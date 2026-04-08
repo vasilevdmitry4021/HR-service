@@ -1,0 +1,23 @@
+name: Deploy
+
+# Шаблон: подключите секреты и цели (Vercel / Railway / свой registry) под вашу инфраструктуру.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Целевое окружение"
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - production
+
+jobs:
+  placeholder:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Placeholder
+        run: |
+          echo "Окружение: ${{ github.event.inputs.environment }}"
+          echo "Добавьте шаги деплоя (например: vercel deploy, railway up, docker push)."

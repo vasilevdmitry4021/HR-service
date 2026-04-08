@@ -1,0 +1,33 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node / Next.js
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tests / Playwright
+.pytest_cache/
+htmlcov/
+playwright-report/
+blob-report/
+test-results/
+
+# Корневой runner E2E (npm install в корне)
+/node_modules/

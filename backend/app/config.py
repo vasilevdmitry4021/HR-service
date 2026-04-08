@@ -1,0 +1,186 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    database_url: str = "postgresql://hr:hr@localhost:5432/hr_service"
+
+    secret_key: str = "change-me-in-production"
+    access_token_expire_minutes: int = 30
+    refresh_token_expire_days: int = 7
+    jwt_algorithm: str = "HS256"
+
+    token_encryption_key: str = ""
+
+    hh_client_id: str = ""
+    hh_client_secret: str = ""
+    hh_redirect_uri: str = "http://localhost:8000/api/v1/hh/callback"
+
+    feature_use_mock_llm: bool = True
+    feature_use_mock_hh: bool = True
+    feature_use_mock_estaff: bool = False
+    feature_use_telegram_source: bool = False
+
+    telegram_session_encryption_key: str = ""
+    telegram_sync_enabled: bool = True
+    telegram_sync_interval_seconds: int = 300
+    telegram_sync_batch_size: int = 100
+    telegram_max_attachment_mb: int = 10
+    telegram_allowed_attachment_types: str = "pdf,docx,doc,txt"
+    # Каталог вложений на стороне ingestion (совпадает с TELEGRAM_ATTACHMENTS_DIR в контейнере)
+    telegram_attachments_dir: str = "/data/attachments"
+    telegram_resume_classifier_enabled: bool = True
+    telegram_resume_classifier_min_score: float = 0.6
+
+    # Пути относительно базового URL (полный хост в настройках, например krit.e-staff.ru)
+    estaff_create_candidate_path: str = "/api/candidate/add"
+    # POST /api/vacancy/find — см. документацию e-staff
+    estaff_vacancies_path: str = "/api/vacancy/find"
+    # Проверка TLS при вызове e-staff (false только для отладки / внутренний CA)
+    estaff_http_verify: bool = True
+    # Добавлять к тексту ошибки 502 краткую техническую причину (только для отладки)
+    estaff_expose_error_detail: bool = False
+    estaff_vacancies_cache_ttl_seconds: int = 120
+    # POST /api/base/get_voc — справочники для разрешения id
+    estaff_get_voc_path: str = "/api/base/get_voc"
+    estaff_voc_cache_ttl_seconds: int = 600
+    estaff_voc_cache_max_entries: int = 128
+    # Если HH не отдаёт ФИО и контакты (ограничения тарифа), подставить значения в поля eStaff.
+    estaff_fio_placeholder_enabled: bool = False
+    estaff_fio_placeholder_firstname: str = "Имя не указано"
+    estaff_fio_placeholder_lastname: str = "Фамилия не указана"
+    estaff_fio_placeholder_middlename: str = ""
+    estaff_contact_placeholder_email: str = "nocontact@placeholder.invalid"
+    estaff_contact_placeholder_mobile: str = "+70000000000"
+
+    # Публичный базовый URL фронтенда для абсолютной ссылки в HTML-вложении выгрузки (без завершающего /)
+    hr_public_base_url: str = ""
+    # type_id типа вложения из справочника card_attachment_types в e-staff (HTML-блок HR)
+    estaff_hr_bundle_attachment_type_id: str = ""
+
+    # LLM (OpenAI/Ollama compatible API)
+    internal_llm_endpoint: str = ""
+    internal_llm_api_key: str = "ollama"
+    internal_llm_model: str = "llama3.2"
+    feature_pdf_export: bool = False
+    feature_llm_resume_analysis: bool = True
+    llm_relevance_threshold: int = 60
+
+    # LLM детальный анализ (батч на снимке)
+    llm_search_batch_size: int = 10
+    llm_detailed_top_n: int = 15
+
+    # Быстрый LLM pre-screening (лёгкая модель, числовая оценка)
+    llm_fast_model: str = "qwen2.5:7b"
+    # Меньшие батчи надёжнее для тяжёлых моделей (полный JSON-массив по всем строкам).
+    llm_fast_batch_size: int = 5
+    # Дозапрос по одному резюме, если в батче не пришла оценка
+    llm_prescore_refill_enabled: bool = True
+    llm_prescore_refill_max_llm_calls: int = 500
+
+    # Кэш LLM после поиска (карточка с тем же ?q= без повторного вызова модели)
+    llm_analysis_cache_ttl_seconds: int = 7200
+    llm_analysis_cache_max_entries: int = 2000
+
+    # Снимок выдачи поиска (пагинация без повторных запросов к HH/LLM)
+    search_snapshot_ttl_seconds: int = 3600
+    search_snapshot_max_per_user: int = 8
+    search_max_resumes_fetch_per_search: int = 1000
+    search_hh_page_size: int = 50
+    # Максимум резюме с подгрузкой полных данных (опыт, «о себе») на этапе evaluate
+    evaluate_max_enrich_resumes: int = 200
+
+    # Пост-фильтрация по точным числовым границам из parsed
+    strict_numeric_filters: bool = True
+    strict_filter_mode: str = "hide"  # hide | demote
+
+    cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+
+def _hh_credentials_dict_from_db(db: Session) -> dict[str, Any] | None:
+    from sqlalchemy import select
+
+    from app.models.system_settings import SystemSettings
+    from app.services import encryption
+
+    row = db.scalars(
+        select(SystemSettings).where(SystemSettings.key == "hh_credentials")
+    ).first()
+    if not row:
+        return None
+    try:
+        data = encryption.decrypt_json(row.encrypted_value)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def get_hh_credentials_from_db(db: Session) -> tuple[str, str] | None:
+    """Возвращает (client_id, client_secret) из БД или None."""
+    data = _hh_credentials_dict_from_db(db)
+    if not data:
+        return None
+    cid = data.get("client_id")
+    sec = data.get("client_secret")
+    if isinstance(cid, str) and isinstance(sec, str) and cid.strip() and sec.strip():
+        return cid.strip(), sec.strip()
+    return None
+
+
+def get_hh_oauth_payload_from_db(db: Session) -> dict[str, Any] | None:
+    """Расшифрованные сохранённые поля OAuth-приложения HH (если есть)."""
+    return _hh_credentials_dict_from_db(db)
+
+
+def _estaff_credentials_dict_from_db(db: Session) -> dict[str, Any] | None:
+    from sqlalchemy import select
+
+    from app.models.system_settings import SystemSettings
+    from app.services import encryption
+
+    row = db.scalars(
+        select(SystemSettings).where(SystemSettings.key == "estaff_credentials")
+    ).first()
+    if not row:
+        return None
+    try:
+        data = encryption.decrypt_json(row.encrypted_value)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def get_estaff_credentials_from_db(db: Session) -> tuple[str, str] | None:
+    """Возвращает (server_name, api_token) из БД или None."""
+    data = _estaff_credentials_dict_from_db(db)
+    if not data:
+        return None
+    server = data.get("server_name")
+    token = data.get("api_token")
+    if (
+        isinstance(server, str)
+        and isinstance(token, str)
+        and server.strip()
+        and token.strip()
+    ):
+        return server.strip(), token.strip()
+    return None
+
+
+settings = Settings()
