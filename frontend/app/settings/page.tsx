@@ -41,13 +41,46 @@ function isLlmProvider(v: string): v is LLMProvider {
   );
 }
 
+function SettingsNotice({
+  msg,
+  err,
+}: {
+  msg: string | null;
+  err: string | null;
+}) {
+  return (
+    <>
+      {msg ? (
+        <div className="rounded-lg border-2 border-success/30 bg-success/10 px-4 py-3 text-sm text-success animate-fade-in">
+          {msg}
+        </div>
+      ) : null}
+      {err ? (
+        <div className="rounded-lg border-2 border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive animate-fade-in">
+          {err}
+        </div>
+      ) : null}
+    </>
+  );
+}
+
 function SettingsBody() {
   const router = useRouter();
   const params = useSearchParams();
   const accessToken = useAuthStore((s) => s.accessToken);
+  const canWriteIntegrationSettings = useAuthStore(
+    (s) => s.canWriteIntegrationSettings,
+  );
+  const canManageIntegrationEditors = useAuthStore(
+    (s) => s.canManageIntegrationEditors,
+  );
   const hasHydrated = useAuthStore((s) => s._hasHydrated);
-  const [msg, setMsg] = useState<string | null>(null);
-  const [err, setErr] = useState<string | null>(null);
+  const [llmMsg, setLlmMsg] = useState<string | null>(null);
+  const [llmErr, setLlmErr] = useState<string | null>(null);
+  const [estaffMsg, setEstaffMsg] = useState<string | null>(null);
+  const [estaffErr, setEstaffErr] = useState<string | null>(null);
+  const [hhMsg, setHhMsg] = useState<string | null>(null);
+  const [hhErr, setHhErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [estaffConfigured, setEstaffConfigured] = useState(false);
   const [estaffServer, setEstaffServer] = useState("");
@@ -77,6 +110,7 @@ function SettingsBody() {
 
   useEffect(() => {
     if (!accessToken) return;
+    if (canWriteIntegrationSettings !== true) return;
     void fetchEstaffCredentialsStatus()
       .then((st) => setEstaffConfigured(st.configured))
       .catch(() => {
@@ -98,12 +132,12 @@ function SettingsBody() {
       .catch(() => {
         /* ignore */
       });
-  }, [accessToken]);
+  }, [accessToken, canWriteIntegrationSettings]);
 
   async function saveLlmSettings() {
     setSavingLlm(true);
-    setErr(null);
-    setMsg(null);
+    setLlmErr(null);
+    setLlmMsg(null);
     setLlmTestHint(null);
     try {
       const body: LLMSettingsIn = {
@@ -124,11 +158,11 @@ function SettingsBody() {
       await updateLLMSettings(body);
       setLlmApiKey("");
       setLlmClientSecret("");
-      setMsg("Настройки языковой модели сохранены");
+      setLlmMsg("Настройки языковой модели сохранены");
       const st = await fetchLLMSettingsStatus();
       setLlmConfigured(st.configured);
     } catch (e) {
-      setErr(
+      setLlmErr(
         e instanceof ApiError ? e.message : "Не удалось сохранить настройки LLM",
       );
     } finally {
@@ -138,7 +172,7 @@ function SettingsBody() {
 
   async function runLlmTest() {
     setTestingLlm(true);
-    setErr(null);
+    setLlmErr(null);
     setLlmTestHint(null);
     try {
       const r = await testLLMConnection();
@@ -147,7 +181,7 @@ function SettingsBody() {
           (r.response_time_ms != null ? ` (${r.response_time_ms} мс)` : ""),
       );
     } catch (e) {
-      setErr(
+      setLlmErr(
         e instanceof ApiError ? e.message : "Не удалось проверить соединение",
       );
     } finally {
@@ -168,8 +202,8 @@ function SettingsBody() {
         sessionStorage.setItem(key, "pending");
       }
       setBusy(true);
-      setErr(null);
-      setMsg(null);
+      setHhErr(null);
+      setHhMsg(null);
       try {
         await apiFetch("/hh/connect", {
           method: "POST",
@@ -181,13 +215,13 @@ function SettingsBody() {
         if (typeof window !== "undefined") {
           sessionStorage.setItem(`hh_oauth:${code}`, "done");
         }
-        setMsg("HeadHunter подключён.");
+        setHhMsg("HeadHunter подключён.");
         router.replace("/settings");
       } catch (e) {
         if (typeof window !== "undefined") {
           sessionStorage.removeItem(`hh_oauth:${code}`);
         }
-        setErr(e instanceof ApiError ? e.message : "Ошибка подключения");
+        setHhErr(e instanceof ApiError ? e.message : "Ошибка подключения");
       } finally {
         if (hhOAuthInflightCode === code) hhOAuthInflightCode = null;
         setBusy(false);
@@ -200,49 +234,53 @@ function SettingsBody() {
     const code = params.get("code");
     const state = params.get("state");
     if (!code || !accessToken) return;
+    if (canWriteIntegrationSettings !== true) return;
     void finishOAuth(code, state);
-  }, [params, accessToken, finishOAuth]);
+  }, [params, accessToken, canWriteIntegrationSettings, finishOAuth]);
 
   useEffect(() => {
     if (!accessToken) return;
+    if (canWriteIntegrationSettings !== true) return;
     const oauth = params.get("hh_oauth");
     if (!oauth) return;
-    setErr(null);
-    setMsg(null);
+    setHhErr(null);
+    setHhMsg(null);
     if (oauth === "ok") {
-      setMsg("HeadHunter подключён.");
+      setHhMsg("HeadHunter подключён.");
     } else if (oauth === "error") {
       const m = params.get("hh_msg");
-      setErr(
+      setHhErr(
         m
           ? decodeURIComponent(m.replace(/\+/g, " "))
           : "Ошибка подключения HeadHunter",
       );
     }
     router.replace("/settings");
-  }, [params, accessToken, router]);
+  }, [params, accessToken, canWriteIntegrationSettings, router]);
 
   async function saveEstaffCredentials() {
     setSavingEstaff(true);
-    setErr(null);
-    setMsg(null);
+    setEstaffErr(null);
+    setEstaffMsg(null);
     try {
       await putEstaffCredentials(estaffServer.trim(), estaffToken.trim());
       setEstaffConfigured(true);
       setEstaffServer("");
       setEstaffToken("");
-      setMsg("Настройки e-staff сохранены");
+      setEstaffMsg("Настройки e-staff сохранены");
       const st = await fetchEstaffCredentialsStatus();
       setEstaffConfigured(st.configured);
     } catch (e) {
-      setErr(e instanceof ApiError ? e.message : "Не удалось сохранить e-staff");
+      setEstaffErr(
+        e instanceof ApiError ? e.message : "Не удалось сохранить e-staff",
+      );
     } finally {
       setSavingEstaff(false);
     }
   }
 
   async function startConnect() {
-    setErr(null);
+    setHhErr(null);
     setBusy(true);
     try {
       const data = await apiFetch<{ authorization_url: string }>(
@@ -251,7 +289,9 @@ function SettingsBody() {
       );
       window.location.href = data.authorization_url;
     } catch (e) {
-      setErr(e instanceof ApiError ? e.message : "Не удалось запустить OAuth");
+      setHhErr(
+        e instanceof ApiError ? e.message : "Не удалось запустить OAuth",
+      );
       setBusy(false);
     }
   }
@@ -268,6 +308,17 @@ function SettingsBody() {
       <main className="flex min-h-screen items-center justify-center p-4">
         <p className="text-muted-foreground">Перенаправление…</p>
       </main>
+    );
+  }
+
+  if (canWriteIntegrationSettings === null) {
+    return (
+      <>
+        <AppNav />
+        <main className="mx-auto w-full max-w-7xl px-4 py-6 lg:px-6 lg:py-10">
+          <p className="text-muted-foreground">Загрузка профиля…</p>
+        </main>
+      </>
     );
   }
 
@@ -292,6 +343,36 @@ function SettingsBody() {
           </Link>
         </div>
 
+        {canManageIntegrationEditors === true ? (
+          <div className="rounded-lg border border-border bg-card px-4 py-3 text-sm">
+            <Link
+              href="/settings/integration-editors"
+              className="text-primary font-medium hover:underline"
+            >
+              Кто может менять глобальные настройки интеграций →
+            </Link>
+          </div>
+        ) : null}
+
+        {!canWriteIntegrationSettings ? (
+          <Card>
+            <CardHeader>
+              <CardTitle>Глобальные интеграции</CardTitle>
+              <CardDescription>
+                Параметры подключения к языковой модели, e-staff и HeadHunter.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-3 text-sm text-muted-foreground">
+              <p>
+                Изменять эти настройки может только администратор системы или
+                сотрудник, которому администратор явно выдал такое право. Если вам
+                нужен доступ, обратитесь к администратору.
+              </p>
+            </CardContent>
+          </Card>
+        ) : null}
+
+        {canWriteIntegrationSettings ? (
         <div className="grid gap-6 xl:grid-cols-2">
           <Card className="xl:col-span-2 relative overflow-hidden">
             <div className="absolute top-0 right-0 w-32 h-32 bg-primary/5 rounded-full blur-3xl -translate-y-1/2 translate-x-1/2" />
@@ -416,6 +497,7 @@ function SettingsBody() {
               </div>
             </CardHeader>
             <CardContent className="space-y-4">
+              <SettingsNotice msg={llmMsg} err={llmErr} />
               <div className="grid gap-4 md:grid-cols-2">
                 <div className="space-y-2">
                   <Label htmlFor="llm-provider">Провайдер</Label>
@@ -574,6 +656,7 @@ function SettingsBody() {
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
+              <SettingsNotice msg={estaffMsg} err={estaffErr} />
               <div className="space-y-2">
                 <Label htmlFor="estaff-server">Домен (server name)</Label>
                 <Input
@@ -599,6 +682,11 @@ function SettingsBody() {
                   placeholder="Вставьте токен из e-staff"
                   autoComplete="off"
                 />
+                <p className="text-xs text-muted-foreground">
+                  Зайдите в раздел «Администрирование». На вкладке «Доступ к API»
+                  создайте API-токен или выберите существующий. Скопируйте
+                  полученный API-токен в это поле.
+                </p>
               </div>
               <Button
                 type="button"
@@ -621,22 +709,14 @@ function SettingsBody() {
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
-              {msg && (
-                <div className="rounded-lg border-2 border-success/30 bg-success/10 px-4 py-3 text-sm text-success animate-fade-in">
-                  {msg}
-                </div>
-              )}
-              {err && (
-                <div className="rounded-lg border-2 border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive animate-fade-in">
-                  {err}
-                </div>
-              )}
+              <SettingsNotice msg={hhMsg} err={hhErr} />
               <Button onClick={startConnect} disabled={busy}>
                 {busy ? "Подождите…" : "Подключить HeadHunter"}
               </Button>
             </CardContent>
           </Card>
         </div>
+        ) : null}
 
         <div className="mt-12 flex justify-center">
           <Link href="/search" className="text-sm text-muted-foreground hover:text-primary transition-colors">
