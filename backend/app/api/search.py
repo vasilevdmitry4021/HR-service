@@ -7,12 +7,11 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_db
+from app.api.deps import get_current_user, get_db, require_search_parse_debug_access
+from app.api.hh_access import ensure_hh_access_token
 from app.config import settings
-from app.models.api_key import ApiKey
 from app.models.search_history import SearchHistory
 from app.models.user import User
 from app.schemas.search import (
@@ -27,7 +26,6 @@ from app.schemas.search import (
     SearchParseIn,
     SearchParseOut,
 )
-from app.services import encryption
 from app.services import hh_client
 from app.services import llm_client
 from app.services import llm_evaluation
@@ -58,21 +56,6 @@ def _evaluate_response_item_dict(row: dict[str, Any]) -> dict[str, Any]:
 
 def _llm_endpoint_configured(db: Session) -> bool:
     return llm_client.llm_connection_configured(db)
-
-
-def _latest_hh_access(db: Session, user_id: uuid.UUID) -> str | None:
-    row = db.scalars(
-        select(ApiKey)
-        .where(ApiKey.user_id == user_id)
-        .order_by(ApiKey.created_at.desc())
-    ).first()
-    if not row:
-        return None
-    try:
-        data = encryption.decrypt_json(row.encrypted_key)
-    except Exception:
-        return None
-    return data.get("access_token")
 
 
 def _candidate_dict_from_raw(r: dict[str, Any]) -> dict[str, Any]:
@@ -171,6 +154,8 @@ async def _fetch_hh_resume_pages(
     *,
     max_resumes: int,
     per_page: int,
+    db: Session | None = None,
+    hh_token_user_id: uuid.UUID | None = None,
 ) -> tuple[list[dict[str, Any]], int, int]:
     """Собирает резюме с HH постранично до исчерпания выдачи или лимита."""
     all_items: list[dict[str, Any]] = []
@@ -181,7 +166,13 @@ async def _fetch_hh_resume_pages(
 
     while len(all_items) < cap:
         chunk, found = await hh_client.search_resumes(
-            access, parsed, filters, page, page_size
+            access,
+            parsed,
+            filters,
+            page,
+            page_size,
+            db=db,
+            hh_token_user_id=hh_token_user_id,
         )
         hh_found = int(found)
         if not chunk:
@@ -203,9 +194,9 @@ async def _fetch_hh_resume_pages(
 def search_parse_debug(
     body: SearchParseIn,
     db: Session = Depends(get_db),
-    _user: User = Depends(get_current_user),
+    _user: User = Depends(require_search_parse_debug_access),
 ):
-    """Отладка: сырой ответ LLM (без mock)."""
+    """Отладка: сырой ответ LLM (без mock). Включение и права — через настройки сервера."""
     return llm_client.debug_raw_llm_response(body.query, db)
 
 
@@ -249,7 +240,7 @@ async def evaluate_resumes(
     access: str | None = None
     if _snapshot_needs_hh_access(snap.items):
         if not settings.feature_use_mock_hh:
-            access = _latest_hh_access(db, user.id)
+            access = await ensure_hh_access_token(db, user.id)
             if not access:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
@@ -267,7 +258,7 @@ async def evaluate_resumes(
 
     try:
         updated = await llm_evaluation.evaluate_all_resumes(
-            access, base_rows, parsed, db
+            access, base_rows, parsed, db, user_id=user.id
         )
     except Exception as exc:
         logger.exception("Ошибка оценки снимка: %s", exc)
@@ -337,7 +328,7 @@ async def analyze_resumes(
     access: str | None = None
     if _snapshot_needs_hh_access(snap.items):
         if not settings.feature_use_mock_hh:
-            access = _latest_hh_access(db, user.id)
+            access = await ensure_hh_access_token(db, user.id)
             if not access:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
@@ -451,7 +442,7 @@ async def search(
     if scope in ("hh", "all"):
         access: str | None = None
         if not settings.feature_use_mock_hh:
-            access = _latest_hh_access(db, user.id)
+            access = await ensure_hh_access_token(db, user.id)
             if not access:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
@@ -470,6 +461,8 @@ async def search(
                 body.filters,
                 max_resumes=max_fetch,
                 per_page=hh_page,
+                db=db,
+                hh_token_user_id=user.id,
             )
         except PermissionError as e:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e

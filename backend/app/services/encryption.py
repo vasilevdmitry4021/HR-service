@@ -14,6 +14,17 @@ def _aes_key() -> bytes:
     return hashlib.sha256(settings.secret_key.encode()).digest()
 
 
+def validate_encryption_key_for_environment() -> None:
+    """В продакшене требуется отдельный ключ шифрования токенов (не только JWT secret)."""
+    env = (getattr(settings, "environment", "") or "").strip().lower()
+    if env == "production" and not (settings.token_encryption_key or "").strip():
+        msg = (
+            "Для ENVIRONMENT=production задайте непустой TOKEN_ENCRYPTION_KEY "
+            "(отдельно от SECRET_KEY)."
+        )
+        raise RuntimeError(msg)
+
+
 def encrypt_json(payload: dict[str, Any]) -> bytes:
     raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     aesgcm = AESGCM(_aes_key())

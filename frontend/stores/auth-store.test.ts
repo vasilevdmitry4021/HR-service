@@ -9,6 +9,11 @@ describe("useAuthStore", () => {
       accessToken: null,
       refreshToken: null,
       email: null,
+      isAdmin: null,
+      isSuperAdmin: null,
+      canWriteIntegrationSettings: null,
+      canManageIntegrationEditors: null,
+      canRevokeIntegrationEditorAccess: null,
       _hasHydrated: true,
     });
   });
@@ -34,5 +39,11 @@ describe("useAuthStore", () => {
     const s = useAuthStore.getState();
     expect(s.accessToken).toBeNull();
     expect(s.refreshToken).toBeNull();
+    expect(s.email).toBeNull();
+    expect(s.isAdmin).toBeNull();
+    expect(s.isSuperAdmin).toBeNull();
+    expect(s.canWriteIntegrationSettings).toBeNull();
+    expect(s.canManageIntegrationEditors).toBeNull();
+    expect(s.canRevokeIntegrationEditorAccess).toBeNull();
   });
 });

@@ -234,13 +234,11 @@ function SettingsBody() {
     const code = params.get("code");
     const state = params.get("state");
     if (!code || !accessToken) return;
-    if (canWriteIntegrationSettings !== true) return;
     void finishOAuth(code, state);
-  }, [params, accessToken, canWriteIntegrationSettings, finishOAuth]);
+  }, [params, accessToken, finishOAuth]);
 
   useEffect(() => {
     if (!accessToken) return;
-    if (canWriteIntegrationSettings !== true) return;
     const oauth = params.get("hh_oauth");
     if (!oauth) return;
     setHhErr(null);
@@ -256,7 +254,7 @@ function SettingsBody() {
       );
     }
     router.replace("/settings");
-  }, [params, accessToken, canWriteIntegrationSettings, router]);
+  }, [params, accessToken, router]);
 
   async function saveEstaffCredentials() {
     setSavingEstaff(true);
@@ -359,7 +357,7 @@ function SettingsBody() {
             <CardHeader>
               <CardTitle>Глобальные интеграции</CardTitle>
               <CardDescription>
-                Параметры подключения к языковой модели, e-staff и HeadHunter.
+                Параметры подключения к языковой модели и e-staff.
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-3 text-sm text-muted-foreground">
@@ -700,23 +698,24 @@ function SettingsBody() {
             </CardContent>
           </Card>
 
-          <Card>
-            <CardHeader>
-              <CardTitle>HeadHunter</CardTitle>
-              <CardDescription>
-                Подключение аккаунта для поиска резюме (OAuth). При включённом
-                mock HH доступен мгновенный тестовый callback.
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <SettingsNotice msg={hhMsg} err={hhErr} />
-              <Button onClick={startConnect} disabled={busy}>
-                {busy ? "Подождите…" : "Подключить HeadHunter"}
-              </Button>
-            </CardContent>
-          </Card>
         </div>
         ) : null}
+
+        <Card>
+          <CardHeader>
+            <CardTitle>HeadHunter</CardTitle>
+            <CardDescription>
+              Подключение аккаунта для поиска резюме (OAuth). При включённом
+              mock HH доступен мгновенный тестовый callback.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <SettingsNotice msg={hhMsg} err={hhErr} />
+            <Button onClick={startConnect} disabled={busy}>
+              {busy ? "Подождите…" : "Подключить HeadHunter"}
+            </Button>
+          </CardContent>
+        </Card>
 
         <div className="mt-12 flex justify-center">
           <Link href="/search" className="text-sm text-muted-foreground hover:text-primary transition-colors">

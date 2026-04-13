@@ -3,10 +3,14 @@ from __future__ import annotations
 import html
 import re
 import time
-from typing import Any
+import uuid
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlencode
 
 import httpx
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.schemas.search_filters import ResumeSearchFilters
@@ -316,6 +320,44 @@ async def exchange_code_for_tokens(
     return data
 
 
+async def refresh_access_token(
+    refresh_token: str,
+    *,
+    client_id: str | None = None,
+    client_secret: str | None = None,
+) -> dict[str, Any]:
+    if settings.feature_use_mock_hh:
+        await _sleep_short()
+        return {
+            "access_token": f"mock_refreshed_{int(time.time())}",
+            "refresh_token": refresh_token,
+            "expires_in": 3600,
+        }
+
+    cid = settings.hh_client_id if client_id is None else client_id
+    csec = settings.hh_client_secret if client_secret is None else client_secret
+    if not cid or not csec:
+        raise HHClientError(503, "HeadHunter OAuth не настроен для обновления токена")
+
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            HH_TOKEN_URL,
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": cid,
+                "client_secret": csec,
+            },
+            headers={"User-Agent": USER_AGENT},
+            timeout=30.0,
+        )
+        _raise_if_hh_error(r)
+        data = r.json()
+    if not isinstance(data, dict):
+        raise HHClientError(503, "Некорректный ответ HeadHunter при обновлении токена")
+    return data
+
+
 async def fetch_employer_me(access_token: str) -> dict[str, Any]:
     if settings.feature_use_mock_hh:
         await _sleep_short()
@@ -335,12 +377,35 @@ async def fetch_employer_me(access_token: str) -> dict[str, Any]:
         return r.json()
 
 
+async def _maybe_retry_hh_after_401(
+    exc: HHClientError,
+    access_token: str | None,
+    db: Session | None,
+    hh_token_user_id: uuid.UUID | None,
+) -> str | None:
+    if exc.status_code != 401 or settings.feature_use_mock_hh:
+        return None
+    if db is None or hh_token_user_id is None:
+        return None
+    from app.api import hh_access as _hh_access
+
+    new_access = await _hh_access.ensure_hh_access_token(
+        db, hh_token_user_id, force_refresh=True
+    )
+    if not new_access or new_access == access_token:
+        return None
+    return new_access
+
+
 async def search_resumes(
     access_token: str | None,
     parsed: dict[str, Any],
     filters: ResumeSearchFilters | dict[str, Any] | None,
     page: int,
     per_page: int,
+    *,
+    db: Session | None = None,
+    hh_token_user_id: uuid.UUID | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     merged = merge_resume_search_params(parsed, filters, page, per_page)
 
@@ -356,14 +421,28 @@ async def search_resumes(
         raise PermissionError("HeadHunter is not connected")
 
     flat = flatten_params_for_httpx(merged)
+    token = access_token
     async with httpx.AsyncClient() as client:
         r = await client.get(
             f"{HH_API}/resumes",
             params=flat,
-            headers=_hh_headers(access_token),
+            headers=_hh_headers(token or ""),
             timeout=30.0,
         )
-        _raise_if_hh_error(r)
+        try:
+            _raise_if_hh_error(r)
+        except HHClientError as e:
+            retry_tok = await _maybe_retry_hh_after_401(e, token, db, hh_token_user_id)
+            if retry_tok is None:
+                raise
+            token = retry_tok
+            r = await client.get(
+                f"{HH_API}/resumes",
+                params=flat,
+                headers=_hh_headers(token),
+                timeout=30.0,
+            )
+            _raise_if_hh_error(r)
         data = r.json()
 
     items_raw = data.get("items", [])
@@ -381,6 +460,8 @@ async def fetch_resume(
     resume_id: str,
     *,
     keep_raw: bool = False,
+    db: Session | None = None,
+    hh_token_user_id: uuid.UUID | None = None,
 ) -> dict[str, Any]:
     if settings.feature_use_mock_hh:
         await _sleep_short()
@@ -396,13 +477,26 @@ async def fetch_resume(
     if not access_token:
         raise PermissionError("HeadHunter is not connected")
 
+    token = access_token
     async with httpx.AsyncClient() as client:
         r = await client.get(
             f"{HH_API}/resumes/{resume_id}",
-            headers=_hh_headers(access_token),
+            headers=_hh_headers(token),
             timeout=30.0,
         )
-        _raise_if_hh_error(r)
+        try:
+            _raise_if_hh_error(r)
+        except HHClientError as e:
+            retry_tok = await _maybe_retry_hh_after_401(e, token, db, hh_token_user_id)
+            if retry_tok is None:
+                raise
+            token = retry_tok
+            r = await client.get(
+                f"{HH_API}/resumes/{resume_id}",
+                headers=_hh_headers(token),
+                timeout=30.0,
+            )
+            _raise_if_hh_error(r)
         it = r.json()
     if not isinstance(it, dict):
         raise HHClientError(503, "Некорректный ответ HeadHunter")

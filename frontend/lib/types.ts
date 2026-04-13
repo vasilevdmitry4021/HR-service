@@ -104,6 +104,8 @@ export type FavoriteRow = {
   candidate_id?: string | null;
   title_snapshot: string | null;
   full_name: string | null;
+  contact_email?: string | null;
+  contact_phone?: string | null;
   area: string | null;
   skills_snapshot: string[] | null;
   experience_years: number | null;
@@ -112,9 +114,21 @@ export type FavoriteRow = {
   salary_currency: string | null;
   llm_score: number | null;
   llm_summary: string | null;
+  llm_analysis?: LLMAnalysis | null;
   notes: string;
   created_at: string;
   updated_at: string;
+};
+
+export type FavoriteRefreshMeta = {
+  contacts_unlocked: boolean;
+  full_name_updated: boolean;
+  message?: string | null;
+};
+
+export type FavoriteRefreshResponse = {
+  favorite: FavoriteRow;
+  meta: FavoriteRefreshMeta;
 };
 
 export type WorkExperienceItem = {

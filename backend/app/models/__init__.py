@@ -16,10 +16,14 @@ from app.models.telegram_models import (
     TelegramSource,
     TelegramSyncRun,
 )
+from app.models.oauth_handoff import OAuthHandoffCode
+from app.models.oauth_identity import OAuthIdentity
 from app.models.user import User
 
 __all__ = [
     "User",
+    "OAuthIdentity",
+    "OAuthHandoffCode",
     "ApiKey",
     "Favorite",
     "SearchHistory",

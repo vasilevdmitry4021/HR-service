@@ -38,5 +38,14 @@ class RefreshIn(BaseModel):
 class UserMeOut(BaseModel):
     id: uuid.UUID
     email: str
+    is_admin: bool
+    is_super_admin: bool
+    can_write_integration_settings: bool
+    can_manage_integration_editors: bool
+    can_revoke_integration_editor_access: bool
 
     model_config = {"from_attributes": True}
+
+
+class OAuthExchangeIn(BaseModel):
+    code: str = Field(min_length=8, max_length=512)

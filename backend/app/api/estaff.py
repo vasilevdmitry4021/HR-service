@@ -12,11 +12,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_db
+from app.api.deps import get_current_user, get_db, get_settings_admin
+from app.api.hh_access import ensure_hh_access_token
 from app.config import get_estaff_credentials_from_db, settings
-from app.models.api_key import ApiKey
 from app.models.candidate_profile import CandidateProfile
 from app.models.estaff_export import EstaffExport, EstaffExportStatus
+from app.models.favorite import Favorite
 from app.models.system_settings import SystemSettings
 from app.models.user import User
 from app.schemas.estaff import (
@@ -33,6 +34,8 @@ from app.schemas.estaff import (
     EstaffExportResultOut,
     EstaffExportRowOut,
     EstaffExportsListOut,
+    EstaffUserCheckOut,
+    EstaffUserCheckRequestIn,
     EstaffVacanciesListOut,
     EstaffVacancyItemOut,
 )
@@ -48,10 +51,12 @@ from app.services.estaff_client import (
     EStaffClientError,
     EstaffVacancyRow,
     create_candidate_in_estaff,
+    fetch_user_by_login,
     fetch_get_voc,
     fetch_open_vacancies,
 )
 from app.services.hh_client import HHClientError
+from app.services.hh_resume_contacts import contacts_from_hh_raw
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +96,50 @@ def _legacy_hh_resume_id_field(stored_candidate_key: str) -> str | None:
     return stored_candidate_key
 
 
+def _merge_favorite_contacts_into_hh_norm(
+    db: Session,
+    user_id: uuid.UUID,
+    resume_key: str,
+    norm: dict[str, Any],
+) -> None:
+    """
+    Если в избранном у пользователя для этого hh_resume_id заданы contact_email / contact_phone,
+    подмешивает их в _raw.contact для подготовки выгрузки (когда в ответе HH контактов нет).
+    """
+    key = (resume_key or "").strip()
+    if not key:
+        return
+    fav = db.scalar(
+        select(Favorite).where(
+            Favorite.user_id == user_id,
+            Favorite.hh_resume_id == key,
+        )
+    )
+    if fav is None:
+        return
+    email = (fav.contact_email or "").strip() or None
+    phone = (fav.contact_phone or "").strip() or None
+    if not email and not phone:
+        return
+
+    raw_any = norm.get("_raw")
+    if not isinstance(raw_any, dict):
+        raw_any = {}
+        norm["_raw"] = raw_any
+
+    existing_email, existing_phone = contacts_from_hh_raw(raw_any)
+
+    contact_list = raw_any.get("contact")
+    if not isinstance(contact_list, list):
+        contact_list = []
+        raw_any["contact"] = contact_list
+
+    if email and not existing_email:
+        contact_list.append({"type": {"id": "email"}, "value": email})
+    if phone and not existing_phone:
+        contact_list.append({"type": {"id": "cell"}, "value": phone})
+
+
 def _telegram_profile_by_candidate_id(
     db: Session, candidate_id: str
 ) -> CandidateProfile | None:
@@ -102,21 +151,6 @@ def _telegram_profile_by_candidate_id(
     if p and p.source_type == "telegram":
         return p
     return None
-
-
-def _latest_hh_access(db: Session, user_id) -> str | None:
-    row = db.scalars(
-        select(ApiKey)
-        .where(ApiKey.user_id == user_id)
-        .order_by(ApiKey.created_at.desc())
-    ).first()
-    if not row:
-        return None
-    try:
-        data = encryption.decrypt_json(row.encrypted_key)
-    except Exception:
-        return None
-    return data.get("access_token") if isinstance(data, dict) else None
 
 
 def _detail_dict(row: EstaffExport) -> dict[str, Any]:
@@ -194,7 +228,7 @@ def get_estaff_credentials_status(
 def put_estaff_credentials(
     body: EstaffCredentialsIn,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_settings_admin),
 ) -> EstaffCredentialsPutOut:
     payload = {
         "server_name": body.server_name.strip(),
@@ -328,6 +362,12 @@ async def post_estaff_export(
             detail="Подключение к e-staff не настроено",
         )
     server_name, api_token = creds
+    user_login = body.user_login.strip()
+    if not user_login:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Укажите логин пользователя e-staff",
+        )
 
     if len(body.items) > MAX_EXPORT_ITEMS:
         raise HTTPException(
@@ -343,7 +383,7 @@ async def post_estaff_export(
 
     access: str | None = None
     if needs_hh and not settings.feature_use_mock_hh:
-        access = _latest_hh_access(db, user.id)
+        access = await ensure_hh_access_token(db, user.id)
         if not access:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -400,7 +440,14 @@ async def post_estaff_export(
                     )
                     prep_warnings.extend(w)
                 else:
-                    norm = await hh_client.fetch_resume(access, cand_key, keep_raw=True)
+                    norm = await hh_client.fetch_resume(
+                        access,
+                        cand_key,
+                        keep_raw=True,
+                        db=db,
+                        hh_token_user_id=user.id,
+                    )
+                    _merge_favorite_contacts_into_hh_norm(db, user.id, cand_key, norm)
                     payload, w = await prepare_candidate_payload_for_export(
                         norm,
                         server_name=server_name,
@@ -489,6 +536,7 @@ async def post_estaff_export(
                 user.id,
                 cand_key,
                 include_bundle=True,
+                client_analysis=item.hr_llm_analysis,
                 client_summary=item.hr_llm_summary,
                 client_score=item.hr_llm_score,
                 search_query=item.hr_search_query,
@@ -503,6 +551,7 @@ async def post_estaff_export(
                 server_name,
                 api_token,
                 payload,
+                user_login=user_login,
                 vacancy_id=item.vacancy_id,
             )
             now = datetime.now(timezone.utc)
@@ -564,6 +613,47 @@ async def post_estaff_export(
             )
 
     return EstaffExportBatchOut(results=results)
+
+
+@router.post("/user/check", response_model=EstaffUserCheckOut)
+async def post_estaff_user_check(
+    body: EstaffUserCheckRequestIn,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> EstaffUserCheckOut:
+    creds = get_estaff_credentials_from_db(db)
+    if not creds:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Подключение к e-staff не настроено",
+        )
+    server_name, api_token = creds
+    login = body.login.strip()
+    if not login:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Укажите логин пользователя e-staff",
+        )
+    try:
+        user_data, _elapsed = await fetch_user_by_login(server_name, api_token, login)
+    except EStaffClientError as exc:
+        msg = exc.user_message
+        if settings.estaff_expose_error_detail and exc.detail_for_db.strip():
+            short = exc.detail_for_db.strip()[:400]
+            if short not in msg:
+                msg = f"{msg} [{short}]"
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=msg,
+        ) from exc
+    user_name = None
+    if isinstance(user_data, dict):
+        for key in ("name", "full_name", "title"):
+            value = user_data.get(key)
+            if isinstance(value, str) and value.strip():
+                user_name = value.strip()
+                break
+    return EstaffUserCheckOut(valid=user_data is not None, login=login, user_name=user_name)
 
 
 @router.get("/exports", response_model=EstaffExportsListOut)

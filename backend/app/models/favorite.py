@@ -36,6 +36,8 @@ class Favorite(Base):
     )
     title_snapshot = Column(String(512), nullable=True)
     full_name = Column(String(256), nullable=True)
+    contact_email = Column(String(320), nullable=True)
+    contact_phone = Column(String(64), nullable=True)
     area = Column(String(256), nullable=True)
     skills_snapshot = Column(JSONB, nullable=True)
     experience_years = Column(Integer, nullable=True)
@@ -44,6 +46,7 @@ class Favorite(Base):
     salary_currency = Column(String(16), nullable=True)
     llm_score = Column(Integer, nullable=True)
     llm_summary = Column(Text(), nullable=True)
+    llm_analysis = Column(JSONB, nullable=True)
     notes = Column(Text(), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(

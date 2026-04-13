@@ -5,6 +5,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.schemas.search import LLMAnalysisOut
+
 # Максимум кандидатов в одном запросе выгрузки и в запросе пакетного статуса.
 MAX_ESTAFF_EXPORT_BATCH_RESUME_IDS = 50
 MAX_ESTAFF_EXPORT_BATCH_CANDIDATE_IDS = MAX_ESTAFF_EXPORT_BATCH_RESUME_IDS
@@ -58,6 +60,10 @@ class EstaffExportItemIn(BaseModel):
         default=None,
         description="Балл ИИ с клиента; если не задан, при include_hr_llm_bundle подставляется из избранного.",
     )
+    hr_llm_analysis: LLMAnalysisOut | None = Field(
+        default=None,
+        description="Полная структура оценки ИИ (балл, релевантность, списки, вывод); приоритетнее полей hr_llm_summary/hr_llm_score.",
+    )
     hr_search_query: str | None = Field(
         default=None,
         max_length=2000,
@@ -79,7 +85,18 @@ class EstaffExportItemIn(BaseModel):
 
 
 class EstaffExportRequestIn(BaseModel):
+    user_login: str = Field(min_length=1, max_length=256)
     items: list[EstaffExportItemIn] = Field(min_length=1)
+
+
+class EstaffUserCheckRequestIn(BaseModel):
+    login: str = Field(min_length=1, max_length=256)
+
+
+class EstaffUserCheckOut(BaseModel):
+    valid: bool
+    login: str
+    user_name: str | None = None
 
 
 class EstaffExportResultOut(BaseModel):

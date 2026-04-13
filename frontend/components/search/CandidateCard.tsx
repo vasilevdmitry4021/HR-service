@@ -180,6 +180,7 @@ export function CandidateCard({
             onEstaffStatusUpdated={onEstaffExportUpdated}
             hrLlmSummary={analysis?.summary ?? null}
             hrLlmScore={analysis?.llm_score ?? prescore ?? null}
+            hrLlmAnalysis={analysis ?? null}
             hrSearchQuery={searchQuery?.trim() || null}
           />
           <HhResumeLinkButton

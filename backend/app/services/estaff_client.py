@@ -18,10 +18,6 @@ logger = logging.getLogger(__name__)
 
 USER_AGENT = "HR-Service/1.0 (e-staff export)"
 
-# Временно: все кандидаты в e-staff создаются от имени этого логина (тестовый пользователь).
-# Перед продуктивом убрать подстановку — см. Documents/Допущения-e-staff-хардкод-логина.md
-_ESTAFF_HARDCODED_CANDIDATE_USER_LOGIN = "dmitriy.vasiliev@krit.pro"
-
 
 def _host_hint_for_message(server_name: str) -> str:
     s = server_name.strip()
@@ -517,11 +513,128 @@ def _extract_candidate_id_from_response(data: Any) -> str | None:
     return None
 
 
+def _extract_user_from_get_response(data: Any) -> dict[str, Any] | None:
+    if data is None:
+        return None
+    if isinstance(data, dict):
+        if data.get("success") is False:
+            return None
+        if isinstance(data.get("user"), dict):
+            return data["user"]
+        if isinstance(data.get("data"), dict):
+            return data["data"]
+        has_identity = any(
+            isinstance(data.get(k), (str, int))
+            for k in ("id", "login", "email", "name", "full_name")
+        )
+        if has_identity:
+            return data
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                return item
+    return None
+
+
+async def fetch_user_by_login(
+    server_name: str,
+    api_token: str,
+    login: str,
+) -> tuple[dict[str, Any] | None, float]:
+    normalized_login = (login or "").strip()
+    if not normalized_login:
+        raise EStaffClientError(
+            422,
+            "Не указан логин пользователя e-staff.",
+            "empty user login",
+        )
+    if settings.feature_use_mock_estaff:
+        await asyncio.sleep(0.02)
+        return {"id": "mock-user", "login": normalized_login, "name": "Mock User"}, 0.02
+
+    base = build_estaff_base_url(server_name)
+    path = settings.estaff_user_get_path.strip()
+    if not path.startswith("/"):
+        path = "/" + path
+    url = f"{base.rstrip('/')}{path}"
+    headers = {
+        "Authorization": f"Bearer {api_token}",
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    t0 = time.perf_counter()
+    last_exc: EStaffClientError | None = None
+    for attempt in range(3):
+        try:
+            async with _estaff_http_client() as client:
+                r = await client.post(
+                    url,
+                    headers=headers,
+                    json={"user": {"login": normalized_login}},
+                )
+            if r.status_code == 404:
+                return None, time.perf_counter() - t0
+            if r.status_code in (500, 502, 503) and attempt < 2:
+                await asyncio.sleep(0.5 * (attempt + 1))
+                continue
+            if r.is_success:
+                try:
+                    parsed = r.json()
+                except Exception:
+                    raise EStaffClientError(
+                        502,
+                        "Некорректный ответ проверки пользователя e-staff.",
+                        "invalid json user/get",
+                    ) from None
+                return _extract_user_from_get_response(parsed), time.perf_counter() - t0
+            text = r.text or ""
+            try:
+                parsed_err = r.json()
+                err_body = json.dumps(parsed_err, ensure_ascii=False)
+            except Exception:
+                parsed_err = None
+                err_body = _truncate_detail(text)
+            user_msg = _user_message_from_estaff_http_error(
+                r.status_code,
+                parsed_err if parsed_err is not None else text,
+            )
+            raise EStaffClientError(
+                r.status_code,
+                user_msg,
+                _truncate_detail(f"HTTP {r.status_code} user/get: {err_body}"),
+            )
+        except httpx.TimeoutException:
+            last_exc = EStaffClientError(
+                504,
+                "Сервис e-staff не ответил вовремя. Повторите попытку позже.",
+                "timeout user/get",
+            )
+            if attempt < 2:
+                await asyncio.sleep(0.5 * (attempt + 1))
+                continue
+            raise last_exc from None
+        except httpx.RequestError as exc:
+            last_exc = EStaffClientError(
+                502,
+                _user_message_for_request_error(exc, server_name),
+                _truncate_detail(str(exc)),
+            )
+            if attempt < 2:
+                await asyncio.sleep(0.5 * (attempt + 1))
+                continue
+            raise last_exc from None
+    if last_exc:
+        raise last_exc
+    raise EStaffClientError(500, "Не удалось проверить логин e-staff.", "unknown user/get")
+
+
 async def create_candidate_in_estaff(
     server_name: str,
     api_token: str,
     body: dict[str, Any],
     *,
+    user_login: str,
     vacancy_id: str | None = None,
 ) -> tuple[str | None, float]:
     """Создаёт кандидата в e-staff. Возвращает (id кандидата или None, длительность с)."""
@@ -548,9 +661,15 @@ async def create_candidate_in_estaff(
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
+    normalized_user_login = (user_login or "").strip()
+    if not normalized_user_login:
+        raise EStaffClientError(
+            422,
+            "Не указан логин пользователя e-staff.",
+            "empty user login for candidate/add",
+        )
     candidate_payload = dict(body)
-    if _ESTAFF_HARDCODED_CANDIDATE_USER_LOGIN.strip():
-        candidate_payload["user_login"] = _ESTAFF_HARDCODED_CANDIDATE_USER_LOGIN.strip()
+    candidate_payload["user_login"] = normalized_user_login
     send_body: dict[str, Any] = {"candidate": candidate_payload}
     if vacancy_id and str(vacancy_id).strip():
         vid = str(vacancy_id).strip()

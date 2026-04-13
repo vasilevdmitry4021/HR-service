@@ -21,6 +21,9 @@ const bricolageGrotesque = Bricolage_Grotesque({
 export const metadata: Metadata = {
   title: "HR Service",
   description: "Поиск кандидатов",
+  icons: {
+    icon: [{ url: "/hr-icon.svg", type: "image/svg+xml" }],
+  },
 };
 
 export default function RootLayout({

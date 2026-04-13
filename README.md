@@ -32,6 +32,28 @@ docker compose exec backend alembic upgrade head
 
 **Frontend:** из каталога `frontend` выполните `npm install` и `npm run dev`.
 
+### Безопасный bootstrap супер-админов (пустая БД)
+
+При открытой регистрации супер-права нельзя назначать через email в конфиге. Используйте только флаг `users.is_super_admin` в БД через CLI:
+
+```bash
+cd backend
+python -m app.cli.admin_bootstrap create-super-admin --email admin@example.com --password "StrongPass123!"
+```
+
+Команды:
+
+- `python -m app.cli.admin_bootstrap create-super-admin --email ... --password ...` — создать пользователя (если его нет) и выдать super-admin.
+- `python -m app.cli.admin_bootstrap grant-super-admin --email ...` — выдать super-admin существующему пользователю.
+- `python -m app.cli.admin_bootstrap revoke-super-admin --email ...` — снять super-admin (с защитой от снятия последнего супер-админа).
+
+Безопасный порядок деплоя:
+
+1. Применить миграции: `alembic upgrade head`.
+2. Выполнить `create-super-admin` для первого привилегированного пользователя.
+3. Войти этим пользователем и проверить `GET /api/v1/auth/me` (`is_super_admin=true`).
+4. Только после этого открывать внешнюю регистрацию/доступ.
+
 ---
 
 ## Тестирование и CI

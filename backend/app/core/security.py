@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -33,11 +36,12 @@ def create_access_token(user_id: uuid.UUID) -> str:
     return jwt.encode(payload, settings.secret_key, algorithm=settings.jwt_algorithm)
 
 
-def create_refresh_token(user_id: uuid.UUID) -> str:
+def create_refresh_token(user_id: uuid.UUID, jti: str) -> str:
     expire = datetime.now(timezone.utc) + timedelta(days=settings.refresh_token_expire_days)
     payload = {
         "sub": str(user_id),
         "type": "refresh",
+        "jti": jti,
         "exp": _exp_unix(expire),
     }
     return jwt.encode(payload, settings.secret_key, algorithm=settings.jwt_algorithm)
@@ -91,3 +95,58 @@ def decode_hh_oauth_user_id(state: str) -> uuid.UUID | None:
         return uuid.UUID(str(sub))
     except ValueError:
         return None
+
+
+SOCIAL_OAUTH_STATE_TYP = "social_oauth_state"
+SOCIAL_OAUTH_STATE_EXPIRE_MINUTES = 10
+
+
+def create_social_oauth_state(provider: str, *, code_verifier: str | None = None) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(minutes=SOCIAL_OAUTH_STATE_EXPIRE_MINUTES)
+    payload: dict = {
+        "typ": SOCIAL_OAUTH_STATE_TYP,
+        "jti": str(uuid.uuid4()),
+        "prov": provider,
+        "exp": _exp_unix(expire),
+    }
+    if code_verifier:
+        payload["cv"] = code_verifier
+    return jwt.encode(payload, settings.secret_key, algorithm=settings.jwt_algorithm)
+
+
+def verify_social_oauth_state(state: str, *, expected_provider: str) -> dict | None:
+    if not (state and str(state).strip()):
+        return None
+    try:
+        data = jwt.decode(
+            str(state).strip(),
+            settings.secret_key,
+            algorithms=[settings.jwt_algorithm],
+        )
+    except JWTError:
+        return None
+    if data.get("typ") != SOCIAL_OAUTH_STATE_TYP:
+        return None
+    if data.get("prov") != expected_provider:
+        return None
+    return data
+
+
+def generate_pkce_pair() -> tuple[str, str]:
+    """Возвращает (code_verifier, code_challenge S256) для VK ID."""
+    verifier_bytes = secrets.token_bytes(32)
+    verifier = base64.urlsafe_b64encode(verifier_bytes).decode("ascii").rstrip("=")
+    challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest())
+        .decode("ascii")
+        .rstrip("=")
+    )
+    return verifier, challenge
+
+
+def hash_handoff_code(plain: str) -> str:
+    return hashlib.sha256(plain.encode("utf-8")).hexdigest()
+
+
+def generate_handoff_plain() -> str:
+    return secrets.token_urlsafe(32)

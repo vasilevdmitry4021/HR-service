@@ -1,12 +1,27 @@
 "use client";
 
+import Image from "next/image";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 
 import { Button } from "@/components/ui/button";
+import { fetchAuthMe } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { useAuthStore } from "@/stores/auth-store";
+
+function initialsFromEmail(email: string | null): string {
+  if (!email) return "?";
+  const local = email.split("@")[0]?.trim() || "";
+  const parts = local.split(/[._-]+/).filter(Boolean);
+  if (parts.length >= 2) {
+    const a = parts[0][0];
+    const b = parts[1][0];
+    if (a && b) return (a + b).toUpperCase();
+  }
+  if (local.length >= 2) return local.slice(0, 2).toUpperCase();
+  return (local[0] || "?").toUpperCase();
+}
 
 const links = [
   { href: "/search", label: "Поиск" },
@@ -20,14 +35,56 @@ export function AppNav() {
   const pathname = usePathname();
   const router = useRouter();
   const accessToken = useAuthStore((s) => s.accessToken);
+  const refreshToken = useAuthStore((s) => s.refreshToken);
+  const email = useAuthStore((s) => s.email);
+  const setSession = useAuthStore((s) => s.setSession);
   const clearSession = useAuthStore((s) => s.clearSession);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [resolvingEmail, setResolvingEmail] = useState(false);
 
   useEffect(() => {
     setMenuOpen(false);
   }, [pathname]);
 
+  useEffect(() => {
+    if (!accessToken || !refreshToken) return;
+    let cancelled = false;
+    setResolvingEmail(true);
+    (async () => {
+      try {
+        const me = await fetchAuthMe(accessToken);
+        if (!cancelled) {
+          setSession({
+            accessToken,
+            refreshToken,
+            email: me.email,
+            isAdmin: me.is_admin,
+            isSuperAdmin: me.is_super_admin,
+            canWriteIntegrationSettings: me.can_write_integration_settings,
+            canManageIntegrationEditors: me.can_manage_integration_editors,
+            canRevokeIntegrationEditorAccess: me.can_revoke_integration_editor_access,
+          });
+        }
+      } catch {
+        /* сессия может быть сброшена обработчиком API */
+      } finally {
+        if (!cancelled) setResolvingEmail(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [accessToken, refreshToken, setSession]);
+
   if (!accessToken) return null;
+
+  const displayLine =
+    email ?? (resolvingEmail ? "Загрузка…" : "Аккаунт");
+  const avatarText = email
+    ? initialsFromEmail(email)
+    : resolvingEmail
+      ? "…"
+      : "?";
 
   function logout() {
     clearSession();
@@ -39,7 +96,15 @@ export function AppNav() {
       <header className="relative sticky top-0 z-30 border-b-2 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
         <div className="mx-auto flex h-16 max-w-7xl items-center justify-between gap-4 px-4 lg:px-6">
           <div className="flex items-center gap-8">
-            <Link href="/search" className="flex items-center gap-2">
+            <Link href="/search" className="flex items-center gap-2.5">
+              <Image
+                src="/hr-icon.svg"
+                alt=""
+                width={32}
+                height={32}
+                className="h-8 w-8 shrink-0"
+                priority
+              />
               <span className="text-xl font-display font-bold tracking-tight text-primary">
                 HR Service
               </span>
@@ -85,11 +150,25 @@ export function AppNav() {
                 </span>
               )}
             </Button>
+            <div
+              className="hidden min-w-0 items-center gap-2.5 sm:flex"
+              title={email ?? undefined}
+            >
+              <span
+                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-primary/10 text-xs font-semibold text-primary"
+                aria-hidden
+              >
+                {avatarText}
+              </span>
+              <span className="max-w-[14rem] truncate text-sm font-medium text-foreground">
+                {displayLine}
+              </span>
+            </div>
             <Button
               variant="ghost"
               size="sm"
               type="button"
-              className="hidden sm:inline-flex"
+              className="hidden sm:inline-flex shrink-0"
               onClick={logout}
             >
               Выйти
@@ -129,7 +208,18 @@ export function AppNav() {
                     </Link>
                   </li>
                 ))}
-                <li className="pt-3 border-t mt-2">
+                <li className="pt-3 border-t mt-2 space-y-3">
+                  <div className="flex items-center gap-3 rounded-lg bg-secondary/50 px-3 py-2.5">
+                    <span
+                      className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-primary/10 text-sm font-semibold text-primary"
+                      aria-hidden
+                    >
+                      {avatarText}
+                    </span>
+                    <p className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">
+                      {displayLine}
+                    </p>
+                  </div>
                   <Button
                     variant="outline"
                     size="sm"

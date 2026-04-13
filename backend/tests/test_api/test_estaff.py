@@ -57,6 +57,7 @@ def test_estaff_export_stores_user_message_on_estaff_client_error(
         "/api/v1/estaff/export",
         headers=auth_headers,
         json={
+            "user_login": "hr.user",
             "items": [
                 {"hh_resume_id": resume_id, "vacancy_id": "1"},
             ],
@@ -96,6 +97,7 @@ def test_estaff_export_accepts_candidate_id_field(
         "/api/v1/estaff/export",
         headers=auth_headers,
         json={
+            "user_login": "hr.user",
             "items": [
                 {"candidate_id": "hh-by-candidate-id-1", "vacancy_id": "mock-vac-1"},
             ],
@@ -125,6 +127,7 @@ def test_estaff_export_include_hr_llm_bundle_adds_attachments(
         api_token: str,
         body: dict,
         *,
+        user_login: str,
         vacancy_id: str | None = None,
     ):
         captured.append(dict(body))
@@ -146,6 +149,7 @@ def test_estaff_export_include_hr_llm_bundle_adds_attachments(
         "/api/v1/estaff/export",
         headers=auth_headers,
         json={
+            "user_login": "hr.user",
             "items": [
                 {
                     "hh_resume_id": resume_id,
@@ -176,6 +180,79 @@ def test_estaff_export_include_hr_llm_bundle_adds_attachments(
     assert "<b>" not in html_data
     assert "&lt;b&gt;" in html_data
     assert "72" in html_data
+    assert "Вывод" in html_data
+
+
+def test_estaff_export_hr_llm_analysis_structured_in_html(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """hr_llm_analysis: в HTML попадают релевантность, списки и вывод."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "feature_use_mock_estaff", True)
+    monkeypatch.setattr(settings, "feature_use_mock_hh", True)
+    monkeypatch.setattr(settings, "hr_public_base_url", "https://hr.example.com")
+    monkeypatch.setattr(settings, "estaff_hr_bundle_attachment_type_id", "hr-note-type")
+
+    captured: list[dict] = []
+
+    async def _capture(
+        server_name: str,
+        api_token: str,
+        body: dict,
+        *,
+        user_login: str,
+        vacancy_id: str | None = None,
+    ):
+        captured.append(dict(body))
+        return "mock-structured", 0.01
+
+    monkeypatch.setattr(
+        "app.api.estaff.create_candidate_in_estaff",
+        _capture,
+    )
+
+    client.put(
+        "/api/v1/estaff/credentials",
+        headers=auth_headers,
+        json={"server_name": "demo", "api_token": "t"},
+    )
+
+    resume_id = "hh-mock-003"
+    r = client.post(
+        "/api/v1/estaff/export",
+        headers=auth_headers,
+        json={
+            "user_login": "hr.user",
+            "items": [
+                {
+                    "hh_resume_id": resume_id,
+                    "vacancy_id": "mock-vac-1",
+                    "include_hr_llm_bundle": True,
+                    "hr_llm_analysis": {
+                        "llm_score": 80,
+                        "is_relevant": True,
+                        "strengths": ["Опыт в Python", "Английский B2"],
+                        "gaps": ["Нет Kubernetes"],
+                        "summary": "Итоговый вывод по кандидату",
+                    },
+                },
+            ],
+        },
+    )
+    assert r.status_code == 200
+    assert r.json()["results"][0]["status"] == "success"
+    html_data = captured[0]["attachments"][0].get("html_data") or ""
+    assert "80" in html_data
+    assert "релевантен" in html_data.lower()
+    assert "Опыт в Python" in html_data
+    assert "Нет Kubernetes" in html_data
+    assert "Итоговый вывод по кандидату" in html_data
+    assert "Сильные стороны" in html_data
+    assert "Пробелы и риски" in html_data
+    assert "Вывод" in html_data
 
 
 def test_estaff_export_hr_llm_from_favorite_when_client_omits_llm_fields(
@@ -198,6 +275,7 @@ def test_estaff_export_hr_llm_from_favorite_when_client_omits_llm_fields(
         api_token: str,
         body: dict,
         *,
+        user_login: str,
         vacancy_id: str | None = None,
     ):
         captured.append(dict(body))
@@ -232,6 +310,7 @@ def test_estaff_export_hr_llm_from_favorite_when_client_omits_llm_fields(
         "/api/v1/estaff/export",
         headers=auth_headers,
         json={
+            "user_login": "hr.user",
             "items": [
                 {
                     "candidate_id": resume_id,
@@ -249,6 +328,88 @@ def test_estaff_export_hr_llm_from_favorite_when_client_omits_llm_fields(
     html_data = atts[0].get("html_data") or ""
     assert "91" in html_data
     assert "Сводка только в избранном" in html_data
+    assert "Вывод" in html_data
+
+
+def test_estaff_export_hr_llm_from_favorite_llm_analysis_json(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Полный JSON оценки в избранном без полей клиента — все секции во вложении."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "feature_use_mock_estaff", True)
+    monkeypatch.setattr(settings, "feature_use_mock_hh", True)
+    monkeypatch.setattr(settings, "hr_public_base_url", "https://hr.example.com")
+    monkeypatch.setattr(settings, "estaff_hr_bundle_attachment_type_id", "hr-note-type")
+
+    captured: list[dict] = []
+
+    async def _capture(
+        server_name: str,
+        api_token: str,
+        body: dict,
+        *,
+        user_login: str,
+        vacancy_id: str | None = None,
+    ):
+        captured.append(dict(body))
+        return "mock-fav-json", 0.01
+
+    monkeypatch.setattr(
+        "app.api.estaff.create_candidate_in_estaff",
+        _capture,
+    )
+
+    client.put(
+        "/api/v1/estaff/credentials",
+        headers=auth_headers,
+        json={"server_name": "demo", "api_token": "t"},
+    )
+
+    resume_id = "hh-mock-004"
+    fav = client.post(
+        "/api/v1/favorites",
+        headers=auth_headers,
+        json={
+            "hh_resume_id": resume_id,
+            "title_snapshot": "T",
+            "notes": "",
+            "llm_score": 55,
+            "llm_summary": "Кратко",
+            "llm_analysis": {
+                "llm_score": 55,
+                "is_relevant": False,
+                "strengths": ["Из избранного сильная"],
+                "gaps": ["Из избранного пробел"],
+                "summary": "Вывод из JSON избранного",
+            },
+        },
+    )
+    assert fav.status_code == 201
+
+    r = client.post(
+        "/api/v1/estaff/export",
+        headers=auth_headers,
+        json={
+            "user_login": "hr.user",
+            "items": [
+                {
+                    "candidate_id": resume_id,
+                    "vacancy_id": "mock-vac-1",
+                    "include_hr_llm_bundle": True,
+                },
+            ],
+        },
+    )
+    assert r.status_code == 200
+    assert r.json()["results"][0]["status"] == "success"
+    html_data = captured[0]["attachments"][0].get("html_data") or ""
+    assert "Из избранного сильная" in html_data
+    assert "Из избранного пробел" in html_data
+    assert "Вывод из JSON избранного" in html_data
+    assert "не релевантен" in html_data.lower() or "не релевант" in html_data.lower()
 
 
 def test_estaff_export_mock_hh_and_estaff(
@@ -270,6 +431,7 @@ def test_estaff_export_mock_hh_and_estaff(
         "/api/v1/estaff/export",
         headers=auth_headers,
         json={
+            "user_login": "hr.user",
             "items": [
                 {"hh_resume_id": "hh-mock-001", "vacancy_id": "mock-vac-1"},
             ],
@@ -302,6 +464,7 @@ def test_estaff_export_requires_credentials(
         "/api/v1/estaff/export",
         headers=auth_headers,
         json={
+            "user_login": "hr.user",
             "items": [{"hh_resume_id": "hh-mock-001", "vacancy_id": "v1"}],
         },
     )
@@ -315,9 +478,72 @@ def test_estaff_export_requires_vacancy_id(
     r = client.post(
         "/api/v1/estaff/export",
         headers=auth_headers,
-        json={"items": [{"hh_resume_id": "hh-mock-001"}]},
+        json={"user_login": "hr.user", "items": [{"hh_resume_id": "hh-mock-001"}]},
     )
     assert r.status_code == 422
+
+
+def test_estaff_export_requires_user_login(
+    client: TestClient,
+    auth_headers: dict[str, str],
+) -> None:
+    r = client.post(
+        "/api/v1/estaff/export",
+        headers=auth_headers,
+        json={
+            "items": [{"hh_resume_id": "hh-mock-001", "vacancy_id": "v1"}],
+        },
+    )
+    assert r.status_code == 422
+
+
+def test_estaff_user_check_mock_success(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "feature_use_mock_estaff", True)
+    client.put(
+        "/api/v1/estaff/credentials",
+        headers=auth_headers,
+        json={"server_name": "demo", "api_token": "t"},
+    )
+    r = client.post(
+        "/api/v1/estaff/user/check",
+        headers=auth_headers,
+        json={"login": "hr.user"},
+    )
+    assert r.status_code == 200
+    assert r.json()["valid"] is True
+    assert r.json()["login"] == "hr.user"
+
+
+def test_estaff_user_check_not_found(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _not_found(*_a, **_kw):
+        return None, 0.01
+
+    monkeypatch.setattr(
+        "app.api.estaff.fetch_user_by_login",
+        _not_found,
+    )
+    client.put(
+        "/api/v1/estaff/credentials",
+        headers=auth_headers,
+        json={"server_name": "demo", "api_token": "t"},
+    )
+    r = client.post(
+        "/api/v1/estaff/user/check",
+        headers=auth_headers,
+        json={"login": "missing.user"},
+    )
+    assert r.status_code == 200
+    assert r.json() == {"valid": False, "login": "missing.user", "user_name": None}
 
 
 def test_estaff_vacancies_mock(
@@ -402,7 +628,10 @@ def test_estaff_exports_latest_batch_not_found_and_success(
     client.post(
         "/api/v1/estaff/export",
         headers=auth_headers,
-        json={"items": [{"hh_resume_id": rid, "vacancy_id": "mock-vac-1"}]},
+        json={
+            "user_login": "hr.user",
+            "items": [{"hh_resume_id": rid, "vacancy_id": "mock-vac-1"}],
+        },
     )
     r = client.post(
         "/api/v1/estaff/exports/latest-batch",
@@ -436,7 +665,7 @@ def test_estaff_exports_latest_batch_returns_latest_row(
     client.post(
         "/api/v1/estaff/export",
         headers=auth_headers,
-        json={"items": [{"hh_resume_id": rid, "vacancy_id": "v1"}]},
+        json={"user_login": "hr.user", "items": [{"hh_resume_id": rid, "vacancy_id": "v1"}]},
     )
     monkeypatch.setattr(settings, "feature_use_mock_estaff", False)
     from app.services.estaff_client import EStaffClientError
@@ -451,7 +680,7 @@ def test_estaff_exports_latest_batch_returns_latest_row(
     client.post(
         "/api/v1/estaff/export",
         headers=auth_headers,
-        json={"items": [{"hh_resume_id": rid, "vacancy_id": "v2"}]},
+        json={"user_login": "hr.user", "items": [{"hh_resume_id": rid, "vacancy_id": "v2"}]},
     )
     r = client.post(
         "/api/v1/estaff/exports/latest-batch",
@@ -482,7 +711,10 @@ def test_estaff_exports_latest_batch_other_user_isolated(
     client.post(
         "/api/v1/estaff/export",
         headers=auth_headers,
-        json={"items": [{"hh_resume_id": rid, "vacancy_id": "mock-vac-1"}]},
+        json={
+            "user_login": "hr.user",
+            "items": [{"hh_resume_id": rid, "vacancy_id": "mock-vac-1"}],
+        },
     )
     email_b = f"b_{unique_email}"
     assert client.post(

@@ -5,6 +5,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.schemas.search import LLMAnalysisOut
+
 
 class FavoriteCreateIn(BaseModel):
     hh_resume_id: str = Field(default="", max_length=128)
@@ -20,6 +22,7 @@ class FavoriteCreateIn(BaseModel):
     # Обязательны в теле запроса; значение null — если оценка ИИ не выполнялась
     llm_score: int | None
     llm_summary: str | None
+    llm_analysis: LLMAnalysisOut | None = None
     notes: str = Field(default="", max_length=8000)
 
     @model_validator(mode="after")
@@ -40,6 +43,8 @@ class FavoriteOut(BaseModel):
     candidate_id: uuid.UUID | None = None
     title_snapshot: str | None
     full_name: str | None
+    contact_email: str | None = None
+    contact_phone: str | None = None
     area: str | None
     skills_snapshot: list[str] | None
     experience_years: int | None
@@ -48,8 +53,20 @@ class FavoriteOut(BaseModel):
     salary_currency: str | None
     llm_score: int | None
     llm_summary: str | None
+    llm_analysis: LLMAnalysisOut | None = None
     notes: str
     created_at: datetime
     updated_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class FavoriteRefreshMeta(BaseModel):
+    contacts_unlocked: bool
+    full_name_updated: bool
+    message: str | None = None
+
+
+class FavoriteRefreshOut(BaseModel):
+    favorite: FavoriteOut
+    meta: FavoriteRefreshMeta

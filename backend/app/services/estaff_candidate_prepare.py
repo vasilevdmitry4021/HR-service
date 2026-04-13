@@ -8,6 +8,7 @@ import re
 from typing import Any, Awaitable, Callable
 
 from app.config import settings
+from app.services.hh_resume_contacts import contacts_from_hh_raw
 from app.services.estaff_vocabulary import (
     get_vocabulary_items_cached,
     resolve_vocab_id,
@@ -24,41 +25,6 @@ class EstaffMandatoryDataError(Exception):
     def __init__(self, messages: list[str]) -> None:
         self.messages = messages
         super().__init__("; ".join(messages))
-
-
-def contacts_from_hh_raw(raw: dict[str, Any]) -> tuple[str | None, str | None]:
-    email: str | None = None
-    phone: str | None = None
-    items = raw.get("contact")
-    if not isinstance(items, list):
-        return None, None
-    for c in items:
-        if not isinstance(c, dict):
-            continue
-        t = c.get("type")
-        type_id = ""
-        if isinstance(t, dict):
-            type_id = str(t.get("id") or "").lower()
-        elif isinstance(t, str):
-            type_id = t.lower()
-        val: Any = (
-            c.get("value")
-            or c.get("formatted")
-            or c.get("contact")
-            or c.get("number")
-        )
-        if isinstance(val, dict):
-            val = val.get("formatted") or val.get("number") or val.get("email")
-        if not isinstance(val, str) or not val.strip():
-            continue
-        s = val.strip()
-        if type_id == "email" or ("@" in s and "." in s):
-            email = email or s
-        elif type_id in ("cell", "phone", "work", "home", "telegram", "whatsapp"):
-            phone = phone or s
-        elif not phone and re.search(r"[\d+()\- ]{10,}", s):
-            phone = phone or s
-    return email, phone
 
 
 def hh_normalized_resume_to_estaff_payload(norm: dict[str, Any]) -> dict[str, Any]:

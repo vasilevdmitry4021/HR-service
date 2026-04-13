@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -97,7 +98,9 @@ async def _enrich_resumes_for_llm(
     resumes: list[dict[str, Any]],
     access_token: str | None,
     *,
+    cache_user_id: uuid.UUID,
     max_enrich: int | None = None,
+    db: Session | None = None,
 ) -> list[dict[str, Any]]:
     enriched: list[dict[str, Any]] = []
     enrich_count = 0
@@ -112,7 +115,7 @@ async def _enrich_resumes_for_llm(
         if r.get("work_experience") and r.get("about"):
             enriched.append(r)
             continue
-        cached = resume_cache.get_cached_resume(rid)
+        cached = resume_cache.get_cached_resume(cache_user_id, rid)
         if cached:
             enriched.append({**r, **cached})
             continue
@@ -120,8 +123,13 @@ async def _enrich_resumes_for_llm(
             enriched.append(r)
             continue
         try:
-            full = await hh_client.fetch_resume(access_token, rid)
-            resume_cache.cache_resume(rid, full)
+            full = await hh_client.fetch_resume(
+                access_token,
+                rid,
+                db=db,
+                hh_token_user_id=cache_user_id if db is not None else None,
+            )
+            resume_cache.cache_resume(cache_user_id, rid, full)
             enriched.append({**r, **full})
             enrich_count += 1
         except Exception as e:
@@ -198,6 +206,8 @@ async def evaluate_all_resumes(
     resumes: list[dict[str, Any]],
     parsed_params: dict[str, Any],
     db: Session,
+    *,
+    user_id: uuid.UUID,
 ) -> list[dict[str, Any]]:
     """
     Подгружает полные резюме (о себе, опыт), вызывает pre-screening LLM батчами,
@@ -216,7 +226,9 @@ async def evaluate_all_resumes(
     enriched = await _enrich_resumes_for_llm(
         stubs_head,
         access_token,
+        cache_user_id=user_id,
         max_enrich=max_to_enrich,
+        db=db,
     )
     scores = llm_prescoring.prescore_resumes_batch(parsed_params, enriched, db=db)
 
@@ -270,7 +282,9 @@ async def analyze_top_resumes(
     enriched = await _enrich_resumes_for_llm(
         top,
         access_token,
+        cache_user_id=uuid.UUID(user_id),
         max_enrich=len(top),
+        db=db,
     )
     batch_size = max(1, int(cfg.llm_search_batch_size or 10))
 

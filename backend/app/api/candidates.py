@@ -9,8 +9,8 @@ from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
 from app.api.deps import get_current_user, get_db
+from app.api.hh_access import ensure_hh_access_token
 from app.config import settings
-from app.models.api_key import ApiKey
 from app.models.candidate_profile import CandidateProfile
 from app.models.favorite import Favorite
 from app.models.user import User
@@ -20,7 +20,6 @@ from app.schemas.search import (
     LLMAnalysisOut,
     WorkExperienceItemOut,
 )
-from app.services import encryption
 from app.services import hh_client
 from app.services.candidate_unified import candidate_profile_to_search_dict
 from app.services.telegram_search import telegram_profile_owned_by_user
@@ -38,6 +37,22 @@ def _llm_analysis_from_favorite(fav: Favorite | None) -> LLMAnalysisOut | None:
     """Оценка ИИ из записи избранного (без привязки к поисковому запросу)."""
     if fav is None:
         return None
+    blob = fav.llm_analysis
+    if isinstance(blob, dict) and blob:
+        try:
+            out = LLMAnalysisOut.model_validate(blob)
+        except Exception:
+            out = None
+        else:
+            has_content = (
+                out.llm_score is not None
+                or out.is_relevant is not None
+                or bool(out.strengths)
+                or bool(out.gaps)
+                or (isinstance(out.summary, str) and out.summary.strip())
+            )
+            if has_content:
+                return out
     raw_summary = fav.llm_summary
     summary = raw_summary.strip() if isinstance(raw_summary, str) else None
     if summary == "":
@@ -54,21 +69,6 @@ def _llm_analysis_from_favorite(fav: Favorite | None) -> LLMAnalysisOut | None:
     )
 
 
-def _latest_hh_access(db: Session, user_id) -> str | None:
-    row = db.scalars(
-        select(ApiKey)
-        .where(ApiKey.user_id == user_id)
-        .order_by(ApiKey.created_at.desc())
-    ).first()
-    if not row:
-        return None
-    try:
-        data = encryption.decrypt_json(row.encrypted_key)
-    except Exception:
-        return None
-    return data.get("access_token")
-
-
 @router.get("/{resume_id}/pdf")
 async def get_candidate_pdf(
     resume_id: str,
@@ -82,7 +82,7 @@ async def get_candidate_pdf(
         )
     access: str | None = None
     if not settings.feature_use_mock_hh:
-        access = _latest_hh_access(db, user.id)
+        access = await ensure_hh_access_token(db, user.id)
         if not access:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -90,7 +90,12 @@ async def get_candidate_pdf(
             )
 
     try:
-        raw = await hh_client.fetch_resume(access, resume_id)
+        raw = await hh_client.fetch_resume(
+            access,
+            resume_id,
+            db=db,
+            hh_token_user_id=user.id,
+        )
     except PermissionError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except HHClientError as e:
@@ -145,7 +150,7 @@ async def analyze_candidate_resume(
 
     access: str | None = None
     if not settings.feature_use_mock_hh:
-        access = _latest_hh_access(db, user.id)
+        access = await ensure_hh_access_token(db, user.id)
         if not access:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -153,7 +158,12 @@ async def analyze_candidate_resume(
             )
 
     try:
-        raw = await hh_client.fetch_resume(access, resume_id)
+        raw = await hh_client.fetch_resume(
+            access,
+            resume_id,
+            db=db,
+            hh_token_user_id=user.id,
+        )
     except PermissionError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except HHClientError as e:
@@ -302,7 +312,7 @@ async def get_candidate(
 
     access: str | None = None
     if not settings.feature_use_mock_hh:
-        access = _latest_hh_access(db, user.id)
+        access = await ensure_hh_access_token(db, user.id)
         if not access:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -310,7 +320,12 @@ async def get_candidate(
             )
 
     try:
-        raw = await hh_client.fetch_resume(access, resume_id)
+        raw = await hh_client.fetch_resume(
+            access,
+            resume_id,
+            db=db,
+            hh_token_user_id=user.id,
+        )
     except PermissionError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except HHClientError as e:

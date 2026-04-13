@@ -15,6 +15,7 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   ApiError,
+  estaffLlmAnalysisHasPayload,
   fetchFavorites,
   patchFavoriteNotes,
   removeFavorite,
@@ -150,6 +151,12 @@ export default function FavoritesPage() {
       const key = (f.hh_resume_id?.trim() || f.candidate_id || "").trim();
       if (!key) continue;
       const row: EstaffHrBundleContext = {};
+      if (
+        f.llm_analysis != null &&
+        estaffLlmAnalysisHasPayload(f.llm_analysis)
+      ) {
+        row.hr_llm_analysis = f.llm_analysis;
+      }
       if (f.llm_summary?.trim()) row.hr_llm_summary = f.llm_summary;
       if (f.llm_score != null) row.hr_llm_score = f.llm_score;
       if (Object.keys(row).length) ctx[key] = row;
@@ -253,6 +260,11 @@ export default function FavoritesPage() {
                   onEstaffExportUpdated={() =>
                     void refetchEstaffFavoritesMap()
                   }
+                  onFavoriteRefreshed={(row) => {
+                    setItems((prev) =>
+                      prev.map((x) => (x.id === row.id ? row : x)),
+                    );
+                  }}
                 />
               </li>
             ))}

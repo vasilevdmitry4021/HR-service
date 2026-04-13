@@ -203,6 +203,7 @@ async def test_create_candidate_mock(monkeypatch: pytest.MonkeyPatch) -> None:
         "x",
         "token",
         {"lastname": "Иванов", "email": "t@example.com"},
+        user_login="hr.user",
         vacancy_id="100",
     )
     assert cid and "mock-estaff" in cid
@@ -283,6 +284,7 @@ async def test_create_candidate_post_wraps_candidate_and_vacancy(
             "krit.e-staff.ru",
             "tok",
             body,
+            user_login="hr.manager",
             vacancy_id="55",
         )
 
@@ -292,8 +294,46 @@ async def test_create_candidate_post_wraps_candidate_and_vacancy(
     assert sent == {
         "candidate": {
             **body,
-            "user_login": "dmitriy.vasiliev@krit.pro",
+            "user_login": "hr.manager",
         },
         "vacancy": {"id": 55},
     }
     assert mock_client.post.call_args[1]["headers"]["Authorization"] == "Bearer tok"
+
+
+@pytest.mark.asyncio
+async def test_fetch_user_by_login_post_uses_bearer_and_login_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.config import settings
+    from app.services import estaff_client
+
+    monkeypatch.setattr(settings, "feature_use_mock_estaff", False)
+    monkeypatch.setattr(settings, "estaff_user_get_path", "/api/user/get")
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.is_success = True
+    mock_response.json.return_value = {
+        "success": True,
+        "user": {"id": 7, "login": "hr.user", "name": "HR User"},
+    }
+
+    mock_client = MagicMock()
+    mock_client.post = AsyncMock(return_value=mock_response)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+
+    with patch("app.services.estaff_client.httpx.AsyncClient", return_value=mock_client):
+        user_data, _ = await estaff_client.fetch_user_by_login(
+            "krit.e-staff.ru",
+            "tok",
+            "hr.user",
+        )
+
+    assert user_data is not None
+    assert user_data["login"] == "hr.user"
+    mock_client.post.assert_called_once()
+    assert mock_client.post.call_args[0][0].endswith("/api/user/get")
+    assert mock_client.post.call_args[1]["headers"]["Authorization"] == "Bearer tok"
+    assert mock_client.post.call_args[1]["json"] == {"user": {"login": "hr.user"}}

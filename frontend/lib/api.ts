@@ -3,6 +3,7 @@ import type {
   Candidate,
   CandidateDetail,
   EvaluateSnapshotResponse,
+  FavoriteRefreshResponse,
   FavoriteRow,
   LLMAnalysis,
   SearchHistoryListResponse,
@@ -197,26 +198,36 @@ export async function addFavorite(
       : undefined;
   const scoreFromLlm = llm?.llm_score ?? null;
   const scorePrescreen = candidate.llm_score ?? null;
+  const body: Record<string, unknown> = {
+    hh_resume_id: hhResumeId,
+    candidate_profile_id: profileId ?? null,
+    title_snapshot: candidate.title ?? null,
+    full_name: candidate.full_name ?? null,
+    area: candidate.area ?? null,
+    skills_snapshot:
+      Array.isArray(candidate.skills) && candidate.skills.length > 0
+        ? candidate.skills
+        : null,
+    experience_years: candidate.experience_years ?? null,
+    age: candidate.age ?? null,
+    salary_amount: candidate.salary?.amount ?? null,
+    salary_currency: candidate.salary?.currency ?? null,
+    llm_score: scoreFromLlm ?? scorePrescreen,
+    llm_summary: llm?.summary ?? null,
+    notes: "",
+  };
+  if (llm != null) {
+    body.llm_analysis = {
+      llm_score: llm.llm_score,
+      is_relevant: llm.is_relevant,
+      strengths: llm.strengths ?? [],
+      gaps: llm.gaps ?? [],
+      summary: llm.summary,
+    };
+  }
   return apiFetch<FavoriteRow>("/favorites", {
     method: "POST",
-    body: JSON.stringify({
-      hh_resume_id: hhResumeId,
-      candidate_profile_id: profileId ?? null,
-      title_snapshot: candidate.title ?? null,
-      full_name: candidate.full_name ?? null,
-      area: candidate.area ?? null,
-      skills_snapshot:
-        Array.isArray(candidate.skills) && candidate.skills.length > 0
-          ? candidate.skills
-          : null,
-      experience_years: candidate.experience_years ?? null,
-      age: candidate.age ?? null,
-      salary_amount: candidate.salary?.amount ?? null,
-      salary_currency: candidate.salary?.currency ?? null,
-      llm_score: scoreFromLlm ?? scorePrescreen,
-      llm_summary: llm?.summary ?? null,
-      notes: "",
-    }),
+    body: JSON.stringify(body),
   });
 }
 
@@ -229,6 +240,13 @@ export async function patchFavoriteNotes(favoriteId: string, notes: string) {
     method: "PATCH",
     body: JSON.stringify({ notes }),
   });
+}
+
+export async function postFavoriteRefreshFromHh(favoriteId: string) {
+  return apiFetch<FavoriteRefreshResponse>(
+    `/favorites/${favoriteId}/refresh-from-hh`,
+    { method: "POST" },
+  );
 }
 
 export async function fetchSearchHistory(skip = 0, limit = 20) {
@@ -555,6 +573,8 @@ export async function putEstaffCredentials(serverName: string, apiToken: string)
 
 /** Ключ localStorage для последней выбранной вакансии e-staff */
 export const ESTAFF_LAST_VACANCY_STORAGE_KEY = "hr_service_estaff_last_vacancy_id";
+/** Ключ localStorage для последнего проверенного логина пользователя e-staff */
+export const ESTAFF_LAST_USER_LOGIN_STORAGE_KEY = "hr_service_estaff_last_user_login";
 
 export type EstaffVacancyItem = {
   id: string;
@@ -572,6 +592,21 @@ export async function fetchEstaffVacancies(minStart: string, maxStart: string) {
   );
 }
 
+export type EstaffUserCheckResponse = {
+  valid: boolean;
+  login: string;
+  user_name?: string | null;
+};
+
+export async function postEstaffUserCheck(
+  login: string,
+): Promise<EstaffUserCheckResponse> {
+  return apiFetch<EstaffUserCheckResponse>("/estaff/user/check", {
+    method: "POST",
+    body: JSON.stringify({ login: login.trim() }),
+  });
+}
+
 export type EstaffExportItemPayload = {
   candidate_id?: string;
   /** Устарело: подставляется в candidate_id, если оно не задано */
@@ -582,18 +617,39 @@ export type EstaffExportItemPayload = {
   include_hr_llm_bundle?: boolean;
   hr_llm_summary?: string | null;
   hr_llm_score?: number | null;
+  /** Полная оценка ИИ для HTML-вложения (приоритетнее отдельных summary/score) */
+  hr_llm_analysis?: LLMAnalysis | null;
   hr_search_query?: string | null;
 };
+
+/** Есть ли в объекте оценки данные, достаточные для блока e-staff */
+export function estaffLlmAnalysisHasPayload(
+  a: LLMAnalysis | null | undefined,
+): boolean {
+  if (a == null) return false;
+  return (
+    a.llm_score != null ||
+    a.is_relevant != null ||
+    (a.strengths?.length ?? 0) > 0 ||
+    (a.gaps?.length ?? 0) > 0 ||
+    Boolean(a.summary?.trim())
+  );
+}
 
 /** Контекст ИИ и запроса поиска для одного идентификатора кандидата при выгрузке в e-staff */
 export type EstaffHrBundleContext = {
   hr_llm_summary?: string | null;
   hr_llm_score?: number | null;
+  hr_llm_analysis?: LLMAnalysis | null;
   hr_search_query?: string | null;
 };
 
-export async function postEstaffExport(items: EstaffExportItemPayload[]) {
+export async function postEstaffExport(
+  items: EstaffExportItemPayload[],
+  userLogin: string,
+) {
   const payload = {
+    user_login: userLogin.trim(),
     items: items.map((it) => {
       const candidate_id = (
         it.candidate_id ||
@@ -611,6 +667,18 @@ export async function postEstaffExport(items: EstaffExportItemPayload[]) {
           ? { hr_llm_summary: it.hr_llm_summary }
           : {}),
         ...(it.hr_llm_score != null ? { hr_llm_score: it.hr_llm_score } : {}),
+        ...(it.hr_llm_analysis != null &&
+        estaffLlmAnalysisHasPayload(it.hr_llm_analysis)
+          ? {
+              hr_llm_analysis: {
+                llm_score: it.hr_llm_analysis.llm_score,
+                is_relevant: it.hr_llm_analysis.is_relevant,
+                strengths: it.hr_llm_analysis.strengths ?? [],
+                gaps: it.hr_llm_analysis.gaps ?? [],
+                summary: it.hr_llm_analysis.summary,
+              },
+            }
+          : {}),
         ...(it.hr_search_query != null && it.hr_search_query.trim() !== ""
           ? { hr_search_query: it.hr_search_query.trim() }
           : {}),
@@ -738,6 +806,88 @@ export async function downloadCandidatePdfBlob(
     throw new ApiError(msg || "Ошибка загрузки PDF", res.status, body);
   }
   return res.blob();
+}
+
+export async function exchangeOAuthHandoff(code: string) {
+  const res = await fetch(`${baseUrl}/api/v1/auth/oauth/exchange`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code }),
+  });
+  const text = await res.text();
+  let body: unknown = text;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    /* keep */
+  }
+  if (!res.ok) {
+    const msg = formatDetail(body) ?? STATUS_HINT_RU[res.status] ?? res.statusText;
+    throw new ApiError(msg || "Ошибка обмена кода", res.status, body);
+  }
+  const data = body as {
+    access_token: string;
+    refresh_token: string;
+    expires_in?: number;
+  };
+  return {
+    accessToken: data.access_token,
+    refreshToken: data.refresh_token,
+  };
+}
+
+export type AuthMeResponse = {
+  id: string;
+  email: string;
+  is_admin: boolean;
+  is_super_admin: boolean;
+  can_write_integration_settings: boolean;
+  can_manage_integration_editors: boolean;
+  can_revoke_integration_editor_access: boolean;
+};
+
+export async function fetchAuthMe(accessToken: string): Promise<AuthMeResponse> {
+  const res = await fetch(`${baseUrl}/api/v1/auth/me`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  const text = await res.text();
+  let body: unknown = text;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    /* keep */
+  }
+  if (!res.ok) {
+    const msg = formatDetail(body) ?? STATUS_HINT_RU[res.status] ?? res.statusText;
+    throw new ApiError(msg || "Ошибка профиля", res.status, body);
+  }
+  return body as AuthMeResponse;
+}
+
+export type IntegrationEditorRow = {
+  id: string;
+  email: string;
+  is_admin: boolean;
+  can_edit_integration_settings: boolean;
+};
+
+export function fetchIntegrationEditors() {
+  return apiFetch<IntegrationEditorRow[]>(
+    "/admin/integration-settings-editors",
+  );
+}
+
+export function addIntegrationEditor(email: string) {
+  return apiFetch<IntegrationEditorRow>("/admin/integration-settings-editors", {
+    method: "POST",
+    body: JSON.stringify({ email }),
+  });
+}
+
+export function removeIntegrationEditorFlag(userId: string) {
+  return apiFetch<unknown>(`/admin/integration-settings-editors/${userId}`, {
+    method: "DELETE",
+  });
 }
 
 export async function loginRequest(email: string, password: string) {

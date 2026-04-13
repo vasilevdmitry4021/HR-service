@@ -23,7 +23,13 @@ os.environ.setdefault("TOKEN_ENCRYPTION_KEY", "pytest-token-encryption-key-32byt
 # Перекрываем значения из docker-compose / .env: выгрузка и HH в тестах без реального OAuth
 os.environ["FEATURE_USE_MOCK_LLM"] = "true"
 os.environ["FEATURE_USE_MOCK_HH"] = "true"
+os.environ["FEATURE_USE_MOCK_SOCIAL_OAUTH"] = "true"
+os.environ.setdefault("HR_PUBLIC_BASE_URL", "http://localhost:3000")
+# Снимки поиска в тестах — в памяти процесса (не общий Redis из .env)
+os.environ["REDIS_URL"] = ""
 os.environ.setdefault("INTERNAL_LLM_ENDPOINT", "")
+# Интеграционные тесты вызывают PUT глобальных настроек без роли администратора
+os.environ.setdefault("SETTINGS_ADMIN_ONLY", "false")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -67,6 +73,47 @@ def _integration_db_ready() -> None:
                         "ADD COLUMN IF NOT EXISTS export_detail JSON"
                     )
                 )
+        user_cols = {c["name"] for c in insp.get_columns("users")}
+        if "is_admin" not in user_cols:
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "ALTER TABLE users "
+                        "ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT false"
+                    )
+                )
+        if "active_refresh_jti" not in user_cols:
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "ALTER TABLE users "
+                        "ADD COLUMN IF NOT EXISTS active_refresh_jti VARCHAR(64)"
+                    )
+                )
+        if "can_edit_integration_settings" not in user_cols:
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "ALTER TABLE users "
+                        "ADD COLUMN IF NOT EXISTS can_edit_integration_settings "
+                        "BOOLEAN NOT NULL DEFAULT false"
+                    )
+                )
+        if "is_super_admin" not in user_cols:
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "ALTER TABLE users "
+                        "ADD COLUMN IF NOT EXISTS is_super_admin "
+                        "BOOLEAN NOT NULL DEFAULT false"
+                    )
+                )
+        fav_cols = {c["name"] for c in insp.get_columns("favorites")}
+        if "llm_analysis" not in fav_cols:
+            with engine.begin() as conn:
+                conn.execute(
+                    text("ALTER TABLE favorites ADD COLUMN IF NOT EXISTS llm_analysis JSONB")
+                )
     except Exception:
         pass
     yield
@@ -92,6 +139,7 @@ def _truncate_tables(session: Session) -> None:
             "telegram_message_attachments, telegram_messages, telegram_sync_runs, "
             "telegram_sources, telegram_accounts, "
             "candidate_contacts, candidate_source_links, favorites, candidate_profiles, "
+            "oauth_handoff_codes, oauth_identities, "
             "api_keys, estaff_exports, search_history, search_templates, system_settings, users "
             "RESTART IDENTITY CASCADE"
         )

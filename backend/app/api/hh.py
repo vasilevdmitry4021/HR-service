@@ -8,7 +8,7 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_db
+from app.api.deps import get_current_user, get_db, get_settings_admin
 from app.config import settings
 from app.core.security import create_oauth_state, decode_hh_oauth_user_id, verify_oauth_state
 from app.models.api_key import ApiKey
@@ -284,7 +284,7 @@ def get_hh_credentials_status(
 def update_hh_credentials(
     body: HHCredentialsIn,
     db: Session = Depends(get_db),
-    _user: User = Depends(get_current_user),
+    _admin: User = Depends(get_settings_admin),
 ) -> HHCredentialsPutOut:
     from datetime import datetime, timezone
 

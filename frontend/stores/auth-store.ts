@@ -21,11 +21,22 @@ export type AuthState = {
   accessToken: string | null;
   refreshToken: string | null;
   email: string | null;
+  /** null — ещё не загружено с сервера */
+  isAdmin: boolean | null;
+  isSuperAdmin: boolean | null;
+  canWriteIntegrationSettings: boolean | null;
+  canManageIntegrationEditors: boolean | null;
+  canRevokeIntegrationEditorAccess: boolean | null;
   _hasHydrated: boolean;
   setSession: (tokens: {
     accessToken: string;
     refreshToken: string;
     email?: string | null;
+    isAdmin?: boolean | null;
+    isSuperAdmin?: boolean | null;
+    canWriteIntegrationSettings?: boolean | null;
+    canManageIntegrationEditors?: boolean | null;
+    canRevokeIntegrationEditorAccess?: boolean | null;
   }) => void;
   clearSession: () => void;
 };
@@ -36,11 +47,50 @@ export const useAuthStore = create<AuthState>()(
       accessToken: null,
       refreshToken: null,
       email: null,
+      isAdmin: null,
+      isSuperAdmin: null,
+      canWriteIntegrationSettings: null,
+      canManageIntegrationEditors: null,
+      canRevokeIntegrationEditorAccess: null,
       _hasHydrated: false,
-      setSession: ({ accessToken, refreshToken, email }) =>
-        set({ accessToken, refreshToken, email: email ?? null }),
+      setSession: (tokens) =>
+        set((state) => ({
+          accessToken: tokens.accessToken,
+          refreshToken: tokens.refreshToken,
+          email:
+            "email" in tokens ? (tokens.email ?? null) : state.email,
+          isAdmin:
+            "isAdmin" in tokens
+              ? (tokens.isAdmin ?? null)
+              : state.isAdmin,
+          isSuperAdmin:
+            "isSuperAdmin" in tokens
+              ? (tokens.isSuperAdmin ?? null)
+              : state.isSuperAdmin,
+          canWriteIntegrationSettings:
+            "canWriteIntegrationSettings" in tokens
+              ? (tokens.canWriteIntegrationSettings ?? null)
+              : state.canWriteIntegrationSettings,
+          canManageIntegrationEditors:
+            "canManageIntegrationEditors" in tokens
+              ? (tokens.canManageIntegrationEditors ?? null)
+              : state.canManageIntegrationEditors,
+          canRevokeIntegrationEditorAccess:
+            "canRevokeIntegrationEditorAccess" in tokens
+              ? (tokens.canRevokeIntegrationEditorAccess ?? null)
+              : state.canRevokeIntegrationEditorAccess,
+        })),
       clearSession: () =>
-        set({ accessToken: null, refreshToken: null, email: null }),
+        set({
+          accessToken: null,
+          refreshToken: null,
+          email: null,
+          isAdmin: null,
+          isSuperAdmin: null,
+          canWriteIntegrationSettings: null,
+          canManageIntegrationEditors: null,
+          canRevokeIntegrationEditorAccess: null,
+        }),
     }),
     {
       name: "hr-auth",
@@ -50,6 +100,11 @@ export const useAuthStore = create<AuthState>()(
         accessToken: s.accessToken,
         refreshToken: s.refreshToken,
         email: s.email,
+        isAdmin: s.isAdmin,
+        isSuperAdmin: s.isSuperAdmin,
+        canWriteIntegrationSettings: s.canWriteIntegrationSettings,
+        canManageIntegrationEditors: s.canManageIntegrationEditors,
+        canRevokeIntegrationEditorAccess: s.canRevokeIntegrationEditorAccess,
       }),
     },
   ),

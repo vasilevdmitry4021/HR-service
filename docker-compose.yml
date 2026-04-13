@@ -15,6 +15,16 @@ services:
       timeout: 5s
       retries: 5
 
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   backend:
     build:
       context: ./backend
@@ -45,8 +55,16 @@ services:
       HH_CLIENT_ID: ${HH_CLIENT_ID:-}
       HH_CLIENT_SECRET: ${HH_CLIENT_SECRET:-}
       HH_REDIRECT_URI: ${HH_REDIRECT_URI:-http://localhost:8000/api/v1/hh/callback}
+      YANDEX_CLIENT_ID: ${YANDEX_CLIENT_ID:-}
+      YANDEX_CLIENT_SECRET: ${YANDEX_CLIENT_SECRET:-}
+      YANDEX_REDIRECT_URI: ${YANDEX_REDIRECT_URI:-http://localhost:8000/api/v1/auth/oauth/yandex/callback}
+      VK_CLIENT_ID: ${VK_CLIENT_ID:-}
+      VK_CLIENT_SECRET: ${VK_CLIENT_SECRET:-}
+      VK_REDIRECT_URI: ${VK_REDIRECT_URI:-http://localhost:8000/api/v1/auth/oauth/vk/callback}
+      VK_OAUTH_BASE_URL: ${VK_OAUTH_BASE_URL:-https://id.vk.com}
       FEATURE_USE_MOCK_LLM: ${FEATURE_USE_MOCK_LLM:-false}
       FEATURE_USE_MOCK_HH: ${FEATURE_USE_MOCK_HH:-false}
+      FEATURE_USE_MOCK_SOCIAL_OAUTH: ${FEATURE_USE_MOCK_SOCIAL_OAUTH:-false}
       FEATURE_USE_MOCK_ESTAFF: ${FEATURE_USE_MOCK_ESTAFF:-false}
       ESTAFF_CREATE_CANDIDATE_PATH: ${ESTAFF_CREATE_CANDIDATE_PATH:-/api/candidate/add}
       ESTAFF_VACANCIES_PATH: ${ESTAFF_VACANCIES_PATH:-/api/vacancy/find}
@@ -74,7 +92,11 @@ services:
       TELEGRAM_ALLOWED_ATTACHMENT_TYPES: ${TELEGRAM_ALLOWED_ATTACHMENT_TYPES:-pdf,docx,doc,txt}
       TELEGRAM_RESUME_CLASSIFIER_ENABLED: ${TELEGRAM_RESUME_CLASSIFIER_ENABLED:-true}
       TELEGRAM_RESUME_CLASSIFIER_MIN_SCORE: ${TELEGRAM_RESUME_CLASSIFIER_MIN_SCORE:-0.6}
+      # Снимки поиска между репликами бэкенда; пустое значение — только память процесса
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
     depends_on:
+      redis:
+        condition: service_healthy
       db:
         condition: service_healthy
     volumes:

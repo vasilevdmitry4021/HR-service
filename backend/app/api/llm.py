@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_db
+from app.api.deps import get_current_user, get_db, get_settings_admin
 from app.models.system_settings import SystemSettings
 from app.models.user import User
 from app.schemas.llm import (
@@ -73,7 +73,7 @@ def get_llm_settings(
 def put_llm_settings(
     body: LLMSettingsIn,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_settings_admin),
 ) -> dict[str, str]:
     existing = llm_client.get_llm_credentials_from_db(db)
     merged = _merge_llm_payload(existing, body)

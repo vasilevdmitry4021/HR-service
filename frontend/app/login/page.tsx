@@ -17,6 +17,10 @@ import { Label } from "@/components/ui/label";
 import { ApiError, loginRequest } from "@/lib/api";
 import { useAuthStore } from "@/stores/auth-store";
 
+const oauthApiBase =
+  (typeof process !== "undefined" && process.env.NEXT_PUBLIC_API_URL) ||
+  "http://localhost:8000";
+
 export default function LoginPage() {
   const router = useRouter();
   const setSession = useAuthStore((s) => s.setSession);
@@ -88,6 +92,38 @@ export default function LoginPage() {
               <Button type="submit" className="w-full" size="lg" disabled={loading}>
                 {loading ? "Вход в систему…" : "Войти"}
               </Button>
+              <div className="relative py-2">
+                <div className="absolute inset-0 flex items-center">
+                  <span className="w-full border-t border-border" />
+                </div>
+                <div className="relative flex justify-center text-xs uppercase tracking-wide">
+                  <span className="bg-card px-2 text-muted-foreground">или</span>
+                </div>
+              </div>
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-full"
+                  disabled={loading}
+                  onClick={() => {
+                    window.location.href = `${oauthApiBase}/api/v1/auth/oauth/yandex/start`;
+                  }}
+                >
+                  Яндекс
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-full"
+                  disabled={loading}
+                  onClick={() => {
+                    window.location.href = `${oauthApiBase}/api/v1/auth/oauth/vk/start`;
+                  }}
+                >
+                  ВКонтакте
+                </Button>
+              </div>
               <div className="text-center text-sm text-muted-foreground">
                 Нет аккаунта?{" "}
                 <Link href="/register" className="text-primary font-medium hover:underline">

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="HR Service">
+  <rect width="32" height="32" rx="7" fill="hsl(221 83% 53%)"/>
+  <g fill="none" stroke="#ffffff" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="14" cy="14" r="5.75"/>
+    <line x1="18.4" y1="18.4" x2="23" y2="23"/>
+  </g>
+  <circle cx="14" cy="14" r="2" fill="#ffffff"/>
+</svg>

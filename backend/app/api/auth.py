@@ -1,20 +1,22 @@
 from __future__ import annotations
 
+from uuid import UUID
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_db
-from app.config import settings
-from app.core.security import (
-    create_access_token,
-    create_refresh_token,
-    decode_token_optional,
-    hash_password,
-    verify_password,
+from app.api.deps import (
+    can_manage_integration_editors,
+    can_write_integration_settings,
+    get_current_user,
+    get_db,
+    is_super_settings_admin,
 )
+from app.core.security import decode_token_optional, hash_password, verify_password
 from app.models.user import User
 from app.schemas.auth import LoginIn, RefreshIn, RegisterIn, RegisterOut, TokenOut, UserMeOut
+from app.services.auth_tokens import issue_token_out
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -38,16 +40,16 @@ def register(body: RegisterIn, db: Session = Depends(get_db)) -> User:
 @router.post("/login", response_model=TokenOut)
 def login(body: LoginIn, db: Session = Depends(get_db)) -> TokenOut:
     user = db.query(User).filter(User.email == body.email.lower()).one_or_none()
-    if not user or not verify_password(body.password, user.password_hash):
+    if (
+        not user
+        or user.password_hash is None
+        or not verify_password(body.password, user.password_hash)
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",
         )
-    return TokenOut(
-        access_token=create_access_token(user.id),
-        refresh_token=create_refresh_token(user.id),
-        expires_in=settings.access_token_expire_minutes * 60,
-    )
+    return issue_token_out(db, user)
 
 
 @router.post("/refresh", response_model=TokenOut)
@@ -58,7 +60,6 @@ def refresh(body: RefreshIn, db: Session = Depends(get_db)) -> TokenOut:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired refresh token",
         )
-    from uuid import UUID
 
     try:
         uid = UUID(str(payload["sub"]))
@@ -73,13 +74,32 @@ def refresh(body: RefreshIn, db: Session = Depends(get_db)) -> TokenOut:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid refresh token",
         )
-    return TokenOut(
-        access_token=create_access_token(user.id),
-        refresh_token=create_refresh_token(user.id),
-        expires_in=settings.access_token_expire_minutes * 60,
-    )
+
+    token_jti = payload.get("jti")
+    stored = user.active_refresh_jti
+    if stored is not None:
+        if not token_jti or str(token_jti) != str(stored):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired refresh token",
+            )
+    elif token_jti is not None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired refresh token",
+        )
+
+    return issue_token_out(db, user)
 
 
 @router.get("/me", response_model=UserMeOut)
-def me(user: User = Depends(get_current_user)) -> User:
-    return user
+def me(user: User = Depends(get_current_user)) -> UserMeOut:
+    return UserMeOut(
+        id=user.id,
+        email=user.email,
+        is_admin=user.is_admin,
+        is_super_admin=user.is_super_admin,
+        can_write_integration_settings=can_write_integration_settings(user),
+        can_manage_integration_editors=can_manage_integration_editors(user),
+        can_revoke_integration_editor_access=is_super_settings_admin(user),
+    )

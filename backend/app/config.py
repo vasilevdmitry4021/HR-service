@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://hr:hr@localhost:5432/hr_service"
 
     secret_key: str = "change-me-in-production"
+    # production — строгие проверки (например TOKEN_ENCRYPTION_KEY); development по умолчанию
+    environment: str = "development"
     access_token_expire_minutes: int = 30
     refresh_token_expire_days: int = 7
     jwt_algorithm: str = "HS256"
@@ -28,8 +30,20 @@ class Settings(BaseSettings):
     hh_client_secret: str = ""
     hh_redirect_uri: str = "http://localhost:8000/api/v1/hh/callback"
 
+    yandex_client_id: str = ""
+    yandex_client_secret: str = ""
+    yandex_redirect_uri: str = "http://localhost:8000/api/v1/auth/oauth/yandex/callback"
+
+    vk_client_id: str = ""
+    vk_client_secret: str = ""
+    vk_redirect_uri: str = "http://localhost:8000/api/v1/auth/oauth/vk/callback"
+    vk_oauth_base_url: str = "https://id.vk.com"
+    # MAX (мессенджер): в документации platform-api.max.ru описан API ботов с токеном приложения;
+    # сценария OAuth2 «вход пользователя на сайт» в открытом доступе нет — отдельный провайдер не подключён.
+
     feature_use_mock_llm: bool = True
     feature_use_mock_hh: bool = True
+    feature_use_mock_social_oauth: bool = False
     feature_use_mock_estaff: bool = False
     feature_use_telegram_source: bool = False
 
@@ -46,6 +60,8 @@ class Settings(BaseSettings):
 
     # Пути относительно базового URL (полный хост в настройках, например krit.e-staff.ru)
     estaff_create_candidate_path: str = "/api/candidate/add"
+    # POST /api/user/get — проверка существования пользователя по логину
+    estaff_user_get_path: str = "/api/user/get"
     # POST /api/vacancy/find — см. документацию e-staff
     estaff_vacancies_path: str = "/api/vacancy/find"
     # Проверка TLS при вызове e-staff (false только для отладки / внутренний CA)
@@ -97,6 +113,11 @@ class Settings(BaseSettings):
     # Снимок выдачи поиска (пагинация без повторных запросов к HH/LLM)
     search_snapshot_ttl_seconds: int = 3600
     search_snapshot_max_per_user: int = 8
+    # Пустая строка — хранение снимков в памяти процесса; для нескольких реплик укажите Redis
+    redis_url: str = ""
+
+    # POST /search/parse/debug — сырой ответ LLM (по умолчанию выключено; при включении — только админы)
+    feature_search_parse_debug: bool = False
     search_max_resumes_fetch_per_search: int = 1000
     search_hh_page_size: int = 50
     # Максимум резюме с подгрузкой полных данных (опыт, «о себе») на этапе evaluate
@@ -107,6 +128,20 @@ class Settings(BaseSettings):
     strict_filter_mode: str = "hide"  # hide | demote
 
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
+
+    # Глобальные секреты (HH-приложение, e-staff, LLM): PUT только при is_admin у пользователя
+    # или совпадении email / id со списками ниже. При settings_admin_only=false любой
+    # авторизованный пользователь может записывать (только для локальной разработки).
+    feature_settings_write: bool = True
+    settings_admin_only: bool = True
+    settings_admin_emails: str = ""
+    settings_admin_user_ids: str = ""
+    # Устарело: не используется для выдачи супер-прав.
+    # Оставлено только для обратной совместимости конфигов/окружений.
+    super_settings_admin_email: str = ""
+
+    # true — не связывать OAuth с существующим пользователем по email, если у него задан пароль
+    social_oauth_strict_email_link: bool = False
 
     @property
     def cors_origin_list(self) -> list[str]:

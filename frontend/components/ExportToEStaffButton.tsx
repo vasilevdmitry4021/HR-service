@@ -5,7 +5,9 @@ import { toast } from "sonner";
 
 import { EstaffExportDialog } from "@/components/estaff/EstaffExportDialog";
 import { Button } from "@/components/ui/button";
+import type { LLMAnalysis } from "@/lib/types";
 import {
+  estaffLlmAnalysisHasPayload,
   fetchEstaffExportLatest,
   sanitizeApiErrorMessage,
   type EstaffExportLatestResponse,
@@ -30,6 +32,7 @@ type Props = {
   showToastNotifications?: boolean;
   hrLlmSummary?: string | null;
   hrLlmScore?: number | null;
+  hrLlmAnalysis?: LLMAnalysis | null;
   hrSearchQuery?: string | null;
 };
 
@@ -43,6 +46,7 @@ export function ExportToEStaffButton({
   showToastNotifications = true,
   hrLlmSummary = null,
   hrLlmScore = null,
+  hrLlmAnalysis = null,
   hrSearchQuery = null,
 }: Props) {
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -125,6 +129,7 @@ export function ExportToEStaffButton({
     Boolean(id) &&
     (Boolean(hrLlmSummary?.trim()) ||
       hrLlmScore != null ||
+      estaffLlmAnalysisHasPayload(hrLlmAnalysis) ||
       Boolean(hrSearchQuery?.trim()));
   const hrBundleContextByResumeId: Record<string, EstaffHrBundleContext> | undefined =
     hasBundleCtx && id
@@ -134,6 +139,9 @@ export function ExportToEStaffButton({
               ? { hr_llm_summary: hrLlmSummary }
               : {}),
             ...(hrLlmScore != null ? { hr_llm_score: hrLlmScore } : {}),
+            ...(estaffLlmAnalysisHasPayload(hrLlmAnalysis) && hrLlmAnalysis
+              ? { hr_llm_analysis: hrLlmAnalysis }
+              : {}),
             ...(hrSearchQuery != null && hrSearchQuery.trim() !== ""
               ? { hr_search_query: hrSearchQuery.trim() }
               : {}),
