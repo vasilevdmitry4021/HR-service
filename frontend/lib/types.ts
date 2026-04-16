@@ -80,13 +80,65 @@ export type EvaluateCandidateRow = {
 export type EvaluateSnapshotResponse = {
   items: EvaluateCandidateRow[];
   evaluated_count: number;
+  llm_scored_count: number;
+  fallback_scored_count: number;
+  coverage_ratio: number;
   processing_time_seconds: number;
+  metrics?: Record<string, unknown>;
+};
+
+export type EvaluateStartResponse = {
+  job_id: string;
+  status: string;
+  total_count: number;
+};
+
+export type EvaluateProgressResponse = {
+  job_id: string;
+  status: string;
+  stage: string;
+  phase: "interactive" | "background" | "done" | string;
+  total_count: number;
+  scored_count: number;
+  llm_scored_count: number;
+  fallback_scored_count: number;
+  coverage_ratio: number;
+  completed_count: number;
+  interactive_total_count: number;
+  background_total_count: number;
+  interactive_done_count: number;
+  background_done_count: number;
+  interactive_llm_scored_count: number;
+  background_llm_scored_count: number;
+  interactive_fallback_count: number;
+  background_fallback_count: number;
+  items: EvaluateCandidateRow[];
+  processing_time_seconds?: number | null;
+  error?: string | null;
+  metrics?: Record<string, unknown>;
 };
 
 export type AnalyzeSnapshotResponse = {
   items: Candidate[];
   analyzed_count: number;
   processing_time_seconds: number;
+};
+
+export type AnalyzeStartResponse = {
+  job_id: string;
+  status: string;
+  total_count: number;
+};
+
+export type AnalyzeProgressResponse = {
+  job_id: string;
+  status: string;
+  stage: string;
+  total_count: number;
+  processed_count: number;
+  analyzed_count: number;
+  processing_time_seconds?: number | null;
+  error?: string | null;
 };
 
 export type HHStatus = {

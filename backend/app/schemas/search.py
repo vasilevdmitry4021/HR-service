@@ -129,7 +129,42 @@ class EvaluateCandidateOut(BaseModel):
 class EvaluateOut(BaseModel):
     items: list[EvaluateCandidateOut]
     evaluated_count: int
+    llm_scored_count: int = 0
+    fallback_scored_count: int = 0
+    coverage_ratio: float = 0.0
     processing_time_seconds: float
+    metrics: dict[str, Any] = Field(default_factory=dict)
+
+
+class EvaluateStartOut(BaseModel):
+    job_id: str
+    status: str
+    total_count: int
+
+
+class EvaluateProgressOut(BaseModel):
+    job_id: str
+    status: str
+    stage: str
+    phase: str = "interactive"
+    total_count: int
+    scored_count: int
+    llm_scored_count: int = 0
+    fallback_scored_count: int = 0
+    coverage_ratio: float = 0.0
+    completed_count: int
+    interactive_total_count: int = 0
+    background_total_count: int = 0
+    interactive_done_count: int = 0
+    background_done_count: int = 0
+    interactive_llm_scored_count: int = 0
+    background_llm_scored_count: int = 0
+    interactive_fallback_count: int = 0
+    background_fallback_count: int = 0
+    items: list[EvaluateCandidateOut]
+    processing_time_seconds: float | None = None
+    error: str | None = None
+    metrics: dict[str, Any] = Field(default_factory=dict)
 
 
 class AnalyzeIn(BaseModel):
@@ -140,3 +175,20 @@ class AnalyzeOut(BaseModel):
     items: list[CandidateOut]
     analyzed_count: int
     processing_time_seconds: float
+
+
+class AnalyzeStartOut(BaseModel):
+    job_id: str
+    status: str
+    total_count: int
+
+
+class AnalyzeProgressOut(BaseModel):
+    job_id: str
+    status: str
+    stage: str
+    total_count: int
+    processed_count: int
+    analyzed_count: int
+    processing_time_seconds: float | None = None
+    error: str | None = None

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
+from time import sleep
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -89,9 +91,386 @@ def test_evaluate_snapshot_updates_items(
                 assert r1.status_code == 200
                 data = r1.json()
                 assert data["evaluated_count"] == 5
+                assert data["coverage_ratio"] == 1.0
+                assert data["llm_scored_count"] == 5
+                assert data["fallback_scored_count"] == 0
                 for x in data["items"]:
                     assert set(x.keys()) == {"id", "llm_score"}
                     assert x.get("llm_score") == 77
+
+
+def test_evaluate_snapshot_progress_polling(
+    client: TestClient,
+    auth_headers: dict[str, str],
+) -> None:
+    async def fake_eval(
+        access: str | None,
+        resumes: list,
+        parsed_params: dict,
+        db: object,
+        *,
+        user_id: uuid.UUID | None = None,
+        progress_callback=None,
+    ):
+        _ = access, parsed_params, db, user_id
+        out: list[dict] = []
+        for i, r in enumerate(resumes):
+            d = dict(r)
+            d["llm_score"] = 90 if i < 2 else 60
+            out.append(d)
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "stage": "prescore",
+                    "phase": "interactive",
+                    "total_count": 2,
+                    "llm_scored_count": 2,
+                    "fallback_scored_count": 0,
+                    "scores_delta": {str(out[0]["id"]): 90, str(out[1]["id"]): 90},
+                }
+            )
+            progress_callback(
+                {
+                    "stage": "phase_done",
+                    "phase": "interactive",
+                    "phase_total_count": 2,
+                    "phase_scored_count": 2,
+                    "phase_llm_scored_count": 2,
+                    "phase_fallback_count": 0,
+                }
+            )
+            await asyncio.sleep(0.08)
+            progress_callback(
+                {
+                    "stage": "prescore",
+                    "phase": "background",
+                    "total_count": 1,
+                    "llm_scored_count": 2,
+                    "fallback_scored_count": 1,
+                    "scores_delta": {str(out[2]["id"]): 60},
+                    "event": "fallback_done",
+                }
+            )
+            progress_callback(
+                {
+                    "stage": "phase_done",
+                    "phase": "background",
+                    "phase_total_count": 1,
+                    "phase_scored_count": 1,
+                    "phase_llm_scored_count": 0,
+                    "phase_fallback_count": 1,
+                }
+            )
+        return out, {
+            "llm_calls_total": 2,
+            "interactive_scored_count": 2,
+            "background_scored_count": 1,
+            "llm_scored_count": 2,
+            "fallback_scored_count": 1,
+            "coverage_ratio": 1.0,
+            "cache_hit": 0,
+            "cache_miss": 0,
+            "hh_fetch_count": 0,
+        }
+
+    async def fake_search(*args: object, **kwargs: object) -> tuple[list, int]:
+        return _make_mock_resumes(3), 3
+
+    with patch("app.api.search._llm_endpoint_configured", return_value=True):
+        with patch(
+            "app.api.search.hh_client.search_resumes",
+            new_callable=AsyncMock,
+            side_effect=fake_search,
+        ):
+            r0 = client.post(
+                "/api/v1/search",
+                headers=auth_headers,
+                json={"query": "Python", "page": 0, "per_page": 20},
+            )
+            assert r0.status_code == 200
+            sid = r0.json().get("snapshot_id")
+            assert sid
+
+            with patch(
+                "app.api.search.llm_evaluation.evaluate_all_resumes",
+                new_callable=AsyncMock,
+                side_effect=fake_eval,
+            ):
+                rs = client.post(
+                    f"/api/v1/search/{sid}/evaluate/start",
+                    headers=auth_headers,
+                    json={},
+                )
+                assert rs.status_code == 200, rs.text
+                job_id = rs.json()["job_id"]
+                assert job_id
+
+                done = None
+                observed_interactive_ready = False
+                for _ in range(30):
+                    sleep(0.02)
+                    rp = client.get(
+                        f"/api/v1/search/{sid}/evaluate/progress",
+                        headers=auth_headers,
+                        params={"job_id": job_id},
+                    )
+                    assert rp.status_code == 200, rp.text
+                    payload = rp.json()
+                    if (
+                        payload["status"] == "running"
+                        and payload["interactive_done_count"] >= 2
+                    ):
+                        observed_interactive_ready = True
+                    if payload["status"] == "done":
+                        done = payload
+                        break
+
+                assert done is not None
+                assert observed_interactive_ready is True
+                assert done["scored_count"] == 3
+                assert done["llm_scored_count"] == 2
+                assert done["fallback_scored_count"] == 1
+                assert done["coverage_ratio"] == 1.0
+                assert len(done["items"]) == 3
+                assert done["interactive_total_count"] == 2
+                assert done["background_total_count"] == 1
+                assert done["interactive_done_count"] == 2
+                assert done["background_done_count"] == 1
+                assert done["interactive_llm_scored_count"] == 2
+                assert done["background_fallback_count"] == 1
+                assert all(item.get("llm_score") is not None for item in done["items"])
+                assert done["metrics"]["cache_hit"] == 0
+                assert done["metrics"]["cache_miss"] == 0
+                assert done["metrics"]["hh_fetch_count"] == 0
+
+
+def test_evaluate_snapshot_returns_hh_limit_error_detail(
+    client: TestClient,
+    auth_headers: dict[str, str],
+) -> None:
+    async def fake_search(*args: object, **kwargs: object) -> tuple[list, int]:
+        return _make_mock_resumes(2), 2
+
+    async def fake_eval(*args: object, **kwargs: object):
+        raise HHClientError(403, "Превышен дневной лимит просмотров резюме")
+
+    with patch("app.api.search._llm_endpoint_configured", return_value=True):
+        with patch(
+            "app.api.search.hh_client.search_resumes",
+            new_callable=AsyncMock,
+            side_effect=fake_search,
+        ):
+            r0 = client.post(
+                "/api/v1/search",
+                headers=auth_headers,
+                json={"query": "Python", "page": 0, "per_page": 20},
+            )
+            assert r0.status_code == 200
+            sid = r0.json().get("snapshot_id")
+            assert sid
+
+            with patch(
+                "app.api.search.llm_evaluation.evaluate_all_resumes",
+                new_callable=AsyncMock,
+                side_effect=fake_eval,
+            ):
+                r1 = client.post(
+                    f"/api/v1/search/{sid}/evaluate",
+                    headers=auth_headers,
+                    json={},
+                )
+
+    assert r1.status_code == 403
+    assert r1.json()["detail"] == "Превышен дневной лимит просмотров резюме"
+
+
+def test_evaluate_snapshot_progress_returns_hh_limit_error(
+    client: TestClient,
+    auth_headers: dict[str, str],
+) -> None:
+    async def fake_search(*args: object, **kwargs: object) -> tuple[list, int]:
+        return _make_mock_resumes(3), 3
+
+    async def fake_eval(*args: object, **kwargs: object):
+        raise HHClientError(403, "Превышен дневной лимит просмотров резюме")
+
+    with patch("app.api.search._llm_endpoint_configured", return_value=True):
+        with patch(
+            "app.api.search.hh_client.search_resumes",
+            new_callable=AsyncMock,
+            side_effect=fake_search,
+        ):
+            r0 = client.post(
+                "/api/v1/search",
+                headers=auth_headers,
+                json={"query": "Python", "page": 0, "per_page": 20},
+            )
+            assert r0.status_code == 200
+            sid = r0.json().get("snapshot_id")
+            assert sid
+
+            with patch(
+                "app.api.search.llm_evaluation.evaluate_all_resumes",
+                new_callable=AsyncMock,
+                side_effect=fake_eval,
+            ):
+                rs = client.post(
+                    f"/api/v1/search/{sid}/evaluate/start",
+                    headers=auth_headers,
+                    json={},
+                )
+                assert rs.status_code == 200, rs.text
+                job_id = rs.json()["job_id"]
+                assert job_id
+
+                failed = None
+                for _ in range(30):
+                    sleep(0.02)
+                    rp = client.get(
+                        f"/api/v1/search/{sid}/evaluate/progress",
+                        headers=auth_headers,
+                        params={"job_id": job_id},
+                    )
+                    assert rp.status_code == 200, rp.text
+                    payload = rp.json()
+                    if payload["status"] == "error":
+                        failed = payload
+                        break
+
+                assert failed is not None
+                assert failed["stage"] == "error"
+                assert (
+                    failed["error"] == "Превышен дневной лимит просмотров резюме"
+                )
+
+
+def test_analyze_snapshot_progress_polling(
+    client: TestClient,
+    auth_headers: dict[str, str],
+) -> None:
+    async def fake_search(*args: object, **kwargs: object) -> tuple[list, int]:
+        return _make_mock_resumes(4), 4
+
+    async def fake_eval(
+        access: str | None,
+        resumes: list,
+        parsed_params: dict,
+        db: object,
+        *,
+        user_id: uuid.UUID | None = None,
+        progress_callback=None,
+    ):
+        _ = access, parsed_params, db, user_id, progress_callback
+        out: list[dict] = []
+        for i, r in enumerate(resumes):
+            d = dict(r)
+            d["llm_score"] = 95 - i
+            out.append(d)
+        return out, {"coverage_ratio": 1.0}
+
+    async def fake_analyze(
+        access: str | None,
+        items: list,
+        parsed_params: dict,
+        *,
+        user_id: str,
+        query: str,
+        top_n: int,
+        db: object,
+        progress_callback=None,
+    ):
+        _ = access, parsed_params, user_id, query, db
+        if progress_callback is not None:
+            progress_callback(
+                {"stage": "start", "processed_count": 0, "analyzed_count": 0}
+            )
+        out: list[dict] = []
+        for i, row in enumerate(items):
+            d = dict(row)
+            if i < top_n:
+                d["llm_analysis"] = {
+                    "llm_score": d.get("llm_score"),
+                    "is_relevant": True,
+                    "strengths": ["Python"],
+                    "gaps": [],
+                    "summary": "ok",
+                }
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "stage": "running",
+                            "processed_count": i + 1,
+                            "analyzed_count": i + 1,
+                        }
+                    )
+            out.append(d)
+        if progress_callback is not None:
+            progress_callback(
+                {"stage": "done", "processed_count": top_n, "analyzed_count": top_n}
+            )
+        return out
+
+    with patch("app.api.search._llm_endpoint_configured", return_value=True):
+        with patch(
+            "app.api.search.hh_client.search_resumes",
+            new_callable=AsyncMock,
+            side_effect=fake_search,
+        ):
+            r0 = client.post(
+                "/api/v1/search",
+                headers=auth_headers,
+                json={"query": "Python", "page": 0, "per_page": 20},
+            )
+            assert r0.status_code == 200
+            sid = r0.json().get("snapshot_id")
+            assert sid
+
+            with patch(
+                "app.api.search.llm_evaluation.evaluate_all_resumes",
+                new_callable=AsyncMock,
+                side_effect=fake_eval,
+            ):
+                reval = client.post(
+                    f"/api/v1/search/{sid}/evaluate",
+                    headers=auth_headers,
+                    json={},
+                )
+                assert reval.status_code == 200, reval.text
+
+            with patch(
+                "app.api.search.llm_evaluation.analyze_top_resumes",
+                new_callable=AsyncMock,
+                side_effect=fake_analyze,
+            ):
+                rs = client.post(
+                    f"/api/v1/search/{sid}/analyze/start",
+                    headers=auth_headers,
+                    json={"top_n": 2},
+                )
+                assert rs.status_code == 200, rs.text
+                body = rs.json()
+                assert body["status"] == "queued"
+                assert body["total_count"] == 2
+                job_id = body["job_id"]
+
+                done = None
+                for _ in range(30):
+                    sleep(0.02)
+                    rp = client.get(
+                        f"/api/v1/search/{sid}/analyze/progress",
+                        headers=auth_headers,
+                        params={"job_id": job_id},
+                    )
+                    assert rp.status_code == 200, rp.text
+                    payload = rp.json()
+                    if payload["status"] == "done":
+                        done = payload
+                        break
+                assert done is not None
+                assert done["stage"] == "done"
+                assert done["total_count"] == 2
+                assert done["processed_count"] == 2
+                assert done["analyzed_count"] == 2
 
 
 def test_search_parse_requires_auth(client: TestClient) -> None:

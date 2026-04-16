@@ -1,7 +1,11 @@
 import type {
+  AnalyzeProgressResponse,
   AnalyzeSnapshotResponse,
+  AnalyzeStartResponse,
   Candidate,
   CandidateDetail,
+  EvaluateProgressResponse,
+  EvaluateStartResponse,
   EvaluateSnapshotResponse,
   FavoriteRefreshResponse,
   FavoriteRow,
@@ -442,6 +446,22 @@ export async function evaluateSearchSnapshot(snapshotId: string) {
   );
 }
 
+export async function startEvaluateSearchSnapshot(snapshotId: string) {
+  return apiFetch<EvaluateStartResponse>(
+    `/search/${encodeURIComponent(snapshotId)}/evaluate/start`,
+    { method: "POST", body: JSON.stringify({}) },
+  );
+}
+
+export async function fetchEvaluateSearchProgress(
+  snapshotId: string,
+  jobId: string,
+) {
+  return apiFetch<EvaluateProgressResponse>(
+    `/search/${encodeURIComponent(snapshotId)}/evaluate/progress?job_id=${encodeURIComponent(jobId)}`,
+  );
+}
+
 export async function analyzeSearchSnapshot(
   snapshotId: string,
   topN: number = 15,
@@ -452,6 +472,28 @@ export async function analyzeSearchSnapshot(
       method: "POST",
       body: JSON.stringify({ top_n: topN }),
     },
+  );
+}
+
+export async function startAnalyzeSearchSnapshot(
+  snapshotId: string,
+  topN: number = 15,
+) {
+  return apiFetch<AnalyzeStartResponse>(
+    `/search/${encodeURIComponent(snapshotId)}/analyze/start`,
+    {
+      method: "POST",
+      body: JSON.stringify({ top_n: topN }),
+    },
+  );
+}
+
+export async function fetchAnalyzeSearchProgress(
+  snapshotId: string,
+  jobId: string,
+) {
+  return apiFetch<AnalyzeProgressResponse>(
+    `/search/${encodeURIComponent(snapshotId)}/analyze/progress?job_id=${encodeURIComponent(jobId)}`,
   );
 }
 

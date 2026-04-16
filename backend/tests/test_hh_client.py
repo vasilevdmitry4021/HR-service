@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import uuid
+from unittest.mock import AsyncMock, patch
+
 import pytest
 import respx
 from httpx import Response
@@ -171,3 +174,85 @@ async def test_fetch_resume_includes_work_experience(real_hh_settings: Settings)
     assert row.get("about") and "Java" in row["about"]
     assert "education" in row and len(row["education"]) == 1
     assert "Информатика" in (row["education"][0].get("summary") or "")
+
+
+@pytest.mark.asyncio
+async def test_search_resumes_retries_once_after_hh_401(
+    real_hh_settings: Settings,
+) -> None:
+    payload = {"found": 1, "items": [{"id": "resume-1", "title": "Python dev"}]}
+    with respx.mock(assert_all_called=True) as router:
+        route = router.get(f"{hh_client.HH_API}/resumes").mock(
+            side_effect=[
+                Response(401, json={"errors": [{"type": "oauth", "value": "token_expired"}]}),
+                Response(200, json=payload),
+            ]
+        )
+        with patch(
+            "app.api.hh_access.ensure_hh_access_token",
+            new_callable=AsyncMock,
+            return_value="new-access-token",
+        ) as refresh_mock:
+            items, found = await hh_client.search_resumes(
+                "old-access-token",
+                {"skills": ["Python"], "text": "dev"},
+                None,
+                0,
+                20,
+                db=object(),
+                hh_token_user_id=uuid.uuid4(),
+            )
+
+    assert found == 1
+    assert len(items) == 1
+    refresh_mock.assert_awaited_once()
+    assert len(route.calls) == 2
+    assert route.calls[0].request.headers["Authorization"] == "Bearer old-access-token"
+    assert route.calls[1].request.headers["Authorization"] == "Bearer new-access-token"
+
+
+@pytest.mark.asyncio
+async def test_fetch_resume_retries_once_after_hh_401(real_hh_settings: Settings) -> None:
+    payload = {"id": "resume-42", "title": "Engineer"}
+    with respx.mock(assert_all_called=True) as router:
+        route = router.get(f"{hh_client.HH_API}/resumes/resume-42").mock(
+            side_effect=[
+                Response(401, json={"errors": [{"type": "oauth", "value": "token_expired"}]}),
+                Response(200, json=payload),
+            ]
+        )
+        with patch(
+            "app.api.hh_access.ensure_hh_access_token",
+            new_callable=AsyncMock,
+            return_value="fresh-token",
+        ) as refresh_mock:
+            row = await hh_client.fetch_resume(
+                "expired-token",
+                "resume-42",
+                db=object(),
+                hh_token_user_id=uuid.uuid4(),
+            )
+
+    assert row["id"] == "resume-42"
+    refresh_mock.assert_awaited_once()
+    assert len(route.calls) == 2
+    assert route.calls[0].request.headers["Authorization"] == "Bearer expired-token"
+    assert route.calls[1].request.headers["Authorization"] == "Bearer fresh-token"
+
+
+@pytest.mark.asyncio
+async def test_fetch_resume_raises_view_limit_exceeded_message(
+    real_hh_settings: Settings,
+) -> None:
+    with respx.mock(assert_all_called=True) as router:
+        router.get(f"{hh_client.HH_API}/resumes/resume-limit").mock(
+            return_value=Response(
+                403,
+                json={"errors": [{"type": "resumes", "value": "view_limit_exceeded"}]},
+            )
+        )
+        with pytest.raises(hh_client.HHClientError) as exc:
+            await hh_client.fetch_resume("Bearer-token", "resume-limit")
+
+    assert exc.value.status_code == 403
+    assert exc.value.detail == "Превышен дневной лимит просмотров резюме"

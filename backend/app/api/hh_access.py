@@ -74,8 +74,9 @@ async def ensure_hh_access_token(
     if not need_refresh:
         return access_str or None
 
+    fallback_access = None if force_refresh else (access_str or None)
     if not refresh or not str(refresh).strip():
-        return access_str or None
+        return fallback_access
 
     triple = resolve_hh_application_oauth(db)
     if triple:
@@ -84,7 +85,7 @@ async def ensure_hh_access_token(
         client_id = settings.hh_client_id
         client_secret = settings.hh_client_secret
     if not str(client_id or "").strip() or not str(client_secret or "").strip():
-        return access_str or None
+        return fallback_access
 
     try:
         tokens = await refresh_access_token(
@@ -93,11 +94,11 @@ async def ensure_hh_access_token(
             client_secret=str(client_secret).strip(),
         )
     except HHClientError:
-        return access_str or None
+        return fallback_access
 
     new_access = tokens.get("access_token")
     if not new_access:
-        return access_str or None
+        return fallback_access
 
     new_refresh = tokens.get("refresh_token") or refresh
     expires_in = int(tokens.get("expires_in") or 3600)

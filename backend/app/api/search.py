@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import time
@@ -12,15 +13,20 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user, get_db, require_search_parse_debug_access
 from app.api.hh_access import ensure_hh_access_token
 from app.config import settings
+from app.db.session import SessionLocal
 from app.models.search_history import SearchHistory
 from app.models.user import User
 from app.schemas.search import (
     AnalyzeIn,
     AnalyzeOut,
+    AnalyzeProgressOut,
+    AnalyzeStartOut,
     CandidateOut,
     EvaluateCandidateOut,
     EvaluateIn,
     EvaluateOut,
+    EvaluateProgressOut,
+    EvaluateStartOut,
     SearchIn,
     SearchOut,
     SearchParseIn,
@@ -29,10 +35,13 @@ from app.schemas.search import (
 from app.services import hh_client
 from app.services import llm_client
 from app.services import llm_evaluation
+from app.services import analyze_progress
+from app.services import evaluate_progress
 from app.services import nlp_service
 from app.services import post_filter
 from app.services import telegram_search
 from app.services.hh_client import HHClientError
+from app.services.hh_errors import is_daily_view_limit_error
 from app.services.search_snapshot_cache import (
     SearchSnapshotData,
     get_snapshot,
@@ -147,6 +156,260 @@ def _snapshot_needs_hh_access(items: list[dict[str, Any]]) -> bool:
     return any((x.get("source_type") or "hh") != "telegram" for x in items)
 
 
+def _scores_map(rows: list[dict[str, Any]]) -> dict[str, int | None]:
+    out: dict[str, int | None] = {}
+    for row in rows:
+        rid = str(row.get("id", row.get("hh_resume_id", ""))).strip()
+        if not rid:
+            continue
+        val = row.get("llm_score")
+        if isinstance(val, int):
+            out[rid] = int(val)
+    return out
+
+
+async def _run_evaluate_job(
+    *,
+    job_id: str,
+    user_id: str,
+    user_uuid: uuid.UUID,
+    snapshot_id: str,
+    access: str | None,
+) -> None:
+    evaluate_progress.mark_running(job_id)
+    started = time.monotonic()
+    db = SessionLocal()
+    try:
+        snap = get_snapshot(user_id, snapshot_id)
+        if snap is None:
+            evaluate_progress.mark_failed(job_id, "Снимок выдачи устарел или не найден.")
+            return
+
+        parsed = {**snap.parsed_params, "text": snap.query}
+        base_rows: list[dict[str, Any]] = []
+        for d in snap.items:
+            nd = dict(d)
+            nd["llm_score"] = None
+            nd["llm_analysis"] = None
+            base_rows.append(nd)
+
+        def on_progress(evt: dict[str, Any]) -> None:
+            stage = str(evt.get("stage") or "running")
+            phase = str(evt.get("phase") or "").strip() or None
+            stage_ui = stage
+            if stage == "enrichment":
+                stage_ui = "preparing"
+            elif stage == "prescore":
+                stage_ui = "evaluating_top" if phase == "interactive" else "evaluating_rest"
+            elif stage == "phase_done":
+                phase_total = int(evt.get("phase_total_count") or 0)
+                has_background = len(base_rows) > phase_total
+                if phase == "interactive" and has_background:
+                    stage_ui = "evaluating_rest"
+                elif phase == "background" or (phase == "interactive" and not has_background):
+                    stage_ui = "done"
+            evaluate_progress.update_stage(job_id, stage_ui)
+            if phase:
+                evaluate_progress.update_phase(job_id, phase)
+            if stage == "prescore":
+                # Публикуем частичные оценки батчами для polling на фронте.
+                total_count = int(evt.get("total_count") or len(base_rows))
+                counters: dict[str, int] = {"total_count": len(base_rows)}
+                if phase == "interactive":
+                    counters["interactive_total_count"] = total_count
+                elif phase == "background":
+                    counters["background_total_count"] = total_count
+                evaluate_progress.update_counters(job_id, **counters)
+                metrics_patch: dict[str, Any] = {}
+                if evt.get("llm_calls_refill") is not None:
+                    metrics_patch["llm_calls_refill"] = int(evt.get("llm_calls_refill") or 0)
+                if evt.get("llm_scored_count") is not None:
+                    metrics_patch["llm_scored_count"] = int(evt.get("llm_scored_count") or 0)
+                if evt.get("fallback_scored_count") is not None:
+                    metrics_patch["fallback_scored_count"] = int(
+                        evt.get("fallback_scored_count") or 0
+                    )
+                if evt.get("scored_count") is not None:
+                    if phase:
+                        metrics_patch[f"{phase}_scored_count"] = int(
+                            evt.get("scored_count") or 0
+                        )
+                    else:
+                        metrics_patch["scored_count"] = int(evt.get("scored_count") or 0)
+                evaluate_progress.merge_metrics(job_id, metrics_patch)
+                delta = evt.get("scores_delta")
+                if isinstance(delta, dict):
+                    score_source = "fallback" if str(evt.get("event") or "") == "fallback_done" else "llm"
+                    patch: dict[str, int | None] = {}
+                    for rid, score in delta.items():
+                        key = str(rid).strip()
+                        if not key:
+                            continue
+                        patch[key] = score if isinstance(score, int) else None
+                    if patch:
+                        evaluate_progress.add_partial_scores(
+                            job_id,
+                            patch,
+                            phase=phase,
+                            score_source=score_source,
+                        )
+            elif stage == "phase_done":
+                phase_total = int(evt.get("phase_total_count") or 0)
+                phase_scored = int(evt.get("phase_scored_count") or 0)
+                phase_llm_scored = int(evt.get("phase_llm_scored_count") or 0)
+                phase_fallback = int(evt.get("phase_fallback_count") or 0)
+                if phase == "interactive":
+                    evaluate_progress.update_counters(
+                        job_id,
+                        interactive_total_count=phase_total,
+                    )
+                    evaluate_progress.merge_metrics(
+                        job_id,
+                        {
+                            "interactive_scored_count": phase_scored,
+                            "interactive_llm_scored_count": phase_llm_scored,
+                            "interactive_fallback_count": phase_fallback,
+                        },
+                    )
+                elif phase == "background":
+                    evaluate_progress.update_counters(
+                        job_id,
+                        background_total_count=phase_total,
+                    )
+                    evaluate_progress.merge_metrics(
+                        job_id,
+                        {
+                            "background_scored_count": phase_scored,
+                            "background_llm_scored_count": phase_llm_scored,
+                            "background_fallback_count": phase_fallback,
+                        },
+                    )
+
+        eval_result = await llm_evaluation.evaluate_all_resumes(
+            access,
+            base_rows,
+            parsed,
+            db,
+            user_id=user_uuid,
+            progress_callback=on_progress,
+        )
+        if isinstance(eval_result, tuple):
+            updated, metrics = eval_result
+        else:
+            updated, metrics = eval_result, {}
+
+        new_snap = SearchSnapshotData(
+            items=updated,
+            found_raw_hh=snap.found_raw_hh,
+            loaded_from_hh=snap.loaded_from_hh,
+            parsed_params=snap.parsed_params,
+            query=snap.query,
+            filters=snap.filters,
+            evaluated=True,
+            analyzed=False,
+            source_scope=snap.source_scope,
+            found_telegram=snap.found_telegram,
+        )
+        replace_snapshot(user_id, snapshot_id, new_snap)
+        evaluate_progress.mark_done(
+            job_id,
+            scores=_scores_map(updated),
+            processing_time_seconds=time.monotonic() - started,
+            metrics=metrics,
+        )
+    except HHClientError as exc:
+        logger.warning("Оценка снимка остановлена ошибкой HH: %s", exc.detail)
+        evaluate_progress.mark_failed(job_id, exc.detail)
+    except Exception as exc:
+        logger.exception("Ошибка оценки снимка в фоне: %s", exc)
+        evaluate_progress.mark_failed(job_id, "Не удалось выполнить оценку резюме")
+    finally:
+        db.close()
+
+
+async def _run_analyze_job(
+    *,
+    job_id: str,
+    user_id: str,
+    snapshot_id: str,
+    access: str | None,
+    top_n: int,
+) -> None:
+    analyze_progress.mark_running(job_id)
+    started = time.monotonic()
+    db = SessionLocal()
+    try:
+        snap = get_snapshot(user_id, snapshot_id)
+        if snap is None:
+            analyze_progress.mark_failed(job_id, "Снимок выдачи устарел или не найден.")
+            return
+        if not any(isinstance(x.get("llm_score"), int) for x in snap.items):
+            analyze_progress.mark_failed(
+                job_id, "Сначала выполните оценку выдачи (evaluate)."
+            )
+            return
+
+        parsed = {**snap.parsed_params, "text": snap.query}
+
+        def _progress(evt: dict[str, Any]) -> None:
+            stage = str(evt.get("stage") or "running")
+            if stage == "start":
+                stage = "preparing"
+            processed = int(evt.get("processed_count") or 0)
+            analyzed = int(evt.get("analyzed_count") or 0)
+            analyze_progress.update_progress(
+                job_id,
+                stage=stage,
+                processed_count=processed,
+                analyzed_count=analyzed,
+            )
+
+        updated = await llm_evaluation.analyze_top_resumes(
+            access,
+            list(snap.items),
+            parsed,
+            user_id=user_id,
+            query=snap.query,
+            top_n=top_n,
+            db=db,
+            progress_callback=_progress,
+        )
+        processed_count = min(len(updated), max(1, int(top_n)))
+        analyzed_n = sum(1 for x in updated if x.get("llm_analysis"))
+        new_snap = SearchSnapshotData(
+            items=updated,
+            found_raw_hh=snap.found_raw_hh,
+            loaded_from_hh=snap.loaded_from_hh,
+            parsed_params=snap.parsed_params,
+            query=snap.query,
+            filters=snap.filters,
+            evaluated=True,
+            analyzed=True,
+            source_scope=snap.source_scope,
+            found_telegram=snap.found_telegram,
+        )
+        replace_snapshot(user_id, snapshot_id, new_snap)
+        analyze_progress.mark_done(
+            job_id,
+            processed_count=processed_count,
+            analyzed_count=analyzed_n,
+            processing_time_seconds=time.monotonic() - started,
+        )
+    except HHClientError as exc:
+        detail = exc.detail
+        if is_daily_view_limit_error(exc.detail):
+            detail = (
+                f"{exc.detail}. Ошибка связана с превышением дневного лимита "
+                "на просмотр резюме в HeadHunter."
+            )
+        analyze_progress.mark_failed(job_id, detail)
+    except Exception as exc:
+        logger.exception("Ошибка детального анализа в фоне: %s", exc)
+        analyze_progress.mark_failed(job_id, "Не удалось выполнить детальный анализ")
+    finally:
+        db.close()
+
+
 async def _fetch_hh_resume_pages(
     access: str | None,
     parsed: dict[str, Any],
@@ -257,9 +520,22 @@ async def evaluate_resumes(
         base_rows.append(nd)
 
     try:
-        updated = await llm_evaluation.evaluate_all_resumes(
-            access, base_rows, parsed, db, user_id=user.id
+        eval_result = await llm_evaluation.evaluate_all_resumes(
+            access,
+            base_rows,
+            parsed,
+            db,
+            user_id=user.id,
         )
+        if isinstance(eval_result, tuple):
+            updated, metrics = eval_result
+        else:
+            updated, metrics = eval_result, {}
+    except HHClientError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=exc.detail,
+        ) from exc
     except Exception as exc:
         logger.exception("Ошибка оценки снимка: %s", exc)
         raise HTTPException(
@@ -296,7 +572,11 @@ async def evaluate_resumes(
     return EvaluateOut(
         items=items_out,
         evaluated_count=len(updated),
+        llm_scored_count=int(metrics.get("llm_scored_count") or scored),
+        fallback_scored_count=int(metrics.get("fallback_scored_count") or 0),
+        coverage_ratio=round(float(metrics.get("coverage_ratio") or ((scored / len(updated)) if updated else 1.0)), 4),
         processing_time_seconds=round(elapsed, 3),
+        metrics=metrics,
     )
 
 
@@ -307,6 +587,7 @@ async def analyze_resumes(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> AnalyzeOut:
+    # Совместимый синхронный endpoint (deprecated): новый контракт — analyze/start + analyze/progress.
     if not _llm_endpoint_configured(db):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -348,6 +629,17 @@ async def analyze_resumes(
             top_n=top_n,
             db=db,
         )
+    except HHClientError as exc:
+        detail = exc.detail
+        if is_daily_view_limit_error(exc.detail):
+            detail = (
+                f"{exc.detail}. Ошибка связана с превышением дневного лимита "
+                "на просмотр резюме в HeadHunter."
+            )
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=detail,
+        ) from exc
     except Exception as exc:
         logger.exception("Ошибка детального анализа: %s", exc)
         raise HTTPException(
@@ -376,6 +668,214 @@ async def analyze_resumes(
         items=items_out,
         analyzed_count=analyzed_n,
         processing_time_seconds=round(elapsed, 3),
+    )
+
+
+@router.post("/{snapshot_id}/evaluate/start", response_model=EvaluateStartOut)
+async def evaluate_resumes_start(
+    snapshot_id: str,
+    body: EvaluateIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> EvaluateStartOut:
+    _ = body
+    if not _llm_endpoint_configured(db):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Не настроен доступ к языковой модели (веб-настройки или INTERNAL_LLM_ENDPOINT).",
+        )
+
+    uid = str(user.id)
+    snap = get_snapshot(uid, snapshot_id)
+    if snap is None:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Снимок выдачи устарел или не найден.",
+        )
+
+    access: str | None = None
+    if _snapshot_needs_hh_access(snap.items):
+        if not settings.feature_use_mock_hh:
+            access = await ensure_hh_access_token(db, user.id)
+            if not access:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Подключите HeadHunter для загрузки полных резюме",
+                )
+
+    job_id = evaluate_progress.create_job(
+        user_id=uid,
+        snapshot_id=snapshot_id,
+        total_count=len(snap.items),
+    )
+    interactive_total = min(
+        len(snap.items),
+        max(1, int(settings.evaluate_interactive_top_n or 50)),
+    )
+    evaluate_progress.update_counters(
+        job_id,
+        total_count=len(snap.items),
+        interactive_total_count=interactive_total,
+        background_total_count=max(0, len(snap.items) - interactive_total),
+    )
+    asyncio.create_task(
+        _run_evaluate_job(
+            job_id=job_id,
+            user_id=uid,
+            user_uuid=user.id,
+            snapshot_id=snapshot_id,
+            access=access,
+        )
+    )
+    return EvaluateStartOut(job_id=job_id, status="queued", total_count=len(snap.items))
+
+
+@router.post("/{snapshot_id}/analyze/start", response_model=AnalyzeStartOut)
+async def analyze_resumes_start(
+    snapshot_id: str,
+    body: AnalyzeIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> AnalyzeStartOut:
+    if not _llm_endpoint_configured(db):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Не настроен доступ к языковой модели (веб-настройки или INTERNAL_LLM_ENDPOINT).",
+        )
+    uid = str(user.id)
+    snap = get_snapshot(uid, snapshot_id)
+    if snap is None:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Снимок выдачи устарел или не найден.",
+        )
+    if not any(isinstance(x.get("llm_score"), int) for x in snap.items):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Сначала выполните оценку выдачи (evaluate).",
+        )
+
+    access: str | None = None
+    if _snapshot_needs_hh_access(snap.items):
+        if not settings.feature_use_mock_hh:
+            access = await ensure_hh_access_token(db, user.id)
+            if not access:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Подключите HeadHunter для загрузки полных резюме",
+                )
+
+    top_n = max(1, min(50, int(body.top_n)))
+    total_count = min(len(snap.items), top_n)
+    job_id = analyze_progress.create_job(
+        user_id=uid,
+        snapshot_id=snapshot_id,
+        total_count=total_count,
+    )
+    analyze_progress.update_progress(
+        job_id,
+        stage="queued",
+        processed_count=0,
+        analyzed_count=0,
+    )
+    asyncio.create_task(
+        _run_analyze_job(
+            job_id=job_id,
+            user_id=uid,
+            snapshot_id=snapshot_id,
+            access=access,
+            top_n=top_n,
+        )
+    )
+    return AnalyzeStartOut(job_id=job_id, status="queued", total_count=total_count)
+
+
+@router.get("/{snapshot_id}/analyze/progress", response_model=AnalyzeProgressOut)
+async def analyze_resumes_progress(
+    snapshot_id: str,
+    job_id: str,
+    user: User = Depends(get_current_user),
+) -> AnalyzeProgressOut:
+    state = analyze_progress.get_job(job_id)
+    if state is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Задача анализа не найдена или истекла.",
+        )
+    if str(state.get("user_id")) != str(user.id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Нет доступа к задаче анализа.",
+        )
+    if str(state.get("snapshot_id")) != snapshot_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="job_id не относится к указанному snapshot_id.",
+        )
+    return AnalyzeProgressOut(
+        job_id=str(state.get("job_id") or job_id),
+        status=str(state.get("status") or "queued"),
+        stage=str(state.get("stage") or "queued"),
+        total_count=int(state.get("total_count") or 0),
+        processed_count=int(state.get("processed_count") or 0),
+        analyzed_count=int(state.get("analyzed_count") or 0),
+        processing_time_seconds=state.get("processing_time_seconds"),
+        error=state.get("error"),
+    )
+
+
+@router.get("/{snapshot_id}/evaluate/progress", response_model=EvaluateProgressOut)
+async def evaluate_resumes_progress(
+    snapshot_id: str,
+    job_id: str,
+    user: User = Depends(get_current_user),
+) -> EvaluateProgressOut:
+    state = evaluate_progress.get_job(job_id)
+    if state is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Задача оценки не найдена или истекла.",
+        )
+
+    if str(state.get("user_id")) != str(user.id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Нет доступа к задаче оценки.",
+        )
+    if str(state.get("snapshot_id")) != snapshot_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="job_id не относится к указанному snapshot_id.",
+        )
+
+    scores = state.get("scores") or {}
+    items = [
+        EvaluateCandidateOut(id=str(rid), llm_score=score if isinstance(score, int) else None)
+        for rid, score in sorted(scores.items(), key=lambda item: str(item[0]))
+    ]
+    return EvaluateProgressOut(
+        job_id=str(state.get("job_id") or job_id),
+        status=str(state.get("status") or "queued"),
+        stage=str(state.get("stage") or "queued"),
+        phase=str(state.get("phase") or "interactive"),
+        total_count=int(state.get("total_count") or 0),
+        scored_count=int(state.get("scored_count") or 0),
+        llm_scored_count=int(state.get("llm_scored_count") or 0),
+        fallback_scored_count=int(state.get("fallback_scored_count") or 0),
+        coverage_ratio=float(state.get("coverage_ratio") or 0.0),
+        completed_count=int(state.get("completed_count") or 0),
+        interactive_total_count=int(state.get("interactive_total_count") or 0),
+        background_total_count=int(state.get("background_total_count") or 0),
+        interactive_done_count=int(state.get("interactive_done_count") or 0),
+        background_done_count=int(state.get("background_done_count") or 0),
+        interactive_llm_scored_count=int(state.get("interactive_llm_scored_count") or 0),
+        background_llm_scored_count=int(state.get("background_llm_scored_count") or 0),
+        interactive_fallback_count=int(state.get("interactive_fallback_count") or 0),
+        background_fallback_count=int(state.get("background_fallback_count") or 0),
+        items=items,
+        processing_time_seconds=state.get("processing_time_seconds"),
+        error=state.get("error"),
+        metrics=dict(state.get("metrics") or {}),
     )
 
 

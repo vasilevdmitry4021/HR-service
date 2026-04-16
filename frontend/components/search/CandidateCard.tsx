@@ -22,6 +22,7 @@ type Props = {
   onToggleFavorite?: (candidate: Candidate) => void;
   onAnalyze?: (candidate: Candidate) => void;
   analyzeBusy?: boolean;
+  analyzeDisabled?: boolean;
   estaffLatestByResumeId?: Record<string, EstaffExportLatestResponse>;
   onEstaffExportUpdated?: () => void;
 };
@@ -34,6 +35,7 @@ export function CandidateCard({
   onToggleFavorite,
   onAnalyze,
   analyzeBusy,
+  analyzeDisabled,
   estaffLatestByResumeId,
   onEstaffExportUpdated,
 }: Props) {
@@ -145,7 +147,7 @@ export function CandidateCard({
                 size="sm"
                 variant="secondary"
                 className="shrink-0 gap-1.5"
-                disabled={analyzeBusy || !searchQuery?.trim()}
+                disabled={analyzeBusy || analyzeDisabled || !searchQuery?.trim()}
                 onClick={() => onAnalyze?.(candidate)}
               >
                 {analyzeBusy ? (

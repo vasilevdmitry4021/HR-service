@@ -235,6 +235,32 @@ def _format_resume_for_batch(
     return base
 
 
+def _format_resume_for_prescore_batch(resume: dict[str, Any]) -> str:
+    """Компактный формат для pre-score: только ключевые признаки и короткие фрагменты."""
+    rid = str(resume.get("id", resume.get("hh_resume_id", "")))
+    title = _shorten_text(str(resume.get("title") or "").strip(), 80)
+    exp = resume.get("experience_years", 0)
+    area = _shorten_text(str(resume.get("area") or "").strip(), 80)
+    about = _resume_about_for_prompt(resume, max_chars=500)
+    work = _resume_work_summary_for_prompt(resume, max_chars=900)
+    parts = [
+        f"[resume_id={rid}]",
+        f"должность: {title or 'не указана'}",
+        f"опыт: {exp} лет",
+        f"регион: {area or 'не указан'}",
+    ]
+    if about != "не указано":
+        parts.append(f"о себе: {about.replace(chr(10), ' ')}")
+    if work != "не указано":
+        parts.append(f"опыт работы: {work.replace(chr(10), ' | ')}")
+    return " | ".join(parts)
+
+
+def _format_resume_for_analyze_batch(resume: dict[str, Any]) -> str:
+    """Расширенный формат для batch analyze (с тегами и более длинным контекстом)."""
+    return _format_resume_for_batch(resume, include_skill_tags=True)
+
+
 def _extract_json(text: str) -> dict[str, Any] | None:
     text = text.strip()
     m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
@@ -316,7 +342,7 @@ def analyze_resumes_batch(
 
     for batch in batches:
         if batch_size > 1 and len(batch) > 1:
-            resumes_block = "\n".join(_format_resume_for_batch(r) for r in batch)
+            resumes_block = "\n".join(_format_resume_for_analyze_batch(r) for r in batch)
             prompt = RESUME_BATCH_PROMPT.format(
                 **header,
                 resumes_block=resumes_block,

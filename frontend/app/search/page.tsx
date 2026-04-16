@@ -24,21 +24,24 @@ import { StatusIndicator } from "@/components/StatusIndicator";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Progress } from "@/components/ui/progress";
 import { Sheet, SheetContent } from "@/components/ui/sheet";
 import {
   addFavorite,
   analyzeCandidate,
-  analyzeSearchSnapshot,
   ApiError,
   apiFetch,
   createTemplate,
+  fetchAnalyzeSearchProgress,
   deleteTemplate,
-  evaluateSearchSnapshot,
+  fetchEvaluateSearchProgress,
   fetchFavorites,
   fetchReferenceAreasRussia,
   fetchTelegramStatus,
   fetchTemplates,
   removeFavorite,
+  startAnalyzeSearchSnapshot,
+  startEvaluateSearchSnapshot,
 } from "@/lib/api";
 import { consumeRepeatSearchPayload } from "@/lib/repeat-search";
 import {
@@ -77,6 +80,95 @@ function cardModelScore(c: Candidate): number | null {
   return c.llm_score ?? null;
 }
 
+function mapProgressToUi(progress: {
+  status: string;
+  stage: string;
+  phase: string;
+  total_count: number;
+  scored_count: number;
+  llm_scored_count?: number;
+  fallback_scored_count?: number;
+  coverage_ratio?: number;
+  interactive_done_count?: number;
+  interactive_total_count?: number;
+  background_done_count?: number;
+  background_total_count?: number;
+  interactive_fallback_count?: number;
+  background_fallback_count?: number;
+}) {
+  const interactiveTotal = progress.interactive_total_count ?? 0;
+  const interactiveDone = progress.interactive_done_count ?? 0;
+  return {
+    status: progress.status,
+    stage: progress.stage,
+    phase: progress.phase,
+    total: progress.total_count,
+    scored: progress.scored_count,
+    llmScored: progress.llm_scored_count ?? 0,
+    fallbackScored: progress.fallback_scored_count ?? 0,
+    coverageRatio: progress.coverage_ratio ?? 0,
+    interactiveDone,
+    interactiveTotal,
+    backgroundDone: progress.background_done_count ?? 0,
+    backgroundTotal: progress.background_total_count ?? 0,
+    interactiveFallback: progress.interactive_fallback_count ?? 0,
+    backgroundFallback: progress.background_fallback_count ?? 0,
+    interactiveReady:
+      interactiveTotal > 0
+        ? interactiveDone >= interactiveTotal
+        : progress.phase === "background" || progress.status === "done",
+  };
+}
+
+function statusLabelRu(status: string): string {
+  switch (status) {
+    case "done":
+      return "Завершено";
+    case "error":
+      return "Ошибка";
+    case "running":
+      return "Выполняется";
+    case "queued":
+      return "В очереди";
+    default:
+      return status || "Выполняется";
+  }
+}
+
+function stageLabelRu(stage: string): string {
+  switch (stage) {
+    case "preparing":
+      return "Подготавливаем резюме";
+    case "evaluating_top":
+      return "Оцениваем найденные резюме";
+    case "evaluating_rest":
+      return "Дооцениваем оставшиеся резюме";
+    case "done":
+      return "Оценка завершена";
+    case "error":
+      return "Ошибка оценки";
+    default:
+      return "Выполняем оценку";
+  }
+}
+
+function analyzeStageLabelRu(stage: string): string {
+  switch (stage) {
+    case "queued":
+      return "Задача в очереди";
+    case "preparing":
+      return "Подготовка резюме";
+    case "running":
+      return "Детальный анализ";
+    case "done":
+      return "Детальный анализ завершен";
+    case "error":
+      return "Ошибка анализа";
+    default:
+      return "Детальный анализ";
+  }
+}
+
 function SearchPageContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -104,6 +196,46 @@ function SearchPageContent() {
   const [analyzeBusy, setAnalyzeBusy] = useState<string | null>(null);
   const [snapshotEvalBusy, setSnapshotEvalBusy] = useState(false);
   const [snapshotAnalyzeBusy, setSnapshotAnalyzeBusy] = useState(false);
+  const [snapshotAnalyzeJob, setSnapshotAnalyzeJob] = useState<{
+    snapshotId: string;
+    jobId: string;
+  } | null>(null);
+  const [snapshotAnalyzeProgress, setSnapshotAnalyzeProgress] = useState<{
+    status: string;
+    stage: string;
+    total: number;
+    processed: number;
+    analyzed: number;
+  } | null>(null);
+  const [snapshotEvalJob, setSnapshotEvalJob] = useState<{
+    snapshotId: string;
+    jobId: string;
+  } | null>(null);
+  const [snapshotEvalProgress, setSnapshotEvalProgress] = useState<{
+    status: string;
+    stage: string;
+    phase: string;
+    total: number;
+    scored: number;
+    llmScored: number;
+    fallbackScored: number;
+    coverageRatio: number;
+    interactiveDone: number;
+    interactiveTotal: number;
+    backgroundDone: number;
+    backgroundTotal: number;
+    interactiveFallback: number;
+    backgroundFallback: number;
+    interactiveReady: boolean;
+  } | null>(null);
+  const [snapshotEvalScores, setSnapshotEvalScores] = useState<
+    Record<string, number | null>
+  >({});
+  const snapshotEvalPollKeyRef = useRef<string | null>(null);
+  const snapshotEvalRunIdRef = useRef(0);
+  const snapshotEvalInteractiveReadyRef = useRef(false);
+  const snapshotAnalyzePollKeyRef = useRef<string | null>(null);
+  const snapshotAnalyzeRunIdRef = useRef(0);
   const [perPage, setPerPage] = useState(20);
   const [sourceScope, setSourceScope] = useState<"hh" | "telegram" | "all">(
     "hh",
@@ -115,6 +247,22 @@ function SearchPageContent() {
   const [hhAreasLoading, setHhAreasLoading] = useState(true);
   const [hhAreasHint, setHhAreasHint] = useState<string | null>(null);
   const repeatAppliedRef = useRef(false);
+  const evalStatus = snapshotEvalProgress?.status ?? (snapshotEvalBusy ? "running" : "");
+  const evalIsActive =
+    (snapshotEvalBusy || Boolean(snapshotEvalJob)) &&
+    evalStatus !== "done" &&
+    evalStatus !== "error";
+  const evalCompleted = snapshotEvalProgress?.status === "done";
+  const analyzeStatus =
+    snapshotAnalyzeProgress?.status ?? (snapshotAnalyzeBusy ? "running" : "");
+  const analyzeIsActive =
+    (snapshotAnalyzeBusy || Boolean(snapshotAnalyzeJob)) &&
+    analyzeStatus !== "done" &&
+    analyzeStatus !== "error";
+  const batchOperationActive = evalIsActive || analyzeIsActive;
+  const canShowAnalyzeTop = evalCompleted;
+  const canRunEvaluate = !analyzeIsActive && !evalIsActive;
+  const canRunAnalyzeTop = evalCompleted && !analyzeIsActive && !evalIsActive;
 
   const areaLabels = useMemo(() => {
     const m = new Map<number, string>();
@@ -195,6 +343,10 @@ function SearchPageContent() {
       saved.perPage ??
         (saved.results?.per_page === 50 ? 50 : 20),
     );
+    setSnapshotEvalJob(saved.snapshotEvalJob ?? null);
+    setSnapshotEvalProgress(saved.snapshotEvalProgress ?? null);
+    setSnapshotAnalyzeJob(saved.snapshotAnalyzeJob ?? null);
+    setSnapshotAnalyzeProgress(saved.snapshotAnalyzeProgress ?? null);
   }, [accessToken, searchParams, router]);
 
   useEffect(() => {
@@ -209,10 +361,27 @@ function SearchPageContent() {
         listFilter,
         listSort,
         perPage,
+        snapshotEvalJob,
+        snapshotEvalProgress,
+        snapshotAnalyzeJob,
+        snapshotAnalyzeProgress,
       });
     }, 300);
     return () => window.clearTimeout(t);
-  }, [accessToken, q, filters, results, activeTab, listFilter, listSort, perPage]);
+  }, [
+    accessToken,
+    q,
+    filters,
+    results,
+    activeTab,
+    listFilter,
+    listSort,
+    perPage,
+    snapshotEvalJob,
+    snapshotEvalProgress,
+    snapshotAnalyzeJob,
+    snapshotAnalyzeProgress,
+  ]);
 
   const loadTemplates = useCallback(async () => {
     if (!accessToken) return;
@@ -265,8 +434,59 @@ function SearchPageContent() {
 
   const processedItems = useMemo(() => {
     const items = results?.items ?? [];
-    return processCandidatesForList(items, listFilter, listSort);
-  }, [results, listFilter, listSort]);
+    const withOverlay =
+      Object.keys(snapshotEvalScores).length === 0
+        ? items
+        : items.map((item) => {
+            const byId = snapshotEvalScores[item.id];
+            const resumeKey =
+              item.hh_resume_id && item.hh_resume_id.trim()
+                ? item.hh_resume_id.trim()
+                : null;
+            const byResumeId = resumeKey ? snapshotEvalScores[resumeKey] : undefined;
+            const nextScore = byId !== undefined ? byId : byResumeId;
+            if (nextScore === undefined) return item;
+            return { ...item, llm_score: nextScore ?? null };
+          });
+    return processCandidatesForList(withOverlay, listFilter, listSort);
+  }, [results, snapshotEvalScores, listFilter, listSort]);
+
+  useEffect(() => {
+    const currentSnapshotId =
+      typeof results?.snapshot_id === "string" && results.snapshot_id.trim()
+        ? results.snapshot_id.trim()
+        : null;
+    if (snapshotEvalJob && currentSnapshotId && snapshotEvalJob.snapshotId !== currentSnapshotId) {
+      snapshotEvalRunIdRef.current += 1;
+      setSnapshotEvalJob(null);
+      setSnapshotEvalProgress(null);
+      setSnapshotEvalScores({});
+      setSnapshotEvalBusy(false);
+    }
+    if (!currentSnapshotId && snapshotEvalJob) {
+      snapshotEvalRunIdRef.current += 1;
+      setSnapshotEvalJob(null);
+      setSnapshotEvalProgress(null);
+      setSnapshotEvalScores({});
+      setSnapshotEvalBusy(false);
+    }
+    if (
+      snapshotAnalyzeJob &&
+      currentSnapshotId &&
+      snapshotAnalyzeJob.snapshotId !== currentSnapshotId
+    ) {
+      snapshotAnalyzeRunIdRef.current += 1;
+      setSnapshotAnalyzeJob(null);
+      setSnapshotAnalyzeProgress(null);
+      setSnapshotAnalyzeBusy(false);
+    }
+    if (!currentSnapshotId && snapshotAnalyzeJob) {
+      snapshotAnalyzeRunIdRef.current += 1;
+      setSnapshotAnalyzeJob(null);
+      setSnapshotAnalyzeProgress(null);
+      setSnapshotAnalyzeBusy(false);
+    }
+  }, [results?.snapshot_id, snapshotEvalJob, snapshotAnalyzeJob]);
 
   const tabCounts = useMemo(() => {
     const items = processedItems;
@@ -317,6 +537,7 @@ function SearchPageContent() {
   }, []);
 
   const handleClearSearch = useCallback(() => {
+    snapshotEvalRunIdRef.current += 1;
     setQ("");
     setFilters(emptySearchFilters());
     setResults(null);
@@ -326,6 +547,9 @@ function SearchPageContent() {
     setPerPage(20);
     setListFilter("");
     setListSort("server");
+    setSnapshotEvalJob(null);
+    setSnapshotEvalProgress(null);
+    setSnapshotEvalScores({});
     clearSearchState();
   }, []);
 
@@ -389,8 +613,12 @@ function SearchPageContent() {
   }, [queryForApi]);
 
   const runSearch = useCallback(async () => {
+    snapshotEvalRunIdRef.current += 1;
     setLoading(true);
     setError(null);
+    setSnapshotEvalJob(null);
+    setSnapshotEvalProgress(null);
+    setSnapshotEvalScores({});
     try {
       const data = await fetchResultsPage(0, perPage);
       setActiveTab("all");
@@ -477,42 +705,213 @@ function SearchPageContent() {
     }
   }, [results, perPage, fetchResultsPage]);
 
+  const pollSnapshotEvaluation = useCallback(
+    async (snapshotId: string, jobId: string) => {
+      const pollKey = `${snapshotId}:${jobId}`;
+      const runId = snapshotEvalRunIdRef.current;
+      if (snapshotEvalPollKeyRef.current === pollKey) return;
+      snapshotEvalPollKeyRef.current = pollKey;
+      setSnapshotEvalBusy(true);
+
+      try {
+        for (;;) {
+          if (snapshotEvalRunIdRef.current !== runId) break;
+          const progress = await fetchEvaluateSearchProgress(snapshotId, jobId);
+          const uiProgress = mapProgressToUi(progress);
+          setSnapshotEvalProgress(uiProgress);
+
+          if (progress.items.length > 0) {
+            const updates: Record<string, number | null> = {};
+            for (const row of progress.items) {
+              updates[row.id] = row.llm_score ?? null;
+            }
+            setSnapshotEvalScores((prev) => ({ ...prev, ...updates }));
+          }
+
+          if (uiProgress.interactiveReady && !snapshotEvalInteractiveReadyRef.current) {
+            snapshotEvalInteractiveReadyRef.current = true;
+            await refreshCurrentResultsPage();
+          }
+
+          if (progress.status === "done") {
+            await refreshCurrentResultsPage();
+            break;
+          }
+          if (progress.status === "error") {
+            throw new ApiError(
+              progress.error?.trim() || "Не удалось оценить выдачу",
+              503,
+              progress,
+            );
+          }
+          await new Promise((resolve) => window.setTimeout(resolve, 1200));
+        }
+      } catch (e) {
+        setError(e instanceof ApiError ? e.message : "Не удалось оценить выдачу");
+      } finally {
+        setSnapshotEvalBusy(false);
+        if (snapshotEvalPollKeyRef.current === pollKey) {
+          snapshotEvalPollKeyRef.current = null;
+        }
+      }
+    },
+    [refreshCurrentResultsPage],
+  );
+
+  useEffect(() => {
+    if (!accessToken) return;
+    if (!snapshotEvalJob) return;
+    if (snapshotEvalProgress?.status === "done" || snapshotEvalProgress?.status === "error") {
+      return;
+    }
+    void pollSnapshotEvaluation(snapshotEvalJob.snapshotId, snapshotEvalJob.jobId);
+  }, [accessToken, snapshotEvalJob, snapshotEvalProgress?.status, pollSnapshotEvaluation]);
+
+  useEffect(() => {
+    return () => {
+      snapshotEvalRunIdRef.current += 1;
+      snapshotAnalyzeRunIdRef.current += 1;
+    };
+  }, []);
+
+  const pollSnapshotAnalyze = useCallback(
+    async (snapshotId: string, jobId: string) => {
+      const pollKey = `${snapshotId}:${jobId}`;
+      const runId = snapshotAnalyzeRunIdRef.current;
+      if (snapshotAnalyzePollKeyRef.current === pollKey) return;
+      snapshotAnalyzePollKeyRef.current = pollKey;
+      setSnapshotAnalyzeBusy(true);
+
+      try {
+        for (;;) {
+          if (snapshotAnalyzeRunIdRef.current !== runId) break;
+          const progress = await fetchAnalyzeSearchProgress(snapshotId, jobId);
+          setSnapshotAnalyzeProgress({
+            status: progress.status,
+            stage: progress.stage,
+            total: progress.total_count,
+            processed: progress.processed_count,
+            analyzed: progress.analyzed_count,
+          });
+          if (progress.status === "done") {
+            await refreshCurrentResultsPage();
+            break;
+          }
+          if (progress.status === "error") {
+            throw new ApiError(
+              progress.error?.trim() || "Не удалось выполнить детальный анализ",
+              503,
+              progress,
+            );
+          }
+          await new Promise((resolve) => window.setTimeout(resolve, 1200));
+        }
+      } catch (e) {
+        setError(
+          e instanceof ApiError
+            ? e.message
+            : "Не удалось выполнить детальный анализ",
+        );
+      } finally {
+        setSnapshotAnalyzeBusy(false);
+        if (snapshotAnalyzePollKeyRef.current === pollKey) {
+          snapshotAnalyzePollKeyRef.current = null;
+        }
+      }
+    },
+    [refreshCurrentResultsPage],
+  );
+
+  useEffect(() => {
+    if (!accessToken) return;
+    if (!snapshotAnalyzeJob) return;
+    if (
+      snapshotAnalyzeProgress?.status === "done" ||
+      snapshotAnalyzeProgress?.status === "error"
+    ) {
+      return;
+    }
+    void pollSnapshotAnalyze(snapshotAnalyzeJob.snapshotId, snapshotAnalyzeJob.jobId);
+  }, [
+    accessToken,
+    snapshotAnalyzeJob,
+    snapshotAnalyzeProgress?.status,
+    pollSnapshotAnalyze,
+  ]);
+
   const handleEvaluateSnapshot = useCallback(async () => {
+    if (!canRunEvaluate) return;
     const sid = results?.snapshot_id?.trim();
     if (!sid) return;
-    setSnapshotEvalBusy(true);
+    snapshotEvalRunIdRef.current += 1;
     setError(null);
+    setSnapshotEvalProgress({
+      status: "queued",
+      stage: "preparing",
+      phase: "interactive",
+      total: 0,
+      scored: 0,
+      llmScored: 0,
+      fallbackScored: 0,
+      coverageRatio: 0,
+      interactiveDone: 0,
+      interactiveTotal: 0,
+      backgroundDone: 0,
+      backgroundTotal: 0,
+      interactiveFallback: 0,
+      backgroundFallback: 0,
+      interactiveReady: false,
+    });
+    snapshotEvalInteractiveReadyRef.current = false;
     try {
-      await evaluateSearchSnapshot(sid);
-      await refreshCurrentResultsPage();
+      const started = await startEvaluateSearchSnapshot(sid);
+      setSnapshotEvalJob({
+        snapshotId: sid,
+        jobId: started.job_id,
+      });
     } catch (e) {
-      setError(
-        e instanceof ApiError ? e.message : "Не удалось оценить выдачу",
-      );
-    } finally {
+      setError(e instanceof ApiError ? e.message : "Не удалось оценить выдачу");
+      setSnapshotEvalProgress(null);
+      setSnapshotEvalJob(null);
       setSnapshotEvalBusy(false);
     }
-  }, [results?.snapshot_id, refreshCurrentResultsPage]);
+  }, [results?.snapshot_id, canRunEvaluate]);
 
   const handleAnalyzeSnapshot = useCallback(async () => {
+    if (!evalCompleted || evalIsActive) return;
     const sid = results?.snapshot_id?.trim();
     if (!sid) return;
-    setSnapshotAnalyzeBusy(true);
+    snapshotAnalyzeRunIdRef.current += 1;
+    setSnapshotAnalyzeProgress({
+      status: "queued",
+      stage: "queued",
+      total: 0,
+      processed: 0,
+      analyzed: 0,
+    });
     setError(null);
     try {
-      await analyzeSearchSnapshot(sid, 15);
-      await refreshCurrentResultsPage();
+      const started = await startAnalyzeSearchSnapshot(sid, 15);
+      setSnapshotAnalyzeJob({
+        snapshotId: sid,
+        jobId: started.job_id,
+      });
     } catch (e) {
       setError(
         e instanceof ApiError ? e.message : "Не удалось выполнить детальный анализ",
       );
-    } finally {
+      setSnapshotAnalyzeJob(null);
+      setSnapshotAnalyzeProgress(null);
       setSnapshotAnalyzeBusy(false);
     }
-  }, [results?.snapshot_id, refreshCurrentResultsPage]);
+  }, [results?.snapshot_id, evalCompleted, evalIsActive]);
 
   const handleAnalyze = useCallback(
     async (c: Candidate) => {
+      if (batchOperationActive) {
+        setError("Точечная оценка доступна после завершения пакетной операции.");
+        return;
+      }
       const rid = c.hh_resume_id || c.id;
       const q = queryForApi.trim();
       if (!q) {
@@ -542,10 +941,12 @@ function SearchPageContent() {
         setAnalyzeBusy(null);
       }
     },
-    [queryForApi],
+    [queryForApi, batchOperationActive],
   );
 
   const applyTemplate = useCallback((t: SearchTemplateRow) => {
+    snapshotEvalRunIdRef.current += 1;
+    snapshotAnalyzeRunIdRef.current += 1;
     const f = filtersFromApiPayload(t.filters ?? undefined);
     setFilters(f);
     setQ(t.query.trim() || "");
@@ -554,6 +955,12 @@ function SearchPageContent() {
     setError(null);
     setListFilter("");
     setListSort("server");
+    setSnapshotEvalJob(null);
+    setSnapshotEvalProgress(null);
+    setSnapshotEvalScores({});
+    setSnapshotAnalyzeJob(null);
+    setSnapshotAnalyzeProgress(null);
+    setSnapshotAnalyzeBusy(false);
   }, []);
 
   const removeTemplate = useCallback(
@@ -657,6 +1064,20 @@ function SearchPageContent() {
 
   const selectFieldClass =
     "select-chevron h-9 rounded-md border border-input bg-background pl-2 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
+  const progressValue = snapshotEvalProgress
+    ? Math.min(snapshotEvalProgress.scored, snapshotEvalProgress.total)
+    : 0;
+  const pageButtons = (() => {
+    if (!pagination) return [] as number[];
+    const total = pagination.totalPages;
+    if (total <= 5) return Array.from({ length: total }, (_, i) => i);
+    let start = Math.max(0, pagination.pageIndex - 2);
+    let end = Math.min(total - 1, start + 4);
+    start = Math.max(0, end - 4);
+    const pages: number[] = [];
+    for (let p = start; p <= end; p += 1) pages.push(p);
+    return pages;
+  })();
 
   return (
     <>
@@ -742,27 +1163,97 @@ function SearchPageContent() {
               results.found > 0 &&
               results.snapshot_id &&
               results.snapshot_id.trim() && (
-                <div className="flex flex-wrap gap-2">
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="secondary"
-                    disabled={snapshotEvalBusy || loading}
-                    onClick={() => void handleEvaluateSnapshot()}
-                  >
-                    {snapshotEvalBusy ? "Оценка выдачи…" : "Оценить выдачу"}
-                  </Button>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    disabled={snapshotAnalyzeBusy || loading}
-                    onClick={() => void handleAnalyzeSnapshot()}
-                  >
-                    {snapshotAnalyzeBusy
-                      ? "Детальный анализ…"
-                      : "Детальный анализ (топ-15)"}
-                  </Button>
+                <div className="space-y-2">
+                  <div className="flex flex-wrap gap-2">
+                    {!evalCompleted && (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="secondary"
+                        disabled={!canRunEvaluate || loading}
+                        onClick={() => void handleEvaluateSnapshot()}
+                      >
+                        {snapshotEvalBusy ? "Оценка выдачи…" : "Оценить выдачу"}
+                      </Button>
+                    )}
+                    {canShowAnalyzeTop && (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        disabled={!canRunAnalyzeTop || loading}
+                        onClick={() => void handleAnalyzeSnapshot()}
+                      >
+                        {snapshotAnalyzeBusy
+                          ? "Детальный анализ…"
+                          : "Детальный анализ (топ-15)"}
+                      </Button>
+                    )}
+                  </div>
+                  {snapshotEvalProgress && (
+                    <div className="space-y-2 rounded-lg border bg-muted/30 p-3">
+                      <Progress
+                        value={progressValue}
+                        max={Math.max(snapshotEvalProgress.total, 1)}
+                        label={stageLabelRu(snapshotEvalProgress.stage)}
+                        showPercentage
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        {statusLabelRu(snapshotEvalProgress.status)}.{" "}
+                        {evalIsActive
+                          ? "Можно продолжать работать со списком и страницами — оценки подгружаются автоматически."
+                          : "Финальный прогресс сохранён до следующего запуска оценки."}
+                      </p>
+                      <p>
+                        <span className="text-xs text-muted-foreground">
+                        Проверено резюме: {snapshotEvalProgress.scored} из{" "}
+                        {snapshotEvalProgress.total} (готово{" "}
+                        {(snapshotEvalProgress.coverageRatio * 100).toFixed(0)}%)
+                        </span>
+                      </p>
+                      <p className="text-xs text-muted-foreground">
+                        Оценено основным способом: {snapshotEvalProgress.llmScored}
+                        {" · дополнительно обработано: "}
+                        {snapshotEvalProgress.fallbackScored}
+                      </p>
+                      <p className="text-xs text-muted-foreground">
+                        Первичная оценка: {snapshotEvalProgress.interactiveDone} из{" "}
+                        {snapshotEvalProgress.interactiveTotal}
+                        {" · дополнительно обработано: "}
+                        {snapshotEvalProgress.interactiveFallback}
+                        {snapshotEvalProgress.interactiveReady
+                          ? " — первые оценки готовы"
+                          : ""}
+                      </p>
+                      {snapshotEvalProgress.backgroundTotal > 0 && (
+                        <p className="text-xs text-muted-foreground">
+                          Дополнительная оценка: {snapshotEvalProgress.backgroundDone} из{" "}
+                          {snapshotEvalProgress.backgroundTotal}
+                          {" · дополнительно обработано: "}
+                          {snapshotEvalProgress.backgroundFallback}
+                        </p>
+                      )}
+                    </div>
+                  )}
+                  {snapshotAnalyzeProgress && (
+                    <div className="space-y-2 rounded-lg border bg-muted/30 p-3">
+                      <Progress
+                        value={Math.min(
+                          snapshotAnalyzeProgress.processed,
+                          snapshotAnalyzeProgress.total,
+                        )}
+                        max={Math.max(snapshotAnalyzeProgress.total, 1)}
+                        label={analyzeStageLabelRu(snapshotAnalyzeProgress.stage)}
+                        showPercentage
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        {statusLabelRu(snapshotAnalyzeProgress.status)}. Обработано:{" "}
+                        {snapshotAnalyzeProgress.processed} из{" "}
+                        {snapshotAnalyzeProgress.total}, с детальным выводом:{" "}
+                        {snapshotAnalyzeProgress.analyzed}.
+                      </p>
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -905,6 +1396,7 @@ function SearchPageContent() {
                   onToggleFavorite={toggleFavorite}
                   onAnalyze={handleAnalyze}
                   analyzeBusyResumeId={analyzeBusy}
+                  analyzeDisabled={batchOperationActive}
                   showEmptyGuidance={results != null && results.found === 0}
                   loading={loading}
                   estaffLatestByResumeId={estaffLatestByResumeId}
@@ -912,7 +1404,7 @@ function SearchPageContent() {
                 />
               )}
 
-              {pagination?.show && !loading && (
+              {pagination?.show && (
                 <div className="space-y-3">
                   <div className="flex justify-center">
                     <div className="inline-flex items-center gap-2 rounded-lg bg-muted/30 px-4 py-2 text-sm">
@@ -938,23 +1430,54 @@ function SearchPageContent() {
                     >
                       Назад
                     </Button>
-                    {Array.from({ length: Math.min(pagination.totalPages, 5) }, (_, i) => {
-                      const page = i;
-                      return (
+                    {pageButtons.length > 0 && pageButtons[0] > 0 && (
+                      <>
                         <Button
-                          key={page}
                           type="button"
-                          variant={pagination.pageIndex === page ? "default" : "outline"}
+                          variant={pagination.pageIndex === 0 ? "default" : "outline"}
                           size="sm"
-                          onClick={() => void goToResultsPage(page)}
+                          onClick={() => void goToResultsPage(0)}
                         >
-                          {page + 1}
+                          1
                         </Button>
-                      );
-                    })}
-                    {pagination.totalPages > 5 && (
-                      <span className="text-muted-foreground">...</span>
+                        {pageButtons[0] > 1 && (
+                          <span className="text-muted-foreground">...</span>
+                        )}
+                      </>
                     )}
+                    {pageButtons.map((page) => (
+                      <Button
+                        key={page}
+                        type="button"
+                        variant={pagination.pageIndex === page ? "default" : "outline"}
+                        size="sm"
+                        onClick={() => void goToResultsPage(page)}
+                      >
+                        {page + 1}
+                      </Button>
+                    ))}
+                    {pageButtons.length > 0 &&
+                      pageButtons[pageButtons.length - 1] < pagination.totalPages - 1 && (
+                        <>
+                          {pageButtons[pageButtons.length - 1] < pagination.totalPages - 2 && (
+                            <span className="text-muted-foreground">...</span>
+                          )}
+                          <Button
+                            type="button"
+                            variant={
+                              pagination.pageIndex === pagination.totalPages - 1
+                                ? "default"
+                                : "outline"
+                            }
+                            size="sm"
+                            onClick={() =>
+                              void goToResultsPage(pagination.totalPages - 1)
+                            }
+                          >
+                            {pagination.totalPages}
+                          </Button>
+                        </>
+                      )}
                     <Button
                       type="button"
                       variant="outline"

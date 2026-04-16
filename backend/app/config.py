@@ -90,6 +90,7 @@ class Settings(BaseSettings):
     internal_llm_endpoint: str = ""
     internal_llm_api_key: str = "ollama"
     internal_llm_model: str = "llama3.2"
+    llm_runtime_env_priority: bool = True
     feature_pdf_export: bool = False
     feature_llm_resume_analysis: bool = True
     llm_relevance_threshold: int = 60
@@ -102,9 +103,11 @@ class Settings(BaseSettings):
     llm_fast_model: str = "qwen2.5:7b"
     # Меньшие батчи надёжнее для тяжёлых моделей (полный JSON-массив по всем строкам).
     llm_fast_batch_size: int = 5
-    # Дозапрос по одному резюме, если в батче не пришла оценка
+    # Дозапрос, если в батче не пришла оценка
     llm_prescore_refill_enabled: bool = True
     llm_prescore_refill_max_llm_calls: int = 500
+    llm_prescore_refill_batch_size: int = 5
+    llm_prescore_refill_max_seconds: float = 30.0
 
     # Кэш LLM после поиска (карточка с тем же ?q= без повторного вызова модели)
     llm_analysis_cache_ttl_seconds: int = 7200
@@ -121,7 +124,20 @@ class Settings(BaseSettings):
     search_max_resumes_fetch_per_search: int = 1000
     search_hh_page_size: int = 50
     # Максимум резюме с подгрузкой полных данных (опыт, «о себе») на этапе evaluate
-    evaluate_max_enrich_resumes: int = 200
+    evaluate_max_enrich_resumes: int = 0
+    evaluate_enrich_concurrency: int = 5
+    evaluate_progress_ttl_seconds: int = 1800
+    evaluate_interactive_top_n: int = 50
+    llm_prescore_interactive_max_seconds: float = 12.0
+    llm_prescore_background_max_seconds: float = 45.0
+    llm_prescore_refill_min_gain: int = 1
+    llm_prescore_enable_fallback: bool = True
+    llm_prescore_fallback_min_score: int = 20
+    llm_prescore_fallback_max_score: int = 95
+    llm_prescore_fallback_weight_skills: float = 0.4
+    llm_prescore_fallback_weight_position: float = 0.25
+    llm_prescore_fallback_weight_experience: float = 0.2
+    llm_prescore_fallback_weight_region: float = 0.15
 
     # Пост-фильтрация по точным числовым границам из parsed
     strict_numeric_filters: bool = True

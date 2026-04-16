@@ -18,6 +18,7 @@ type Props = {
   onToggleFavorite?: (candidate: Candidate) => void;
   onAnalyze?: (candidate: Candidate) => void;
   analyzeBusyResumeId?: string | null;
+  analyzeDisabled?: boolean;
   /** После поиска с нулём совпадений — расширенные подсказки */
   showEmptyGuidance?: boolean;
   loading?: boolean;
@@ -50,6 +51,7 @@ export function CandidateList({
   onToggleFavorite,
   onAnalyze,
   analyzeBusyResumeId,
+  analyzeDisabled,
   showEmptyGuidance,
   loading,
   estaffLatestByResumeId,
@@ -122,6 +124,7 @@ export function CandidateList({
               analyzeBusyResumeId != null &&
               analyzeBusyResumeId === (c.hh_resume_id || c.id)
             }
+            analyzeDisabled={Boolean(analyzeDisabled)}
             estaffLatestByResumeId={estaffLatestByResumeId}
             onEstaffExportUpdated={onEstaffExportUpdated}
           />

@@ -85,6 +85,7 @@ SYSTEM_PROMPT = """Ты — ассистент для парсинга HR-зап
 Ответ — только JSON."""
 
 _gigachat_cache: dict[str, Any] = {"token": None, "expires_at": 0.0}
+_logged_config_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -128,6 +129,20 @@ def _default_provider_env(endpoint: str) -> str:
     return LLMProvider.OPENAI_COMPATIBLE.value
 
 
+def _log_llm_config_source(source: str, cfg: LLMRuntimeConfig) -> None:
+    global _logged_config_source
+    if _logged_config_source == source:
+        return
+    logger.info(
+        "LLM runtime config source: %s (provider=%s, model=%s, endpoint=%s)",
+        source,
+        cfg.provider,
+        cfg.model,
+        mask_endpoint(cfg.endpoint),
+    )
+    _logged_config_source = source
+
+
 def get_llm_config(db: Session | None) -> LLMRuntimeConfig:
     """Эффективная конфигурация: учётные данные LLM из БД; батчи и топ-N — из настроек сервера."""
     stored: dict[str, Any] | None = None
@@ -138,6 +153,26 @@ def get_llm_config(db: Session | None) -> LLMRuntimeConfig:
     env_key = (settings.internal_llm_api_key or "ollama").strip() or "ollama"
     env_model = (settings.internal_llm_model or "llama3.2").strip() or "llama3.2"
     env_fast = (settings.llm_fast_model or "qwen2.5:7b").strip() or "qwen2.5:7b"
+
+    env_cfg = LLMRuntimeConfig(
+        provider=_default_provider_env(env_endpoint),
+        endpoint=env_endpoint,
+        api_key=env_key,
+        model=env_model,
+        fast_model=env_fast,
+        folder_id=None,
+        client_id=None,
+        client_secret=None,
+        scope=None,
+        llm_search_batch_size=max(1, min(50, int(settings.llm_search_batch_size or 10))),
+        llm_fast_batch_size=max(1, min(50, int(settings.llm_fast_batch_size or 5))),
+        llm_detailed_top_n=max(1, min(50, int(settings.llm_detailed_top_n or 15))),
+    )
+    env_priority = bool(settings.llm_runtime_env_priority)
+    env_ready = bool(env_endpoint)
+    if env_priority and env_ready:
+        _log_llm_config_source("env", env_cfg)
+        return env_cfg
 
     if stored:
         prov = str(stored.get("provider") or _default_provider_env(str(stored.get("endpoint") or "")))
@@ -176,7 +211,7 @@ def get_llm_config(db: Session | None) -> LLMRuntimeConfig:
         elif prov == LLMProvider.YANDEX_GPT.value and not api_key:
             api_key = env_key if env_key != "ollama" else None
 
-        return LLMRuntimeConfig(
+        cfg = LLMRuntimeConfig(
             provider=prov,
             endpoint=endpoint,
             api_key=api_key or (None if prov == LLMProvider.GIGACHAT.value else env_key),
@@ -190,21 +225,12 @@ def get_llm_config(db: Session | None) -> LLMRuntimeConfig:
             llm_fast_batch_size=max(1, min(50, llm_fast_batch_size)),
             llm_detailed_top_n=max(1, min(50, llm_detailed_top_n)),
         )
+        _log_llm_config_source("db", cfg)
+        return cfg
 
-    return LLMRuntimeConfig(
-        provider=_default_provider_env(env_endpoint),
-        endpoint=env_endpoint,
-        api_key=env_key,
-        model=env_model,
-        fast_model=env_fast,
-        folder_id=None,
-        client_id=None,
-        client_secret=None,
-        scope=None,
-        llm_search_batch_size=max(1, min(50, int(settings.llm_search_batch_size or 10))),
-        llm_fast_batch_size=max(1, min(50, int(settings.llm_fast_batch_size or 5))),
-        llm_detailed_top_n=max(1, min(50, int(settings.llm_detailed_top_n or 15))),
-    )
+    source = "env_fallback" if env_ready else "default_env"
+    _log_llm_config_source(source, env_cfg)
+    return env_cfg
 
 
 def mask_endpoint(url: str) -> str:

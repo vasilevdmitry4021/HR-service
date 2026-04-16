@@ -20,6 +20,8 @@ HH_API_ERRORS: dict[tuple[str, str], str] = {
     ("captcha_required", "captcha_required"): "HeadHunter требует пройти проверку (капчу). Повторите позже",
 }
 
+HH_VIEW_LIMIT_EXCEEDED_MESSAGE = HH_API_ERRORS[("resumes", "view_limit_exceeded")]
+
 
 def _parse_hh_json_errors(body: Any) -> list[tuple[str, str]]:
     if not isinstance(body, dict):
@@ -67,7 +69,7 @@ def classify_hh_http_status(response: httpx.Response) -> tuple[int, str]:
 
     if status == 401:
         msg = custom or "Авторизация HeadHunter не принята — проверьте токен"
-        return 403, msg
+        return 401, msg
     if status == 403:
         return 403, custom or "Нет доступа к базе резюме (проверьте оплату и права на HH)"
     if status == 404:
@@ -80,3 +82,16 @@ def classify_hh_http_status(response: httpx.Response) -> tuple[int, str]:
         return 503, custom or "HeadHunter временно недоступен"
 
     return 503, custom or "HeadHunter API недоступен"
+
+
+def is_daily_view_limit_error(detail: str | None) -> bool:
+    """True, если detail указывает на суточный лимит просмотров резюме HH."""
+    if not isinstance(detail, str):
+        return False
+    normalized = detail.strip().lower()
+    if not normalized:
+        return False
+    return (
+        HH_VIEW_LIMIT_EXCEEDED_MESSAGE.lower() in normalized
+        or "view_limit_exceeded" in normalized
+    )
