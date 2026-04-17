@@ -267,3 +267,87 @@ def test_prescore_fallback_is_deterministic(monkeypatch) -> None:
     score1, _ = llm_prescoring.prescore_resumes_batch(req, resumes)
     score2, _ = llm_prescoring.prescore_resumes_batch(req, resumes)
     assert score1["same"] == score2["same"]
+
+
+def test_fallback_soft_signals_boost_score() -> None:
+    req_base = {
+        "skills": ["python"],
+        "position_keywords": ["developer"],
+    }
+    req_soft = {
+        **req_base,
+        "soft_signals": ["вайбкодинг", "ai pair"],
+    }
+    resume = {
+        "id": "x",
+        "title": "Python Developer",
+        "skills": ["Python"],
+        "about": "Люблю вайбкодинг и AI pair programming",
+    }
+    no_soft = llm_prescoring._fallback_score_for_resume(req_base, resume)
+    with_soft = llm_prescoring._fallback_score_for_resume(req_soft, resume)
+    assert with_soft > no_soft
+
+
+def test_prescore_keeps_raw_llm_scores(monkeypatch) -> None:
+    resumes = [_resume("fit"), _resume("miss")]
+    monkeypatch.setattr(
+        llm_prescoring.llm_client,
+        "get_llm_config",
+        lambda _db: SimpleNamespace(endpoint="http://llm", fast_model="fast", model="base", llm_fast_batch_size=2),
+    )
+    monkeypatch.setattr(llm_prescoring.settings, "llm_prescore_refill_enabled", False)
+    monkeypatch.setattr(llm_prescoring.settings, "llm_prescore_enable_fallback", False)
+
+    def fake_fetch(prompt: str, model: str, *, batch_label: str, db=None):
+        _ = prompt, model, batch_label, db
+        return (
+            [
+                {"resume_id": "fit", "score": 30},
+                {"resume_id": "miss", "score": 90},
+            ],
+            0,
+            "parse-fail",
+        )
+
+    monkeypatch.setattr(llm_prescoring, "_fetch_prescore_array", fake_fetch)
+    scores, _stats = llm_prescoring.prescore_resumes_batch({"skills": ["Python"]}, resumes)
+
+    assert scores == {"fit": 30, "miss": 90}
+
+
+def test_format_prescore_header_includes_expanded_synonyms() -> None:
+    requirements = {
+        "position_keywords": ["Python Developer"],
+        "skills": ["Python", "FastAPI"],
+        "experience_years_min": 3,
+        "region": "Москва",
+        "expanded_synonyms": {
+            "Python": ["питон", "py", "python3"],
+            "FastAPI": ["fast api", "фаст-апи"],
+        },
+    }
+    header = llm_prescoring._format_prescore_header(requirements)
+    assert "Python" in header["synonyms_summary"]
+    assert "питон" in header["synonyms_summary"]
+    assert "FastAPI" in header["synonyms_summary"]
+    assert header["synonyms_summary"] != "нет"
+
+
+def test_format_prescore_header_no_synonyms() -> None:
+    requirements = {
+        "position_keywords": ["Developer"],
+        "skills": ["Python"],
+    }
+    header = llm_prescoring._format_prescore_header(requirements)
+    assert header["synonyms_summary"] == "нет"
+
+
+def test_format_prescore_header_empty_expanded_synonyms() -> None:
+    requirements = {
+        "position_keywords": ["Developer"],
+        "skills": ["Python"],
+        "expanded_synonyms": {},
+    }
+    header = llm_prescoring._format_prescore_header(requirements)
+    assert header["synonyms_summary"] == "нет"

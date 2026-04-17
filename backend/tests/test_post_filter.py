@@ -73,6 +73,31 @@ def test_apply_strict_filters_salary_from() -> None:
     assert out[0]["id"] == "2"
 
 
+def test_apply_strict_filters_currency_only() -> None:
+    """При фильтре currency остаются только резюме в нужной валюте."""
+    items = [
+        {"id": "1", "salary": {"amount": 300000, "currency": "RUR"}},
+        {"id": "2", "salary": {"amount": 750000, "currency": "KZT"}},
+    ]
+    parsed = {"currency": "RUB"}
+    out = post_filter.apply_strict_filters(items, parsed, mode="hide")
+    assert len(out) == 1
+    assert out[0]["id"] == "1"
+
+
+def test_apply_strict_filters_salary_and_currency() -> None:
+    """При salary_from + currency учитываются и сумма, и валюта."""
+    items = [
+        {"id": "1", "salary": {"amount": 210000, "currency": "RUR"}},
+        {"id": "2", "salary": {"amount": 230000, "currency": "KZT"}},
+        {"id": "3", "salary": {"amount": 190000, "currency": "RUB"}},
+    ]
+    parsed = {"salary_from": 200000, "currency": "RUB"}
+    out = post_filter.apply_strict_filters(items, parsed, mode="hide")
+    assert len(out) == 1
+    assert out[0]["id"] == "1"
+
+
 def test_apply_strict_filters_no_bounds_passthrough() -> None:
     """Без числовых границ все проходят без изменений."""
     items = [{"id": "1", "experience_years": 5}]
@@ -215,3 +240,27 @@ def test_apply_strict_filters_title_matching_tech() -> None:
     parsed = {"skills": ["Java"], "position_keywords": ["разработчик", "developer"]}
     out = post_filter.apply_strict_filters(items, parsed, mode="hide")
     assert len(out) == 2
+
+
+def test_apply_strict_filters_analyst_conflict_excludes_developer_title() -> None:
+    items = [
+        {"id": "1", "skills": ["SQL"], "title": "Системный аналитик"},
+        {"id": "2", "skills": ["Python"], "title": "Python Developer"},
+        {"id": "3", "skills": ["Java"], "title": "Backend инженер"},
+    ]
+    parsed = {"position_keywords": ["аналитик", "системный аналитик"]}
+    out = post_filter.apply_strict_filters(items, parsed, mode="hide")
+    ids = {row["id"] for row in out}
+    assert ids == {"1"}
+
+
+def test_apply_strict_filters_empty_title_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(post_filter.settings, "strict_position_allow_empty_title", True)
+    items = [{"id": "1", "skills": ["SQL"], "title": ""}]
+    parsed = {"position_keywords": ["аналитик"]}
+    out = post_filter.apply_strict_filters(items, parsed, mode="hide")
+    assert len(out) == 1
+
+    monkeypatch.setattr(post_filter.settings, "strict_position_allow_empty_title", False)
+    out_strict = post_filter.apply_strict_filters(items, parsed, mode="hide")
+    assert out_strict == []

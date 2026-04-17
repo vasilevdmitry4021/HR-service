@@ -55,11 +55,11 @@ class CandidateOut(BaseModel):
     id: str
     hh_resume_id: str = ""
     hh_resume_url: str | None = None
-    source_type: Literal["hh", "telegram"] = "hh"
+    source_type: Literal["hh"] = "hh"
     candidate_profile_id: str | None = None
     source_resume_id: str | None = Field(
         default=None,
-        description="Внешний идентификатор в контуре источника (Telegram: id сообщения в БД).",
+        description="Внешний идентификатор в контуре источника.",
     )
     title: str
     full_name: str
@@ -73,8 +73,6 @@ class CandidateOut(BaseModel):
     parse_confidence: float | None = None
     parse_warnings: list[str] = Field(default_factory=list)
     incompleteness_flags: list[str] = Field(default_factory=list)
-    telegram_sources: list[dict[str, Any]] = Field(default_factory=list)
-    telegram_attachments: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class CandidateDetailOut(CandidateOut):
@@ -83,15 +81,18 @@ class CandidateDetailOut(CandidateOut):
     work_experience: list[WorkExperienceItemOut] = Field(default_factory=list)
     about: str | None = None
     education: list[EducationItemOut] = Field(default_factory=list)
-    raw_message_text: str | None = Field(
-        default=None,
-        description="Исходный текст сообщения и извлечённого текста вложений (Telegram).",
-    )
 
 
 class SearchIn(BaseModel):
     query: str = Field(default="", max_length=4000)
-    source_scope: Literal["hh", "telegram", "all"] = "hh"
+    source_scope: Literal["hh"] = "hh"
+    sort_by: Literal[
+        "server",
+        "llm_desc",
+        "llm_score_desc",
+        "experience_desc",
+        "experience_asc",
+    ] = "server"
     filters: ResumeSearchFilters | None = None
     page: int = Field(default=0, ge=0)
     per_page: int = Field(default=20, ge=1, le=50)
@@ -107,8 +108,7 @@ class SearchOut(BaseModel):
     parsed_params: dict[str, Any]
     snapshot_id: str | None = None
     found_raw_hh: int | None = None
-    found_telegram: int | None = None
-    source_scope: Literal["hh", "telegram", "all"] = "hh"
+    source_scope: Literal["hh"] = "hh"
 
 
 class EvaluateIn(BaseModel):
@@ -190,5 +190,6 @@ class AnalyzeProgressOut(BaseModel):
     total_count: int
     processed_count: int
     analyzed_count: int
+    analyses: dict[str, Any] = {}
     processing_time_seconds: float | None = None
     error: str | None = None

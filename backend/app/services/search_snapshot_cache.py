@@ -32,7 +32,6 @@ class SearchSnapshotData:
     evaluated: bool = False
     analyzed: bool = False
     source_scope: str = "hh"
-    found_telegram: int | None = None
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
@@ -45,7 +44,6 @@ class SearchSnapshotData:
             "evaluated": self.evaluated,
             "analyzed": self.analyzed,
             "source_scope": self.source_scope,
-            "found_telegram": self.found_telegram,
         }
 
     @staticmethod
@@ -60,7 +58,6 @@ class SearchSnapshotData:
             evaluated=bool(d.get("evaluated", False)),
             analyzed=bool(d.get("analyzed", False)),
             source_scope=str(d.get("source_scope") or "hh"),
-            found_telegram=d.get("found_telegram"),
         )
 
 

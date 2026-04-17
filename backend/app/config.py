@@ -45,18 +45,6 @@ class Settings(BaseSettings):
     feature_use_mock_hh: bool = True
     feature_use_mock_social_oauth: bool = False
     feature_use_mock_estaff: bool = False
-    feature_use_telegram_source: bool = False
-
-    telegram_session_encryption_key: str = ""
-    telegram_sync_enabled: bool = True
-    telegram_sync_interval_seconds: int = 300
-    telegram_sync_batch_size: int = 100
-    telegram_max_attachment_mb: int = 10
-    telegram_allowed_attachment_types: str = "pdf,docx,doc,txt"
-    # Каталог вложений на стороне ingestion (совпадает с TELEGRAM_ATTACHMENTS_DIR в контейнере)
-    telegram_attachments_dir: str = "/data/attachments"
-    telegram_resume_classifier_enabled: bool = True
-    telegram_resume_classifier_min_score: float = 0.6
 
     # Пути относительно базового URL (полный хост в настройках, например krit.e-staff.ru)
     estaff_create_candidate_path: str = "/api/candidate/add"
@@ -121,17 +109,31 @@ class Settings(BaseSettings):
 
     # POST /search/parse/debug — сырой ответ LLM (по умолчанию выключено; при включении — только админы)
     feature_search_parse_debug: bool = False
+    feature_hh_boolean_query: bool = False
     search_max_resumes_fetch_per_search: int = 1000
     search_hh_page_size: int = 50
+    search_recall_target_min: int = 60
+    search_recall_target_max: int = 300
+    search_max_recall: int = 300
+    search_bonus_share_max: float = 0.2
+    search_bonus_guard_top_n: int = 30
+    skill_synonyms_ttl_days: int = 30
+    skill_synonyms_per_canonical_max: int = 8
+    hh_query_use_search_field: bool = False
+    hh_query_relax_max_steps: int = 3
+    hh_query_max_text_length: int = 1500
+    feature_hh_auto_professional_role: bool = False
+    # Формат: "10=аналитик|business analyst;96=разработчик|developer"
+    hh_auto_professional_role_map: str = ""
     # Максимум резюме с подгрузкой полных данных (опыт, «о себе») на этапе evaluate
     evaluate_max_enrich_resumes: int = 0
     evaluate_enrich_concurrency: int = 5
     evaluate_progress_ttl_seconds: int = 1800
-    evaluate_interactive_top_n: int = 50
+    evaluate_interactive_top_n: int = 60
     llm_prescore_interactive_max_seconds: float = 12.0
     llm_prescore_background_max_seconds: float = 45.0
     llm_prescore_refill_min_gain: int = 1
-    llm_prescore_enable_fallback: bool = True
+    llm_prescore_enable_fallback: bool = False
     llm_prescore_fallback_min_score: int = 20
     llm_prescore_fallback_max_score: int = 95
     llm_prescore_fallback_weight_skills: float = 0.4
@@ -142,6 +144,8 @@ class Settings(BaseSettings):
     # Пост-фильтрация по точным числовым границам из parsed
     strict_numeric_filters: bool = True
     strict_filter_mode: str = "hide"  # hide | demote
+    # true: пустой title не отсекается в position-фильтре; false: strict-режим требует title
+    strict_position_allow_empty_title: bool = True
 
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
 

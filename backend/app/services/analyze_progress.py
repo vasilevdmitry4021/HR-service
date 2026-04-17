@@ -27,6 +27,7 @@ def create_job(*, user_id: str, snapshot_id: str, total_count: int) -> str:
         "total_count": max(0, int(total_count)),
         "processed_count": 0,
         "analyzed_count": 0,
+        "analyses": {},
         "processing_time_seconds": None,
         "error": None,
         "created_monotonic": now,
@@ -73,6 +74,25 @@ def update_progress(
         patch["analyzed_count"] = max(0, int(analyzed_count))
     if patch:
         _update(job_id, **patch)
+
+
+def add_partial_analyses(
+    job_id: str,
+    analyses: dict[str, dict[str, Any]],
+) -> None:
+    with _lock:
+        state = _jobs.get(job_id)
+        if not state:
+            return
+        existing = dict(state.get("analyses") or {})
+        existing.update(analyses)
+        state["analyses"] = existing
+        state["analyzed_count"] = sum(
+            1 for v in existing.values()
+            if isinstance(v, dict) and v.get("llm_score") is not None
+        )
+        state["updated_monotonic"] = time.monotonic()
+        _jobs.set(job_id, state)
 
 
 def mark_done(

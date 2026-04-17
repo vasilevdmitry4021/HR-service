@@ -76,11 +76,6 @@ export function CandidateCard({
               >
                 {candidate.title || "Без названия"}
               </Link>
-              {candidate.source_type === "telegram" ? (
-                <span className="ml-2 align-middle text-xs font-normal text-muted-foreground">
-                  (Telegram)
-                </span>
-              ) : null}
             </CardTitle>
             <p className="text-sm text-muted-foreground">
               {[candidate.full_name, candidate.area].filter(Boolean).join(" · ")}
@@ -187,11 +182,6 @@ export function CandidateCard({
           />
           <HhResumeLinkButton
             url={candidate.hh_resume_url}
-            label={
-              candidate.source_type === "telegram"
-                ? "Сообщение в Telegram"
-                : undefined
-            }
           />
         </div>
       </CardContent>

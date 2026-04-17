@@ -1,11 +1,7 @@
 from __future__ import annotations
 
-import uuid
-
 import pytest
 
-from app.models.candidate_profile import CandidateProfile
-from app.services.candidate_unified import candidate_profile_to_export_norm
 from app.services.estaff_candidate_prepare import (
     build_prev_educations_from_norm,
     build_prev_jobs_from_hh_raw,
@@ -85,41 +81,3 @@ async def test_prepare_resolves_location_and_skill() -> None:
     assert not warnings
 
 
-@pytest.mark.asyncio
-async def test_prepare_from_telegram_export_norm_sets_inet_uid() -> None:
-    """Выгрузка e-staff по профилю Telegram: inet_uid = UUID профиля, предупреждения не блокируют."""
-
-    async def fake_fetch(_voc_id: str) -> list[dict]:
-        return []
-
-    mid = uuid.uuid4()
-    prof = CandidateProfile(
-        id=uuid.uuid4(),
-        source_type="telegram",
-        source_resume_id=str(mid),
-        source_url="https://t.me/c/1",
-        full_name="Телеграмов Тест",
-        title="Инженер",
-        area="Москва",
-        experience_years=2,
-        skills=["SQL"],
-        contacts={"email": "t@example.com", "phone": "+79990001122"},
-        about="О себе",
-        education=[{"organization": "ВУЗ", "year": "2015"}],
-        work_experience=[
-            {"company": "ООО", "position": "Разработчик", "description": "работа"}
-        ],
-        normalized_payload={"telegram": {"sources": [], "attachments": []}},
-        parse_confidence=0.8,
-    )
-    norm = candidate_profile_to_export_norm(prof)
-    assert norm.get("source_type") == "telegram"
-    payload, warnings = await prepare_candidate_payload_for_export(
-        norm,
-        server_name="demo",
-        api_token="tok",
-        fetch_voc_items=fake_fetch,
-        candidate_export_key=str(prof.id),
-    )
-    assert payload.get("inet_uid") == str(prof.id)
-    assert isinstance(warnings, list)

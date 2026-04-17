@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -167,3 +168,179 @@ async def test_analyze_top_resumes_keeps_enrichment_for_top_n() -> None:
     assert out[0]["llm_analysis"] is not None
     assert out[1]["llm_analysis"] is not None
     assert out[2].get("llm_analysis") is None
+
+
+@pytest.mark.asyncio
+async def test_evaluate_bonus_share_guard_in_final_top(monkeypatch) -> None:
+    """Доля bonus в первых search_bonus_guard_top_n не превышает search_bonus_share_max."""
+    guard_top_n = 10
+    max_share = 0.2
+    max_bonus = int(guard_top_n * max_share)
+
+    monkeypatch.setattr(llm_evaluation.settings, "search_bonus_guard_top_n", guard_top_n)
+    monkeypatch.setattr(llm_evaluation.settings, "search_bonus_share_max", max_share)
+
+    resumes: list[dict[str, Any]] = []
+    for i in range(15):
+        resumes.append({
+            "id": f"primary-{i}",
+            "hh_resume_id": f"primary-{i}",
+            "title": "Developer",
+            "skills": ["Python"],
+            "experience_years": 5,
+            "match_source": "primary",
+        })
+    for i in range(8):
+        resumes.append({
+            "id": f"bonus-{i}",
+            "hh_resume_id": f"bonus-{i}",
+            "title": "Creative coder",
+            "skills": ["Design"],
+            "experience_years": 8,
+            "match_source": "bonus",
+        })
+
+    parsed = {"text": "python developer", "skills": ["Python"]}
+
+    def fake_prescore(requirements, rows, db=None, **kwargs):
+        scores = {}
+        for row in rows:
+            rid = str(row.get("id"))
+            if rid.startswith("bonus"):
+                scores[rid] = 95
+            else:
+                scores[rid] = 60
+        return scores, {
+            "prescore_elapsed_ms": 1,
+            "llm_calls_total": 1,
+            "llm_calls_refill": 0,
+            "avg_prompt_chars": 10,
+            "parse_fail_count": 0,
+            "refill_gain_ratio": 0.0,
+            "budget_exhausted": False,
+            "llm_scored_count": len(rows),
+            "fallback_scored_count": 0,
+            "coverage_ratio": 1.0,
+        }
+
+    with patch(
+        "app.services.llm_evaluation.llm_prescoring.prescore_resumes_batch",
+        side_effect=fake_prescore,
+    ):
+        items, metrics = await llm_evaluation.evaluate_all_resumes(
+            None,
+            resumes,
+            parsed,
+            db=object(),
+            user_id=uuid.uuid4(),
+        )
+
+    top_n = items[:guard_top_n]
+    bonus_in_top = sum(1 for x in top_n if x.get("match_source") == "bonus")
+    assert bonus_in_top <= max_bonus, (
+        f"bonus_in_top={bonus_in_top} > max_bonus={max_bonus} "
+        f"(guard_top_n={guard_top_n}, max_share={max_share})"
+    )
+    total_bonus = sum(1 for x in items if x.get("match_source") == "bonus")
+    assert total_bonus == 8
+
+
+@pytest.mark.asyncio
+async def test_evaluate_bonus_overflow_pushes_below_topn(monkeypatch) -> None:
+    """Bonus-кандидаты с высокими LLM-оценками выталкиваются за пределы guard top-N,
+    не превышая max share. Primary с низкими оценками остаются в top-N."""
+    guard_top_n = 5
+    max_share = 0.2
+    max_bonus_in_top = int(guard_top_n * max_share)
+
+    monkeypatch.setattr(llm_evaluation.settings, "search_bonus_guard_top_n", guard_top_n)
+    monkeypatch.setattr(llm_evaluation.settings, "search_bonus_share_max", max_share)
+
+    resumes: list[dict[str, Any]] = []
+    for i in range(10):
+        resumes.append({
+            "id": f"primary-{i}",
+            "hh_resume_id": f"primary-{i}",
+            "title": "Developer",
+            "skills": ["Python"],
+            "experience_years": 3,
+            "match_source": "primary",
+        })
+    for i in range(5):
+        resumes.append({
+            "id": f"bonus-{i}",
+            "hh_resume_id": f"bonus-{i}",
+            "title": "Creative",
+            "skills": [],
+            "experience_years": 10,
+            "match_source": "bonus",
+        })
+
+    parsed = {"text": "python", "skills": ["Python"], "position_keywords": ["Developer"]}
+
+    def fake_prescore(requirements, rows, db=None, **kwargs):
+        scores = {}
+        for row in rows:
+            rid = str(row.get("id"))
+            scores[rid] = 99 if rid.startswith("bonus") else 40
+        return scores, {
+            "prescore_elapsed_ms": 1,
+            "llm_calls_total": 1,
+            "llm_calls_refill": 0,
+            "avg_prompt_chars": 10,
+            "parse_fail_count": 0,
+            "refill_gain_ratio": 0.0,
+            "budget_exhausted": False,
+            "llm_scored_count": len(rows),
+            "fallback_scored_count": 0,
+            "coverage_ratio": 1.0,
+        }
+
+    with patch(
+        "app.services.llm_evaluation.llm_prescoring.prescore_resumes_batch",
+        side_effect=fake_prescore,
+    ):
+        items, _metrics = await llm_evaluation.evaluate_all_resumes(
+            None,
+            resumes,
+            parsed,
+            db=object(),
+            user_id=uuid.uuid4(),
+        )
+
+    top_n_items = items[:guard_top_n]
+    bonus_in_top = sum(1 for x in top_n_items if x.get("match_source") == "bonus")
+    assert bonus_in_top <= max_bonus_in_top, (
+        f"leakage: bonus_in_top={bonus_in_top} > max_bonus={max_bonus_in_top}"
+    )
+    all_bonus = [x for x in items if x.get("match_source") == "bonus"]
+    assert len(all_bonus) == 5, "все bonus-кандидаты должны присутствовать в результатах"
+    overflow_bonus = [x for x in items[guard_top_n:] if x.get("match_source") == "bonus"]
+    assert len(overflow_bonus) >= 5 - max_bonus_in_top
+
+
+def test_simple_sort_does_not_promote_bonus_without_must_skills() -> None:
+    resumes = [
+        {
+            "id": "primary-ok",
+            "title": "Java Developer",
+            "skills": ["Java", "Spring"],
+            "experience_years": 4,
+            "match_source": "primary",
+        },
+        {
+            "id": "bonus-weak",
+            "title": "Creative coder",
+            "skills": ["Design"],
+            "about": "вайбкодинг и AI pair",
+            "experience_years": 8,
+            "match_source": "bonus",
+        },
+    ]
+    parsed = {
+        "skills": ["Java"],
+        "position_keywords": ["developer"],
+        "soft_signals": ["вайбкодинг", "ai pair"],
+    }
+    sorted_rows = llm_evaluation._sort_by_simple_criteria(resumes, parsed)
+    assert sorted_rows[0]["id"] == "primary-ok"

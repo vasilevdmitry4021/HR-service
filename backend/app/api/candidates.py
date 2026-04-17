@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import uuid as uuid_std
-
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import Response
 from sqlalchemy import select
@@ -11,7 +9,6 @@ from starlette.concurrency import run_in_threadpool
 from app.api.deps import get_current_user, get_db
 from app.api.hh_access import ensure_hh_access_token
 from app.config import settings
-from app.models.candidate_profile import CandidateProfile
 from app.models.favorite import Favorite
 from app.models.user import User
 from app.schemas.search import (
@@ -21,8 +18,6 @@ from app.schemas.search import (
     WorkExperienceItemOut,
 )
 from app.services import hh_client
-from app.services.candidate_unified import candidate_profile_to_search_dict
-from app.services.telegram_search import telegram_profile_owned_by_user
 from app.services import llm_client
 from app.services import llm_analysis_cache
 from app.services import llm_resume_analyzer
@@ -126,28 +121,6 @@ async def analyze_candidate_resume(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Анализ резюме с помощью ИИ отключён",
         )
-    try:
-        uid = uuid_std.UUID(resume_id.strip())
-    except ValueError:
-        uid = None
-    if uid is not None:
-        prof = db.get(CandidateProfile, uid)
-        if prof and prof.source_type == "telegram":
-            if not telegram_profile_owned_by_user(db, prof, user.id):
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Нет доступа к этому кандидату",
-                )
-            stub = candidate_profile_to_search_dict(prof)
-            q = search_query.strip()
-            parsed, _, _ = nlp_service.parse_natural_query(q, db=db)
-            analysis = llm_resume_analyzer.analyze_resume(parsed, stub, db=db)
-            uid_s = str(user.id)
-            llm_analysis_cache.store_for_resume_ids(
-                uid_s, [str(prof.id)], q, analysis
-            )
-            return LLMAnalysisOut(**analysis)
-
     access: str | None = None
     if not settings.feature_use_mock_hh:
         access = await ensure_hh_access_token(db, user.id)
@@ -194,122 +167,6 @@ async def get_candidate(
     user: User = Depends(get_current_user),
     search_query: str | None = Query(None, alias="q", max_length=4000),
 ) -> CandidateDetailOut:
-    try:
-        uid = uuid_std.UUID(resume_id.strip())
-    except ValueError:
-        uid = None
-    if uid is not None:
-        prof = db.get(CandidateProfile, uid)
-        if prof and prof.source_type == "telegram":
-            if not telegram_profile_owned_by_user(db, prof, user.id):
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Нет доступа к этому кандидату",
-                )
-            d = candidate_profile_to_search_dict(prof)
-            fav = db.scalar(
-                select(Favorite).where(
-                    Favorite.user_id == user.id,
-                    Favorite.candidate_id == prof.id,
-                )
-            )
-            fav_id = str(fav.id) if fav else None
-            fav_notes = fav.notes if fav else None
-            llm_part: LLMAnalysisOut | None = None
-            if llm_client.llm_connection_configured(db) and search_query and search_query.strip():
-                cached = llm_analysis_cache.get_cached(
-                    str(user.id), str(prof.id), search_query.strip()
-                )
-                if cached is not None:
-                    llm_part = LLMAnalysisOut(**cached)
-            if llm_part is None:
-                llm_part = _llm_analysis_from_favorite(fav)
-            we_raw = d.get("work_experience") or []
-            work_out: list[WorkExperienceItemOut] = []
-            if isinstance(we_raw, list):
-                for item in we_raw:
-                    if isinstance(item, dict):
-                        try:
-                            work_out.append(WorkExperienceItemOut(**item))
-                        except Exception:
-                            work_out.append(
-                                WorkExperienceItemOut(
-                                    company=str(item.get("company") or ""),
-                                    position=str(item.get("position") or ""),
-                                )
-                            )
-            ed_raw = d.get("education") or []
-            education_out: list[EducationItemOut] = []
-            if isinstance(ed_raw, list):
-                for item in ed_raw:
-                    if isinstance(item, dict):
-                        try:
-                            education_out.append(EducationItemOut(**item))
-                        except Exception:
-                            education_out.append(
-                                EducationItemOut(
-                                    organization=str(
-                                        item.get("organization") or ""
-                                    ),
-                                )
-                            )
-            about_out = d.get("about")
-            if not isinstance(about_out, str):
-                about_out = None
-            elif not about_out.strip():
-                about_out = None
-            llm_score_out: int | None = None
-            if llm_part is not None and isinstance(llm_part.llm_score, int):
-                llm_score_out = llm_part.llm_score
-            ts = d.get("telegram_sources")
-            telegram_sources = (
-                [x for x in ts if isinstance(x, dict)] if isinstance(ts, list) else []
-            )
-            ta = d.get("telegram_attachments")
-            telegram_attachments = (
-                [x for x in ta if isinstance(x, dict)] if isinstance(ta, list) else []
-            )
-            pw = d.get("parse_warnings")
-            parse_warnings = (
-                [str(x).strip() for x in pw if str(x).strip()]
-                if isinstance(pw, list)
-                else []
-            )
-            inc = d.get("incompleteness_flags")
-            incompleteness_flags = (
-                [str(x).strip() for x in inc if str(x).strip()]
-                if isinstance(inc, list)
-                else []
-            )
-            return CandidateDetailOut(
-                id=str(prof.id),
-                hh_resume_id="",
-                hh_resume_url=d.get("hh_resume_url"),
-                source_type="telegram",
-                candidate_profile_id=str(prof.id),
-                source_resume_id=prof.source_resume_id,
-                title=str(d.get("title", "")),
-                full_name=str(d.get("full_name", "")),
-                age=d.get("age"),
-                experience_years=d.get("experience_years"),
-                salary=d.get("salary"),
-                skills=list(d.get("skills") or []),
-                area=str(d.get("area", "")),
-                llm_score=llm_score_out,
-                llm_analysis=llm_part,
-                parse_confidence=d.get("parse_confidence"),
-                parse_warnings=parse_warnings,
-                incompleteness_flags=incompleteness_flags,
-                telegram_sources=telegram_sources,
-                telegram_attachments=telegram_attachments,
-                favorite_id=fav_id,
-                favorite_notes=fav_notes,
-                work_experience=work_out,
-                about=about_out,
-                education=education_out,
-                raw_message_text=prof.raw_text,
-            )
-
     access: str | None = None
     if not settings.feature_use_mock_hh:
         access = await ensure_hh_access_token(db, user.id)

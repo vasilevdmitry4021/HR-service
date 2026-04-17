@@ -82,16 +82,6 @@ services:
       INTERNAL_LLM_API_KEY: ${INTERNAL_LLM_API_KEY:-}
       INTERNAL_LLM_MODEL: ${INTERNAL_LLM_MODEL:-}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
-      # Включите false в .env на проде, если интеграция не нужна
-      FEATURE_USE_TELEGRAM_SOURCE: ${FEATURE_USE_TELEGRAM_SOURCE:-true}
-      TELEGRAM_SESSION_ENCRYPTION_KEY: ${TELEGRAM_SESSION_ENCRYPTION_KEY:-}
-      TELEGRAM_SYNC_ENABLED: ${TELEGRAM_SYNC_ENABLED:-true}
-      TELEGRAM_SYNC_INTERVAL_SECONDS: ${TELEGRAM_SYNC_INTERVAL_SECONDS:-300}
-      TELEGRAM_SYNC_BATCH_SIZE: ${TELEGRAM_SYNC_BATCH_SIZE:-100}
-      TELEGRAM_MAX_ATTACHMENT_MB: ${TELEGRAM_MAX_ATTACHMENT_MB:-10}
-      TELEGRAM_ALLOWED_ATTACHMENT_TYPES: ${TELEGRAM_ALLOWED_ATTACHMENT_TYPES:-pdf,docx,doc,txt}
-      TELEGRAM_RESUME_CLASSIFIER_ENABLED: ${TELEGRAM_RESUME_CLASSIFIER_ENABLED:-true}
-      TELEGRAM_RESUME_CLASSIFIER_MIN_SCORE: ${TELEGRAM_RESUME_CLASSIFIER_MIN_SCORE:-0.6}
       # Снимки поиска между репликами бэкенда; пустое значение — только память процесса
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
     depends_on:
@@ -101,7 +91,7 @@ services:
         condition: service_healthy
     volumes:
       - ./backend:/app
-    # Миграции до старта API — иначе telegram-ingestion и запросы к БД падают на пустой схеме
+    # Миграции до старта API
     command:
       - sh
       - -c
@@ -126,35 +116,6 @@ services:
       backend:
         condition: service_healthy
 
-  telegram-ingestion:
-    build:
-      context: .
-      dockerfile: telegram-ingestion/Dockerfile
-    env_file:
-      - .env
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-hr}:${POSTGRES_PASSWORD:-hr}@db:5432/${POSTGRES_DB:-hr_service}
-      SECRET_KEY: ${SECRET_KEY:-dev-secret-change-in-production}
-      TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:-}
-      TELEGRAM_SESSION_ENCRYPTION_KEY: ${TELEGRAM_SESSION_ENCRYPTION_KEY:-}
-      TELEGRAM_SYNC_ENABLED: ${TELEGRAM_SYNC_ENABLED:-true}
-      TELEGRAM_SYNC_INTERVAL_SECONDS: ${TELEGRAM_SYNC_INTERVAL_SECONDS:-300}
-      TELEGRAM_QUEUED_POLL_SECONDS: ${TELEGRAM_QUEUED_POLL_SECONDS:-15}
-      TELEGRAM_SYNC_BATCH_SIZE: ${TELEGRAM_SYNC_BATCH_SIZE:-100}
-      TELEGRAM_RESUME_CLASSIFIER_ENABLED: ${TELEGRAM_RESUME_CLASSIFIER_ENABLED:-true}
-      TELEGRAM_RESUME_CLASSIFIER_MIN_SCORE: ${TELEGRAM_RESUME_CLASSIFIER_MIN_SCORE:-0.6}
-      TELEGRAM_MAX_ATTACHMENT_MB: ${TELEGRAM_MAX_ATTACHMENT_MB:-10}
-      TELEGRAM_ALLOWED_ATTACHMENT_TYPES: ${TELEGRAM_ALLOWED_ATTACHMENT_TYPES:-pdf,docx,doc,txt}
-      TELEGRAM_ATTACHMENTS_DIR: /data/attachments
-    depends_on:
-      db:
-        condition: service_healthy
-      backend:
-        condition: service_healthy
-    volumes:
-      - telegram_attachments:/data/attachments
-
 volumes:
   postgres_data:
-  telegram_attachments:
   frontend_next_build:

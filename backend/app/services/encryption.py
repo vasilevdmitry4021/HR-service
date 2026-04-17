@@ -42,7 +42,7 @@ def decrypt_json(blob: bytes) -> dict[str, Any]:
 
 
 def encrypt_secret(text: str) -> bytes:
-    """Шифрование одной строки (api_hash, session Telethon и т.п.)."""
+    """Шифрование одной строки."""
     return encrypt_json({"_v": text})
 
 

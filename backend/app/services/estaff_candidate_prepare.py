@@ -1,4 +1,4 @@
-"""Подготовка тела кандидата для e-staff (candidate/add) из единого нормализованного профиля (HH или Telegram)."""
+"""Подготовка тела кандидата для e-staff (candidate/add) из нормализованного профиля HH."""
 
 from __future__ import annotations
 
@@ -208,95 +208,6 @@ def map_gender_id_from_hh_raw(raw: dict[str, Any]) -> int | None:
     return None
 
 
-def _synthetic_hh_raw_from_unified(norm: dict[str, Any]) -> dict[str, Any]:
-    """Совместимый с HH вид _raw для профилей из Telegram (контакты, опыт)."""
-    fn, ln, mn = "", "", ""
-    full = str(norm.get("full_name") or "").strip()
-    parts = full.split()
-    if len(parts) >= 3:
-        ln, fn, mn = parts[0], parts[1], " ".join(parts[2:])
-    elif len(parts) == 2:
-        fn, ln = parts[0], parts[1]
-    elif len(parts) == 1:
-        fn = parts[0]
-
-    contact_list: list[dict[str, Any]] = []
-    contacts = norm.get("contacts")
-    if isinstance(contacts, dict):
-        em = contacts.get("email")
-        if isinstance(em, str) and em.strip():
-            contact_list.append({"type": {"id": "email"}, "value": em.strip()})
-        ph = contacts.get("phone")
-        if isinstance(ph, str) and ph.strip():
-            contact_list.append({"type": {"id": "cell"}, "value": ph.strip()})
-        tg = contacts.get("telegram")
-        if isinstance(tg, str) and tg.strip():
-            contact_list.append({"type": {"id": "telegram"}, "value": tg.strip()})
-
-    exp_out: list[dict[str, Any]] = []
-    we = norm.get("work_experience")
-    if isinstance(we, list):
-        for block in we:
-            if not isinstance(block, dict):
-                continue
-            company = str(block.get("company") or "").strip()
-            position = str(block.get("position") or "").strip()
-            desc = block.get("description")
-            desc_s = str(desc).strip() if desc is not None else ""
-            row: dict[str, Any] = {
-                "company": company,
-                "position": position,
-                "start": block.get("start"),
-                "end": block.get("end"),
-            }
-            if desc_s:
-                row["description"] = desc_s
-            ar = block.get("area")
-            if isinstance(ar, str) and ar.strip():
-                row["area"] = {"name": ar.strip()}
-            exp_out.append(row)
-
-    return {
-        "first_name": fn,
-        "last_name": ln,
-        "middle_name": mn,
-        "contact": contact_list,
-        "experience": exp_out,
-    }
-
-
-def telegram_export_completeness_warnings(norm: dict[str, Any]) -> list[str]:
-    """Неблокирующие предупреждения о неполном профиле (источник Telegram)."""
-    if norm.get("source_type") != "telegram":
-        return []
-    out: list[str] = []
-    full = str(norm.get("full_name") or "").strip()
-    title = str(norm.get("title") or "").strip()
-    contacts = norm.get("contacts") if isinstance(norm.get("contacts"), dict) else {}
-    if not isinstance(contacts, dict):
-        contacts = {}
-    email = str(contacts.get("email") or "").strip()
-    phone = str(contacts.get("phone") or "").strip()
-    if not full:
-        out.append("В профиле Telegram не указано ФИО.")
-    if not title:
-        out.append("В профиле Telegram не указана желаемая должность (заголовок).")
-    if not email and not phone:
-        out.append("В профиле Telegram не указаны email и телефон.")
-    else:
-        if not email:
-            out.append("В профиле Telegram не указан email.")
-        if not phone:
-            out.append("В профиле Telegram не указан телефон.")
-    we = norm.get("work_experience")
-    if not isinstance(we, list) or len(we) == 0:
-        out.append("В профиле Telegram нет блока опыта работы.")
-    edu = norm.get("education")
-    if not isinstance(edu, list) or len(edu) == 0:
-        out.append("В профиле Telegram нет сведений об образовании.")
-    return out
-
-
 def mandatory_minimum_blockers_for_payload(payload: dict[str, Any]) -> list[str]:
     """
     Обязательный минимум для отправки в e-staff без выдуманных данных.
@@ -316,18 +227,6 @@ def mandatory_minimum_blockers_for_payload(payload: dict[str, Any]) -> list[str]
             "Нет email и мобильного телефона; укажите контакты в профиле или включите подстановки e-staff.",
         )
     return blockers
-
-
-def merge_telegram_norm_for_estaff(norm: dict[str, Any]) -> dict[str, Any]:
-    """Дополняет norm полем _raw для e-staff, если профиль из Telegram."""
-    n = dict(norm)
-    if n.get("source_type") != "telegram":
-        return n
-    raw = n.get("_raw")
-    if isinstance(raw, dict) and raw:
-        return n
-    n["_raw"] = _synthetic_hh_raw_from_unified(n)
-    return n
 
 
 # Псевдоним по плану унификации
@@ -362,17 +261,9 @@ async def prepare_candidate_payload_for_export(
     """
     Полное тело candidate (без user_login — его добавляет HTTP-клиент).
     Возвращает (payload, предупреждения подготовки).
-    candidate_export_key — устойчивый внешний ключ для inet_uid (UUID профиля или id резюме HH).
+    candidate_export_key — устойчивый внешний ключ для inet_uid (id резюме HH).
     """
     warnings: list[str] = []
-    norm = merge_telegram_norm_for_estaff(norm)
-    if norm.get("source_type") == "telegram":
-        warnings.extend(telegram_export_completeness_warnings(norm))
-        pc = norm.get("parse_confidence")
-        if isinstance(pc, (int, float)) and float(pc) < 0.5:
-            warnings.append(
-                "Данные из Telegram распознаны с низкой уверенностью; проверьте поля перед выгрузкой.",
-            )
     base = hh_normalized_resume_to_estaff_payload(norm)
     payload = dict(base)
 

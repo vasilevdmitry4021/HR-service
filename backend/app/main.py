@@ -14,7 +14,6 @@ from app.api.llm import router as llm_router
 from app.api.hh import router as hh_router
 from app.api.reference import router as reference_router
 from app.api.search import router as search_router
-from app.api.telegram import router as telegram_router
 from app.api.templates import router as templates_router
 from app.config import settings
 from app.services.encryption import validate_encryption_key_for_environment
@@ -49,7 +48,6 @@ v1.include_router(favorites_router)
 v1.include_router(candidates_router)
 v1.include_router(estaff_router)
 v1.include_router(llm_router)
-v1.include_router(telegram_router)
 app.include_router(v1, prefix="/api")
 
 

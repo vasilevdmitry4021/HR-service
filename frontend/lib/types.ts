@@ -8,32 +8,13 @@ export type LLMAnalysis = {
   summary: string | null;
 };
 
-/** Метаданные источника Telegram в карточке кандидата */
-export type TelegramSourceMeta = {
-  source_id?: string;
-  source_display_name?: string;
-  channel_or_chat_link?: string | null;
-  telegram_message_id?: number;
-  message_link?: string | null;
-  published_at?: string | null;
-};
-
-/** Вложение Telegram (файл и превью извлечённого текста) */
-export type TelegramAttachmentMeta = {
-  file_type?: string;
-  file_path?: string;
-  file_hash?: string;
-  filename?: string | null;
-  extracted_preview?: string | null;
-};
-
 export type Candidate = {
   id: string;
   hh_resume_id: string;
   hh_resume_url?: string | null;
-  source_type?: "hh" | "telegram";
+  source_type?: "hh";
   candidate_profile_id?: string | null;
-  /** Внешний идентификатор в контуре источника (Telegram: id сообщения в БД) */
+  /** Внешний идентификатор в контуре источника */
   source_resume_id?: string | null;
   title: string;
   full_name: string;
@@ -54,8 +35,6 @@ export type Candidate = {
   parse_confidence?: number | null;
   parse_warnings?: string[];
   incompleteness_flags?: string[];
-  telegram_sources?: TelegramSourceMeta[];
-  telegram_attachments?: TelegramAttachmentMeta[];
 };
 
 export type SearchResponse = {
@@ -67,8 +46,7 @@ export type SearchResponse = {
   parsed_params: ParsedParams;
   snapshot_id?: string | null;
   found_raw_hh?: number | null;
-  found_telegram?: number | null;
-  source_scope?: "hh" | "telegram" | "all";
+  source_scope?: "hh";
 };
 
 /** Ответ POST /search/{snapshot_id}/evaluate — только id резюме и числовой балл */
@@ -137,6 +115,7 @@ export type AnalyzeProgressResponse = {
   total_count: number;
   processed_count: number;
   analyzed_count: number;
+  analyses: Record<string, LLMAnalysis>;
   processing_time_seconds?: number | null;
   error?: string | null;
 };
@@ -208,8 +187,6 @@ export type CandidateDetail = Candidate & {
   work_experience?: WorkExperienceItem[];
   about?: string | null;
   education?: EducationItem[];
-  /** Исходный текст сообщения и извлечённого текста вложений (Telegram) */
-  raw_message_text?: string | null;
 };
 
 export type SearchHistoryRow = {

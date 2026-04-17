@@ -28,9 +28,7 @@ def _resume_row_id(d: dict[str, Any]) -> str:
 
 
 def _candidate_stub_from_row(row: dict[str, Any]) -> dict[str, Any]:
-    """Для Telegram передаётся полный снимок профиля — модели нужны raw_text и нормализация."""
-    if row.get("source_type") == "telegram":
-        return dict(row)
+    """Минимальная карточка кандидата для pre-screening."""
     return {
         "id": row.get("id"),
         "hh_resume_id": row.get("hh_resume_id"),
@@ -42,6 +40,7 @@ def _candidate_stub_from_row(row: dict[str, Any]) -> dict[str, Any]:
         "salary": row.get("salary"),
         "skills": list(row.get("skills") or []),
         "area": row.get("area", ""),
+        "match_source": row.get("match_source"),
     }
 
 
@@ -86,10 +85,41 @@ def _sort_by_simple_criteria(
                 n += 1
         return n
 
-    def sort_key(r: dict[str, Any]) -> tuple[float, int, int, str]:
+    def soft_signal_hits(r: dict[str, Any]) -> int:
+        soft_signals = [
+            str(s).lower().strip()
+            for s in (parsed_params.get("soft_signals") or [])
+            if str(s).strip()
+        ]
+        if not soft_signals:
+            return 0
+        blob = " ".join(
+            [
+                str(r.get("title", "")).lower(),
+                " ".join(str(s).lower() for s in (r.get("skills") or [])),
+                str(r.get("about", "")).lower(),
+                str(r.get("raw_text", "")).lower(),
+            ]
+        )
+        hits = sum(1 for signal in soft_signals if signal in blob)
+        return min(3, hits)
+
+    def match_source_weight(r: dict[str, Any]) -> int:
+        source = str(r.get("match_source") or "")
+        if source == "primary":
+            return 3
+        if source == "broad":
+            return 1
+        if source == "bonus":
+            return -1
+        return 0
+
+    def sort_key(r: dict[str, Any]) -> tuple[int, float, int, int, str]:
         return (
+            -match_source_weight(r),
             -exp_value(r),
             -skill_overlap(r),
+            -soft_signal_hits(r),
             -position_hits(r),
             _resume_row_id(r) or "",
         )
@@ -113,9 +143,6 @@ async def _enrich_resumes_for_llm(
     enrich_count = 0
 
     for idx, r in enumerate(resumes):
-        if r.get("source_type") == "telegram":
-            enriched[idx] = dict(r)
-            continue
         rid = _resume_row_id(r)
         if not rid:
             enriched[idx] = r
@@ -184,7 +211,7 @@ def _row_to_candidate_dict(
         list(merged.get("skills") or []) if store_skills else []
     )
     st = merged.get("source_type") or "hh"
-    if st not in ("hh", "telegram"):
+    if st != "hh":
         st = "hh"
     cpid = merged.get("candidate_profile_id")
     if cpid is not None:
@@ -213,16 +240,7 @@ def _row_to_candidate_dict(
         "parse_confidence": merged.get("parse_confidence"),
         "parse_warnings": list(merged.get("parse_warnings") or []),
         "incompleteness_flags": list(merged.get("incompleteness_flags") or []),
-        "telegram_sources": [
-            x
-            for x in (merged.get("telegram_sources") or [])
-            if isinstance(x, dict)
-        ],
-        "telegram_attachments": [
-            x
-            for x in (merged.get("telegram_attachments") or [])
-            if isinstance(x, dict)
-        ],
+        "match_source": str(merged.get("match_source") or ""),
     }
     if out["source_resume_id"] is not None:
         out["source_resume_id"] = str(out["source_resume_id"]).strip() or None
@@ -399,6 +417,25 @@ async def evaluate_all_resumes(
         )
 
     rows.sort(key=lambda t: (-t[1], t[0].get("id", "")))
+    top_n_guard = min(len(rows), max(1, int(settings.search_bonus_guard_top_n or 30)))
+    max_bonus_share = max(0.0, min(1.0, float(settings.search_bonus_share_max or 0.2)))
+    if rows and max_bonus_share < 1.0:
+        max_bonus = max(0, int(top_n_guard * max_bonus_share))
+        picked_bonus = 0
+        head: list[tuple[dict[str, Any], int]] = []
+        overflow_bonus: list[tuple[dict[str, Any], int]] = []
+        rest: list[tuple[dict[str, Any], int]] = []
+        for row in rows:
+            source = str(row[0].get("match_source") or "")
+            if len(head) >= top_n_guard:
+                rest.append(row)
+            elif source == "bonus" and picked_bonus >= max_bonus:
+                overflow_bonus.append(row)
+            else:
+                if source == "bonus":
+                    picked_bonus += 1
+                head.append(row)
+        rows = head + overflow_bonus + rest
     coverage_ratio = float(len(scores) / len(sorted_resumes)) if sorted_resumes else 1.0
     status = "done" if coverage_ratio >= 1.0 else "partial"
     return [t[0] for t in rows], {
@@ -513,12 +550,18 @@ async def analyze_top_resumes(
             llm_analysis_cache.store_for_resume_ids(user_id, keys, query, batch_out[rid])
             processed_count += 1
         if progress_callback is not None:
+            batch_analyses = {
+                _resume_row_id(r): batch_out[_resume_row_id(r)]
+                for r in chunk
+                if _resume_row_id(r) and _resume_row_id(r) in batch_out
+            }
             progress_callback(
                 {
                     "stage": "running",
                     "processed_count": processed_count,
                     "analyzed_count": len(llm_by_id),
                     "total_count": len(top),
+                    "analyses_delta": batch_analyses,
                 }
             )
 

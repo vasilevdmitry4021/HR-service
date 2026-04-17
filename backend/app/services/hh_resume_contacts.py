@@ -34,7 +34,7 @@ def contacts_from_hh_raw(raw: dict[str, Any]) -> tuple[str | None, str | None]:
         s = val.strip()
         if type_id == "email" or ("@" in s and "." in s):
             email = email or s
-        elif type_id in ("cell", "phone", "work", "home", "telegram", "whatsapp"):
+        elif type_id in ("cell", "phone", "work", "home", "whatsapp"):
             phone = phone or s
         elif not phone and re.search(r"[\d+()\- ]{10,}", s):
             phone = phone or s

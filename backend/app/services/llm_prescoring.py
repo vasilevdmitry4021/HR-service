@@ -18,13 +18,18 @@ from app.services.llm_resume_analyzer import _format_resume_for_prescore_batch
 logger = logging.getLogger(__name__)
 
 PRESCORE_BATCH_PROMPT = """Ты — HR-скринер. По каждому резюме дай одну оценку соответствия требованиям (0–100).
+Главный фактор оценки — совпадение ключевых навыков. Должность, опыт и регион корректируют оценку, но не должны перевешивать явное skill-match.
 Учитывай навыки, должность, опыт; синонимы и разные языки эквивалентны (Python = питон).
+Близкие роли и смежные должности — допустимы с умеренным снижением оценки.
+Небольшие числовые расхождения по опыту — не повод для минимальной оценки, если навыки и роль релевантны.
 
 Требования:
 - Должность: {position}
 - Ключевые навыки: {skills}
 - Минимальный опыт: {exp_min}
 - Регион: {region}
+- Бонусные сигналы: {soft_signals}
+- Эквиваленты: {synonyms_summary}
 
 Резюме (сжатый формат для быстрой оценки: должность, опыт, регион, фрагменты «о себе» и описаний работы):
 {resumes_block}
@@ -40,11 +45,24 @@ PRESCORE_BATCH_PROMPT = """Ты — HR-скринер. По каждому ре�
 def _format_prescore_header(requirements: dict[str, Any]) -> dict[str, str]:
     exp = requirements.get("experience_years_min")
     exp_str = f"от {exp} лет" if exp is not None else "не указан"
+    synonyms_map = requirements.get("expanded_synonyms") or {}
+    synonyms_pairs: list[str] = []
+    if isinstance(synonyms_map, dict):
+        for canonical, syns in list(synonyms_map.items())[:8]:
+            if not isinstance(syns, list) or not syns:
+                continue
+            first = ", ".join(str(x).strip() for x in syns[:3] if str(x).strip())
+            if first:
+                synonyms_pairs.append(f"{canonical}: {first}")
+    soft_signals = requirements.get("soft_signals")
+    soft_text = ", ".join(str(s).strip() for s in (soft_signals or []) if str(s).strip())
     return {
         "position": ", ".join(requirements.get("position_keywords") or []) or "не указана",
         "skills": ", ".join(requirements.get("skills") or []) or "не указаны",
         "exp_min": exp_str,
         "region": str(requirements.get("region") or "любой"),
+        "soft_signals": soft_text or "нет",
+        "synonyms_summary": "; ".join(synonyms_pairs) if synonyms_pairs else "нет",
     }
 
 
@@ -291,56 +309,116 @@ def _to_float(v: Any) -> float | None:
         return None
 
 
+def _resume_text_blob(resume: dict[str, Any]) -> str:
+    work_items = resume.get("work_experience") or []
+    work_parts: list[str] = []
+    for item in work_items:
+        if not isinstance(item, dict):
+            continue
+        for key in ("position", "company", "description"):
+            value = _norm_text(item.get(key))
+            if value:
+                work_parts.append(value)
+    return " ".join(
+        x
+        for x in (
+            _norm_text(resume.get("title")),
+            " ".join(_norm_text(x) for x in (resume.get("skills") or []) if _norm_text(x)),
+            _norm_text(resume.get("about")),
+            _norm_text(resume.get("raw_text")),
+            " ".join(work_parts),
+        )
+        if x
+    )
+
+
+def _skill_variants(requirements: dict[str, Any], skill: str) -> set[str]:
+    variants = {_norm_text(skill)}
+    synonyms_map = requirements.get("expanded_synonyms") or {}
+    if not isinstance(synonyms_map, dict):
+        return {x for x in variants if x}
+    for canonical, synonyms in synonyms_map.items():
+        if _norm_text(canonical) != _norm_text(skill):
+            continue
+        if isinstance(synonyms, list):
+            variants.update(_norm_text(x) for x in synonyms if _norm_text(x))
+        break
+    return {x for x in variants if x}
+
+
+def _skills_part(requirements: dict[str, Any], resume: dict[str, Any]) -> float:
+    req_skills = [_norm_text(s) for s in (requirements.get("skills") or []) if _norm_text(s)]
+    if not req_skills:
+        return 0.5
+    resume_skills = {_norm_text(s) for s in (resume.get("skills") or []) if _norm_text(s)}
+    resume_skill_blob = " ".join(sorted(resume_skills))
+    resume_text_blob = _resume_text_blob(resume)
+    matched_score = 0.0
+    for skill in req_skills:
+        variants = _skill_variants(requirements, skill)
+        if any(variant in resume_skills for variant in variants):
+            matched_score += 1.0
+        elif any(variant and variant in resume_skill_blob for variant in variants):
+            matched_score += 0.85
+        elif any(variant and variant in resume_text_blob for variant in variants):
+            matched_score += 0.65
+    return max(0.0, min(1.0, matched_score / len(req_skills)))
+
+
+def _position_part(requirements: dict[str, Any], resume: dict[str, Any]) -> float:
+    req_pos = [_norm_text(s) for s in (requirements.get("position_keywords") or []) if _norm_text(s)]
+    if not req_pos:
+        return 0.5
+    title = _norm_text(resume.get("title"))
+    blob = _resume_text_blob(resume)
+    hits = 0.0
+    for keyword in req_pos:
+        if keyword and keyword in title:
+            hits += 1.0
+        elif keyword and keyword in blob:
+            hits += 0.6
+    return max(0.0, min(1.0, hits / len(req_pos)))
+
+
+def _experience_part(requirements: dict[str, Any], resume: dict[str, Any]) -> float:
+    req_exp = _to_float(requirements.get("experience_years_min"))
+    cand_exp = _to_float(resume.get("experience_years"))
+    if req_exp is None or req_exp <= 0:
+        return 0.5
+    if cand_exp is None:
+        return 0.2
+    return max(0.0, min(1.0, cand_exp / req_exp))
+
+
+def _region_part(requirements: dict[str, Any], resume: dict[str, Any]) -> float:
+    req_region = _norm_text(requirements.get("region"))
+    area = _norm_text(resume.get("area"))
+    if not req_region or req_region in {"любой", "any"}:
+        return 0.5
+    if req_region in area or area in req_region:
+        return 1.0
+    req_tokens = set(_tokenize(req_region))
+    area_tokens = set(_tokenize(area))
+    overlap = len(req_tokens & area_tokens)
+    return (overlap / len(req_tokens)) if req_tokens else 0.0
+
+
 def _fallback_score_for_resume(requirements: dict[str, Any], resume: dict[str, Any]) -> int:
     min_score = int(settings.llm_prescore_fallback_min_score or 0)
     max_score = int(settings.llm_prescore_fallback_max_score or 100)
     if min_score > max_score:
         min_score, max_score = max_score, min_score
-    w_skills = max(0.0, float(settings.llm_prescore_fallback_weight_skills or 0.4))
+    w_skills = max(0.7, float(settings.llm_prescore_fallback_weight_skills or 0.4))
     w_pos = max(0.0, float(settings.llm_prescore_fallback_weight_position or 0.25))
     w_exp = max(0.0, float(settings.llm_prescore_fallback_weight_experience or 0.2))
     w_region = max(0.0, float(settings.llm_prescore_fallback_weight_region or 0.15))
     total_w = w_skills + w_pos + w_exp + w_region
     if total_w <= 0:
         return max(min_score, min(100, max_score))
-
-    req_skills = [_norm_text(s) for s in (requirements.get("skills") or []) if _norm_text(s)]
-    resume_skills = [_norm_text(s) for s in (resume.get("skills") or []) if _norm_text(s)]
-    resume_blob = " ".join(resume_skills)
-    matched = 0
-    for sk in req_skills:
-        if sk in resume_skills or (sk and sk in resume_blob):
-            matched += 1
-    skills_part = (matched / len(req_skills)) if req_skills else 0.5
-
-    title = _norm_text(resume.get("title"))
-    req_pos = [_norm_text(s) for s in (requirements.get("position_keywords") or []) if _norm_text(s)]
-    if req_pos:
-        pos_hits = sum(1 for kw in req_pos if kw in title)
-        position_part = pos_hits / len(req_pos)
-    else:
-        position_part = 0.5
-
-    req_exp = _to_float(requirements.get("experience_years_min"))
-    cand_exp = _to_float(resume.get("experience_years"))
-    if req_exp is None or req_exp <= 0:
-        experience_part = 0.5
-    elif cand_exp is None:
-        experience_part = 0.2
-    else:
-        experience_part = max(0.0, min(1.0, cand_exp / req_exp))
-
-    req_region = _norm_text(requirements.get("region"))
-    area = _norm_text(resume.get("area"))
-    if not req_region or req_region in {"любой", "any"}:
-        region_part = 0.5
-    elif req_region in area or area in req_region:
-        region_part = 1.0
-    else:
-        req_tokens = set(_tokenize(req_region))
-        area_tokens = set(_tokenize(area))
-        overlap = len(req_tokens & area_tokens)
-        region_part = (overlap / len(req_tokens)) if req_tokens else 0.0
+    skills_part = _skills_part(requirements, resume)
+    position_part = _position_part(requirements, resume)
+    experience_part = _experience_part(requirements, resume)
+    region_part = _region_part(requirements, resume)
 
     weighted_part = (
         skills_part * w_skills
@@ -349,6 +427,24 @@ def _fallback_score_for_resume(requirements: dict[str, Any], resume: dict[str, A
         + region_part * w_region
     ) / total_w
     raw = int(round(min_score + (max_score - min_score) * weighted_part))
+
+    soft_signals = [
+        _norm_text(s)
+        for s in (requirements.get("soft_signals") or [])
+        if _norm_text(s)
+    ]
+    if soft_signals:
+        blob = " ".join(
+            [
+                _norm_text(resume.get("title")),
+                " ".join(_norm_text(x) for x in (resume.get("skills") or []) if _norm_text(x)),
+                _norm_text(resume.get("about")),
+                _norm_text(resume.get("raw_text")),
+            ]
+        )
+        hits = sum(1 for s in soft_signals if s in blob)
+        if hits > 0:
+            raw += min(10, hits * 3)
     return max(0, min(100, max(min_score, min(max_score, raw))))
 
 

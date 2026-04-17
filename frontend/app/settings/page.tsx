@@ -335,11 +335,6 @@ function SettingsBody() {
           <h1 className="text-3xl font-display font-bold tracking-tight">Настройки сервиса</h1>
           <StatusIndicator />
         </div>
-        <div className="rounded-lg bg-muted/30 px-4 py-3 text-sm">
-          <Link href="/settings/telegram" className="text-primary font-medium hover:underline">
-            Перейти к настройкам Telegram →
-          </Link>
-        </div>
 
         {canManageIntegrationEditors === true ? (
           <div className="rounded-lg border border-border bg-card px-4 py-3 text-sm">

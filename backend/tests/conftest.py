@@ -136,9 +136,8 @@ def _truncate_tables(session: Session) -> None:
     session.execute(
         text(
             "TRUNCATE TABLE "
-            "telegram_message_attachments, telegram_messages, telegram_sync_runs, "
-            "telegram_sources, telegram_accounts, "
             "candidate_contacts, candidate_source_links, favorites, candidate_profiles, "
+            "skill_synonyms, "
             "oauth_handoff_codes, oauth_identities, "
             "api_keys, estaff_exports, search_history, search_templates, system_settings, users "
             "RESTART IDENTITY CASCADE"

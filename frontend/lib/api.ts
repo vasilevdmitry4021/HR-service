@@ -192,19 +192,12 @@ export async function addFavorite(
   >,
 ) {
   const llm = candidate.llm_analysis;
-  const isTelegram = candidate.source_type === "telegram";
-  const hhResumeId = isTelegram
-    ? ""
-    : (candidate.hh_resume_id || candidate.id);
-  const profileId =
-    isTelegram && (candidate.candidate_profile_id || candidate.id)
-      ? (candidate.candidate_profile_id || candidate.id)
-      : undefined;
+  const hhResumeId = candidate.hh_resume_id || candidate.id;
   const scoreFromLlm = llm?.llm_score ?? null;
   const scorePrescreen = candidate.llm_score ?? null;
   const body: Record<string, unknown> = {
     hh_resume_id: hhResumeId,
-    candidate_profile_id: profileId ?? null,
+    candidate_profile_id: null,
     title_snapshot: candidate.title ?? null,
     full_name: candidate.full_name ?? null,
     area: candidate.area ?? null,
@@ -304,141 +297,6 @@ export async function deleteTemplate(id: string) {
   });
 }
 
-export type TelegramStatusResponse = {
-  feature_enabled: boolean;
-  connected: boolean;
-  auth_status?: string | null;
-  phone_hint?: string | null;
-  account_id?: string | null;
-  last_sync_at?: string | null;
-  awaiting_two_factor?: boolean | null;
-};
-
-export async function fetchTelegramStatus() {
-  return apiFetch<TelegramStatusResponse>("/telegram/status");
-}
-
-export type TelegramSourceRow = {
-  id: string;
-  account_id: string;
-  telegram_id: number;
-  link: string;
-  type: string;
-  display_name: string;
-  access_status: string;
-  is_enabled: boolean;
-  last_message_id?: number | null;
-  last_check_at?: string | null;
-  last_sync_at?: string | null;
-  error_message?: string | null;
-  created_at: string;
-  updated_at: string;
-};
-
-export async function fetchTelegramSources() {
-  return apiFetch<TelegramSourceRow[]>("/telegram/sources");
-}
-
-export async function postTelegramConnect(body: {
-  api_id: string;
-  api_hash: string;
-  phone: string;
-}) {
-  return apiFetch<{
-    account_id: string;
-    need_code: boolean;
-    phone_hint?: string | null;
-    message?: string | null;
-  }>("/telegram/connect", { method: "POST", body: JSON.stringify(body) });
-}
-
-export async function postTelegramVerify(body: {
-  account_id: string;
-  code: string;
-}) {
-  return apiFetch<{ status: string; message?: string | null }>(
-    "/telegram/verify-code",
-    { method: "POST", body: JSON.stringify(body) },
-  );
-}
-
-export async function postTelegramVerifyPassword(body: {
-  account_id: string;
-  password: string;
-}) {
-  return apiFetch<{ status: string; message?: string | null }>(
-    "/telegram/verify-password",
-    { method: "POST", body: JSON.stringify(body) },
-  );
-}
-
-export async function postTelegramDisconnect() {
-  return apiFetch<{ status: string }>("/telegram/disconnect", {
-    method: "POST",
-    body: JSON.stringify({}),
-  });
-}
-
-export async function postTelegramSource(body: {
-  link: string;
-  telegram_id?: number | null;
-  type?: string;
-  display_name?: string;
-}) {
-  return apiFetch<TelegramSourceRow>("/telegram/sources", {
-    method: "POST",
-    body: JSON.stringify(body),
-  });
-}
-
-export async function patchTelegramSource(
-  id: string,
-  patch: { is_enabled?: boolean; display_name?: string | null },
-) {
-  return apiFetch<TelegramSourceRow>(
-    `/telegram/sources/${encodeURIComponent(id)}`,
-    { method: "PATCH", body: JSON.stringify(patch) },
-  );
-}
-
-export async function deleteTelegramSource(id: string) {
-  await apiFetch<unknown>(`/telegram/sources/${encodeURIComponent(id)}`, {
-    method: "DELETE",
-  });
-}
-
-export type TelegramSyncRunRow = {
-  id: string;
-  source_id: string;
-  status: string;
-  started_at: string;
-  finished_at?: string | null;
-  messages_processed: number;
-  candidates_created: number;
-  error_log?: unknown[] | Record<string, unknown> | null;
-};
-
-/** Проверка доступа к источнику (актуализация статуса и ошибки на сервере). */
-export async function postTelegramValidateSource(sourceId: string) {
-  return apiFetch<TelegramSourceRow>(
-    `/telegram/sources/${encodeURIComponent(sourceId)}/validate`,
-    { method: "POST", body: JSON.stringify({}) },
-  );
-}
-
-/** Постановка задачи синхронизации источника в очередь обработки. */
-export async function postTelegramSyncSource(sourceId: string) {
-  return apiFetch<TelegramSyncRunRow>(
-    `/telegram/sources/${encodeURIComponent(sourceId)}/sync`,
-    { method: "POST", body: JSON.stringify({}) },
-  );
-}
-
-export async function fetchTelegramSyncRuns(limit = 50) {
-  const q = new URLSearchParams({ limit: String(limit) });
-  return apiFetch<TelegramSyncRunRow[]>(`/telegram/sync-runs?${q}`);
-}
-
 export async function evaluateSearchSnapshot(snapshotId: string) {
   return apiFetch<EvaluateSnapshotResponse>(
     `/search/${encodeURIComponent(snapshotId)}/evaluate`,
@@ -530,7 +388,7 @@ export type EstaffExportStatus = "pending" | "success" | "error";
 export type EstaffExportResult = {
   export_id: string;
   candidate_id: string;
-  /** Устарело: для HeadHunter совпадает с candidate_id; для Telegram не заполняется */
+  /** Устарело: для HeadHunter совпадает с candidate_id */
   hh_resume_id?: string | null;
   status: EstaffExportStatus;
   estaff_candidate_id?: string | null;

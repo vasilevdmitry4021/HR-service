@@ -46,9 +46,6 @@ class User(Base):
     estaff_exports = relationship(
         "EstaffExport", back_populates="user", cascade="all, delete-orphan"
     )
-    telegram_accounts = relationship(
-        "TelegramAccount", back_populates="owner", cascade="all, delete-orphan"
-    )
     oauth_identities = relationship(
         "OAuthIdentity", back_populates="user", cascade="all, delete-orphan"
     )

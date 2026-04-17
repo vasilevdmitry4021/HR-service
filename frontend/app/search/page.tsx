@@ -37,7 +37,6 @@ import {
   fetchEvaluateSearchProgress,
   fetchFavorites,
   fetchReferenceAreasRussia,
-  fetchTelegramStatus,
   fetchTemplates,
   removeFavorite,
   startAnalyzeSearchSnapshot,
@@ -62,7 +61,7 @@ import {
 } from "@/lib/search-filters";
 import {
   LIST_SORT_OPTIONS,
-  processCandidatesForList,
+  filterCandidatesBySubstring,
   type ListSortKind,
 } from "@/lib/search-results-list";
 import { cn } from "@/lib/utils";
@@ -236,17 +235,17 @@ function SearchPageContent() {
   const snapshotEvalInteractiveReadyRef = useRef(false);
   const snapshotAnalyzePollKeyRef = useRef<string | null>(null);
   const snapshotAnalyzeRunIdRef = useRef(0);
+  const listRefetchRunIdRef = useRef(0);
   const [perPage, setPerPage] = useState(20);
-  const [sourceScope, setSourceScope] = useState<"hh" | "telegram" | "all">(
-    "hh",
-  );
-  const [telegramFeatureOn, setTelegramFeatureOn] = useState(false);
+  const [sourceScope] = useState<"hh">("hh");
   const [listFilter, setListFilter] = useState("");
   const [listSort, setListSort] = useState<ListSortKind>("server");
   const [hhAreas, setHhAreas] = useState<HhAreaOption[]>(FALLBACK_AREA_OPTIONS);
   const [hhAreasLoading, setHhAreasLoading] = useState(true);
   const [hhAreasHint, setHhAreasHint] = useState<string | null>(null);
   const repeatAppliedRef = useRef(false);
+  const [evalProgressVisible, setEvalProgressVisible] = useState(true);
+  const [analyzeProgressVisible, setAnalyzeProgressVisible] = useState(true);
   const evalStatus = snapshotEvalProgress?.status ?? (snapshotEvalBusy ? "running" : "");
   const evalIsActive =
     (snapshotEvalBusy || Boolean(snapshotEvalJob)) &&
@@ -263,6 +262,32 @@ function SearchPageContent() {
   const canShowAnalyzeTop = evalCompleted;
   const canRunEvaluate = !analyzeIsActive && !evalIsActive;
   const canRunAnalyzeTop = evalCompleted && !analyzeIsActive && !evalIsActive;
+
+  useEffect(() => {
+    if (!snapshotEvalProgress) {
+      setEvalProgressVisible(false);
+      return;
+    }
+    if (snapshotEvalProgress.status !== "done" && snapshotEvalProgress.status !== "error") {
+      setEvalProgressVisible(true);
+      return;
+    }
+    const t = setTimeout(() => setEvalProgressVisible(false), 2000);
+    return () => clearTimeout(t);
+  }, [snapshotEvalProgress, snapshotEvalProgress?.status]);
+
+  useEffect(() => {
+    if (!snapshotAnalyzeProgress) {
+      setAnalyzeProgressVisible(false);
+      return;
+    }
+    if (snapshotAnalyzeProgress.status !== "done" && snapshotAnalyzeProgress.status !== "error") {
+      setAnalyzeProgressVisible(true);
+      return;
+    }
+    const t = setTimeout(() => setAnalyzeProgressVisible(false), 2000);
+    return () => clearTimeout(t);
+  }, [snapshotAnalyzeProgress, snapshotAnalyzeProgress?.status]);
 
   const areaLabels = useMemo(() => {
     const m = new Map<number, string>();
@@ -417,19 +442,6 @@ function SearchPageContent() {
     void refreshFavorites();
   }, [refreshFavorites]);
 
-  useEffect(() => {
-    if (!accessToken) return;
-    void fetchTelegramStatus()
-      .then((s) => {
-        setTelegramFeatureOn(s.feature_enabled);
-        if (!s.feature_enabled) setSourceScope("hh");
-      })
-      .catch(() => {
-        setTelegramFeatureOn(false);
-        setSourceScope("hh");
-      });
-  }, [accessToken]);
-
   const queryForApi = queryBaseWithoutFilterLine(q);
 
   const processedItems = useMemo(() => {
@@ -448,8 +460,8 @@ function SearchPageContent() {
             if (nextScore === undefined) return item;
             return { ...item, llm_score: nextScore ?? null };
           });
-    return processCandidatesForList(withOverlay, listFilter, listSort);
-  }, [results, snapshotEvalScores, listFilter, listSort]);
+    return filterCandidatesBySubstring(withOverlay, listFilter);
+  }, [results, snapshotEvalScores, listFilter]);
 
   useEffect(() => {
     const currentSnapshotId =
@@ -566,6 +578,7 @@ function SearchPageContent() {
       page: number,
       perPageArg: number,
       snapshotIdForPaging?: string | null,
+      sortArg: ListSortKind = listSort,
     ) => {
       const payload = filtersToApiPayload(filters);
       const body: Record<string, unknown> = {
@@ -574,6 +587,9 @@ function SearchPageContent() {
         per_page: perPageArg,
         source_scope: sourceScope,
       };
+      if (sortArg !== "server") {
+        body.sort_by = sortArg;
+      }
       if (payload) body.filters = payload;
       if (snapshotIdForPaging && snapshotIdForPaging.trim()) {
         body.snapshot_id = snapshotIdForPaging.trim();
@@ -583,7 +599,7 @@ function SearchPageContent() {
         body: JSON.stringify(body),
       });
     },
-    [queryForApi, filters, sourceScope],
+    [queryForApi, filters, sourceScope, listSort],
   );
 
   const runParseOnly = useCallback(async () => {
@@ -793,6 +809,23 @@ function SearchPageContent() {
             processed: progress.processed_count,
             analyzed: progress.analyzed_count,
           });
+          if (progress.analyses && Object.keys(progress.analyses).length > 0) {
+            setResults((prev) => {
+              if (!prev) return prev;
+              const updated = prev.items.map((item) => {
+                const analysis = progress.analyses[item.id];
+                if (analysis) {
+                  return {
+                    ...item,
+                    llm_analysis: analysis,
+                    llm_score: analysis.llm_score ?? item.llm_score,
+                  };
+                }
+                return item;
+              });
+              return { ...prev, items: updated };
+            });
+          }
           if (progress.status === "done") {
             await refreshCurrentResultsPage();
             break;
@@ -984,10 +1017,8 @@ function SearchPageContent() {
     (next: 20 | 50) => {
       if (next === perPage) return;
       setPerPage(next);
-      const canRefetch =
-        results != null &&
-        Boolean(queryForApi.trim() || hasAnyFilters(filters));
-      if (canRefetch) {
+      if (results != null) {
+        const runId = ++listRefetchRunIdRef.current;
         void (async () => {
           setLoading(true);
           setError(null);
@@ -997,21 +1028,59 @@ function SearchPageContent() {
               results.snapshot_id.trim()
                 ? results.snapshot_id.trim()
                 : null;
-            const data = await fetchResultsPage(0, next, sid ?? undefined);
+            const data = await fetchResultsPage(0, next, sid ?? undefined, listSort);
+            if (listRefetchRunIdRef.current !== runId) return;
             setActiveTab("all");
             setResults(data);
           } catch (e) {
+            if (listRefetchRunIdRef.current !== runId) return;
             if (e instanceof ApiError && (e.status === 410 || e.status === 404)) {
               setResults(null);
             }
             setError(e instanceof ApiError ? e.message : "Ошибка поиска");
           } finally {
-            setLoading(false);
+            if (listRefetchRunIdRef.current === runId) {
+              setLoading(false);
+            }
           }
         })();
       }
     },
-    [perPage, results, filters, queryForApi, fetchResultsPage],
+    [perPage, results, fetchResultsPage, listSort],
+  );
+
+  const handleListSortChange = useCallback(
+    (next: ListSortKind) => {
+      if (next === listSort) return;
+      setListSort(next);
+      if (!results) return;
+      const runId = ++listRefetchRunIdRef.current;
+      void (async () => {
+        setLoading(true);
+        setError(null);
+        try {
+          const sid =
+            typeof results.snapshot_id === "string" && results.snapshot_id.trim()
+              ? results.snapshot_id.trim()
+              : null;
+          const data = await fetchResultsPage(0, perPage, sid ?? undefined, next);
+          if (listRefetchRunIdRef.current !== runId) return;
+          setActiveTab("all");
+          setResults(data);
+        } catch (e) {
+          if (listRefetchRunIdRef.current !== runId) return;
+          if (e instanceof ApiError && (e.status === 410 || e.status === 404)) {
+            setResults(null);
+          }
+          setError(e instanceof ApiError ? e.message : "Ошибка поиска");
+        } finally {
+          if (listRefetchRunIdRef.current === runId) {
+            setLoading(false);
+          }
+        }
+      })();
+    },
+    [listSort, results, fetchResultsPage, perPage],
   );
 
   const submitSaveTemplate = useCallback(async () => {
@@ -1109,36 +1178,28 @@ function SearchPageContent() {
                     parsePreview?.params?.region) as string | undefined
                 }
               />
-              {telegramFeatureOn ? (
-                <div className="flex flex-wrap items-center gap-2">
-                  <Label htmlFor="search-source-scope" className="text-sm shrink-0">
-                    Источник данных
-                  </Label>
-                  <select
-                    id="search-source-scope"
-                    className={selectFieldClass}
-                    value={sourceScope}
-                    onChange={(e) =>
-                      setSourceScope(
-                        e.target.value as "hh" | "telegram" | "all",
-                      )
-                    }
-                    disabled={loading}
-                  >
-                    <option value="hh">HeadHunter</option>
-                    <option value="telegram">Telegram</option>
-                    <option value="all">Все источники</option>
-                  </select>
-                </div>
-              ) : null}
-              <button
-                type="button"
-                onClick={() => void runParseOnly()}
-                disabled={!queryForApi.trim() || parsing || loading}
-                className="self-start text-sm text-primary underline disabled:pointer-events-none disabled:opacity-50"
-              >
-                Только разобрать запрос
-              </button>
+            </div>
+
+            <div className="rounded-lg border bg-muted/20 p-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <h2 className="text-sm font-display font-semibold text-foreground/80">
+                  Распознанные параметры
+                </h2>
+                <button
+                  type="button"
+                  onClick={() => void runParseOnly()}
+                  disabled={!queryForApi.trim() || parsing || loading}
+                  className="text-sm text-primary underline disabled:pointer-events-none disabled:opacity-50"
+                >
+                  {parsing ? "Разбор…" : "Разобрать запрос"}
+                </button>
+              </div>
+              <ParsedTags
+                params={results?.parsed_params ?? parsePreview?.params ?? null}
+                confidence={
+                  results ? null : (parsePreview?.confidence ?? null)
+                }
+              />
             </div>
 
             <div className="flex flex-wrap items-center gap-3">
@@ -1190,8 +1251,11 @@ function SearchPageContent() {
                       </Button>
                     )}
                   </div>
-                  {snapshotEvalProgress && (
-                    <div className="space-y-2 rounded-lg border bg-muted/30 p-3">
+                  {snapshotEvalProgress && evalProgressVisible && (
+                    <div className={cn(
+                      "space-y-2 rounded-lg border bg-muted/30 p-3 transition-opacity duration-500",
+                      (snapshotEvalProgress.status === "done" || snapshotEvalProgress.status === "error") && "opacity-50",
+                    )}>
                       <Progress
                         value={progressValue}
                         max={Math.max(snapshotEvalProgress.total, 1)}
@@ -1202,7 +1266,7 @@ function SearchPageContent() {
                         {statusLabelRu(snapshotEvalProgress.status)}.{" "}
                         {evalIsActive
                           ? "Можно продолжать работать со списком и страницами — оценки подгружаются автоматически."
-                          : "Финальный прогресс сохранён до следующего запуска оценки."}
+                          : ""}
                       </p>
                       <p>
                         <span className="text-xs text-muted-foreground">
@@ -1235,8 +1299,11 @@ function SearchPageContent() {
                       )}
                     </div>
                   )}
-                  {snapshotAnalyzeProgress && (
-                    <div className="space-y-2 rounded-lg border bg-muted/30 p-3">
+                  {snapshotAnalyzeProgress && analyzeProgressVisible && (
+                    <div className={cn(
+                      "space-y-2 rounded-lg border bg-muted/30 p-3 transition-opacity duration-500",
+                      (snapshotAnalyzeProgress.status === "done" || snapshotAnalyzeProgress.status === "error") && "opacity-50",
+                    )}>
                       <Progress
                         value={Math.min(
                           snapshotAnalyzeProgress.processed,
@@ -1256,18 +1323,6 @@ function SearchPageContent() {
                   )}
                 </div>
               )}
-
-            <section className="space-y-3">
-              <h2 className="text-sm font-display font-semibold text-foreground/80">
-                Распознанные параметры
-              </h2>
-              <ParsedTags
-                params={results?.parsed_params ?? parsePreview?.params ?? null}
-                confidence={
-                  results ? null : (parsePreview?.confidence ?? null)
-                }
-              />
-            </section>
 
             <section className="space-y-4">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
@@ -1359,8 +1414,9 @@ function SearchPageContent() {
                         className={cn(selectFieldClass, "w-full min-w-0")}
                         value={listSort}
                         onChange={(e) =>
-                          setListSort(e.target.value as ListSortKind)
+                          handleListSortChange(e.target.value as ListSortKind)
                         }
+                        disabled={loading}
                       >
                         {LIST_SORT_OPTIONS.map((o) => (
                           <option key={o.value} value={o.value}>
@@ -1371,9 +1427,9 @@ function SearchPageContent() {
                     </div>
                   </div>
                   <p className="text-xs leading-relaxed text-muted-foreground">
-                    Локальный поиск и сортировка ниже относятся к текущей
-                    странице списка. Порядок выдачи по всему снимку поиска
-                    задаётся на сервере при нажатии «Найти».
+                    Локальный поиск ниже относится к текущей странице списка.
+                    Сортировка применяется на сервере ко всему снимку поиска и
+                    учитывается при пагинации.
                   </p>
                 </div>
               )}

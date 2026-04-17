@@ -15,11 +15,6 @@ from app.models import (  # noqa: F401
     SearchHistory,
     SearchTemplate,
     SystemSettings,
-    TelegramAccount,
-    TelegramMessage,
-    TelegramMessageAttachment,
-    TelegramSource,
-    TelegramSyncRun,
     User,
 )
 

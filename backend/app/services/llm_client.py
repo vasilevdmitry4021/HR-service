@@ -24,13 +24,23 @@ logger = logging.getLogger(__name__)
 
 LLM_CREDENTIALS_KEY = "llm_credentials"
 
-SYSTEM_PROMPT = """Ты — ассистент для парсинга HR-запросов. Извлеки параметры из текста.
+SYSTEM_PROMPT = """Ты — ассистент для парсинга HR-запросов в фильтры поиска резюме на hh.ru.
+Твоя задача: извлечь параметры, которые помогут найти релевантных кандидатов, но не сделают поиск слишком узким.
 
-ВАЖНО: Извлекай ТОЛЬКО то, что ЯВНО указано в запросе. НЕ добавляй связанные термины, синонимы или предположения.
+ВАЖНО:
+- Извлекай только явно указанные требования.
+- Не добавляй предполагаемые skills, industry и другие параметры.
+- Исключение: для position_keywords добавляй разумные рус/англ варианты и частые названия той же роли на hh.ru (3-5 вариантов), чтобы не сузить поиск.
+- Цель — сформировать полезные фильтры для поиска резюме, не потеряв релевантных кандидатов.
 
 Верни ТОЛЬКО валидный JSON (без markdown, без текста до/после):
 {
   "skills": [],
+  "must_position": [],
+  "must_skills": [{"canonical": "", "synonyms": [], "search_equivalents": [], "intent_strength": "required|preferred|signal", "query_confidence": 0.0}],
+  "should_skills": [{"canonical": "", "synonyms": [], "search_equivalents": [], "intent_strength": "required|preferred|signal", "query_confidence": 0.0}],
+  "semantic_skills": [{"canonical": "", "search_equivalents": [], "intent_strength": "required|preferred|signal", "query_confidence": 0.0}],
+  "soft_signals": [],
   "experience_years_min": null,
   "experience_years_max": null,
   "region": null,
@@ -43,20 +53,32 @@ SYSTEM_PROMPT = """Ты — ассистент для парсинга HR-зап
 
 Правила извлечения:
 
-- skills: профессиональные навыки и компетенции кандидата, ЯВНО указанные в запросе.
-  * Для IT-позиций: технологии, языки программирования, фреймворки (Python, Java, Docker, React, PostgreSQL)
-  * Для юристов: области права (арбитраж, корпоративное право, судебные дела, договорная работа)
-  * Для бухгалтеров: направления учёта (налоговый учёт, МСФО, 1С, бюджетирование)
-  * Для HR: направления работы (подбор персонала, кадровое делопроизводство, C&B)
-  * Для менеджеров: методологии и области (управление проектами, Agile, Scrum)
-  НЕ добавляй навыки, которые не упомянуты в запросе!
+- skills: только явно указанные профессиональные навыки, технологии, инструменты, компетенции.
+  * IT: Python, Java, Docker, React, PostgreSQL, Kafka, микросервисы
+  * Юристы: арбитраж, договорная работа, корпоративное право
+  * Бухгалтеры: МСФО, налоговый учёт, 1С, бюджетирование
+  * HR: подбор персонала, кадровое делопроизводство, C&B
+  * Менеджеры: Agile, Scrum, управление проектами
+  Не добавляй синонимы и смежные навыки, если их нет в запросе.
 
-- industry: отрасль, в которой должен иметь опыт кандидат.
+- industry: только отрасль / домен бизнеса, где нужен опыт кандидата.
   Примеры: IT, retail, finance, банки, телеком, строительство, недвижимость, медицина, производство.
-  "в области ИТ", "в сфере ритейла", "опыт в банках" -> это industry, НЕ skills!
+  "в области ИТ", "в сфере ритейла", "опыт в банках" -> industry, НЕ skills.
+  Если отрасль упомянута как контекст компании, а не требование к опыту кандидата, не заполняй industry.
 
-- position_keywords: должность на русском И английском.
-  Примеры: ["юрист", "lawyer"], ["бухгалтер", "accountant"], ["разработчик", "developer"]
+- position_keywords: основная должность + 2-4 разумных варианта той же роли на hh.ru.
+  Допустимы: рус/англ вариант, частые синонимы, близкие формулировки той же профессии.
+  Недопустимо: добавлять другой профиль или расширять до смежной, но другой профессии.
+
+- must_position: жёсткая роль (основная должность) и 2-4 синонима; дублирует основную роль для boolean-планировщика.
+- semantic_skills: основной семантический массив навыков. Для каждого навыка:
+  canonical — каноническая профессиональная формулировка;
+  search_equivalents — 2-8 рыночных формулировок для HH (включая RU/EN варианты);
+  intent_strength — required|preferred|signal по намерению пользователя;
+  query_confidence — уверенность в интерпретации 0..1.
+- must_skills / should_skills: backward-compatible поля; заполняй на основе semantic_skills.
+  ВАЖНО: разговорные маркеры ("вайбкодинг", "курсорить", "микрачи") не превращай автоматически в must.
+- soft_signals: только низкая уверенность/шум/сигналы без жёсткого требования.
 
 - experience_years_min: "2 года", "от 3 лет", "3+ года" -> число (2, 3)
 - experience_years_max: "до 5 лет", "3-5 лет" -> 5
@@ -68,19 +90,19 @@ SYSTEM_PROMPT = """Ты — ассистент для парсинга HR-зап
 Примеры:
 
 "Юрист с опытом арбитражных дел в области ИТ" ->
-{"skills":["арбитраж","арбитражные дела"],"experience_years_min":null,"experience_years_max":null,"region":null,"position_keywords":["юрист","lawyer"],"gender":null,"industry":["IT"],"age_min":null,"age_max":null}
+{"skills":["арбитраж","арбитражные дела"],"experience_years_min":null,"experience_years_max":null,"region":null,"position_keywords":["юрист","lawyer","юрисконсульт"],"gender":null,"industry":["IT"],"age_min":null,"age_max":null}
 
 "Бухгалтер со знанием МСФО, опыт в банковской сфере от 3 лет" ->
-{"skills":["МСФО"],"experience_years_min":3,"experience_years_max":null,"region":null,"position_keywords":["бухгалтер","accountant"],"gender":null,"industry":["finance","банки"],"age_min":null,"age_max":null}
+{"skills":["МСФО"],"experience_years_min":3,"experience_years_max":null,"region":null,"position_keywords":["бухгалтер","accountant","главный бухгалтер"],"gender":null,"industry":["finance","банки"],"age_min":null,"age_max":null}
 
 "Системный аналитик с опытом работы с микросервисами, 2 года, Москва" ->
-{"skills":["микросервисы"],"experience_years_min":2,"experience_years_max":null,"region":"Москва","position_keywords":["системный аналитик","system analyst"],"gender":null,"industry":[],"age_min":null,"age_max":null}
+{"skills":["микросервисы"],"experience_years_min":2,"experience_years_max":null,"region":"Москва","position_keywords":["системный аналитик","system analyst","systems analyst","бизнес-аналитик"],"gender":null,"industry":[],"age_min":null,"age_max":null}
 
 "Java developer 5+ лет, Spring Boot, до 40 лет" ->
-{"skills":["Java","Spring Boot"],"experience_years_min":5,"experience_years_max":null,"region":null,"position_keywords":["разработчик","developer"],"gender":null,"industry":[],"age_min":null,"age_max":40}
+{"skills":["Java","Spring Boot"],"experience_years_min":5,"experience_years_max":null,"region":null,"position_keywords":["java developer","java разработчик","backend developer","разработчик Java"],"gender":null,"industry":[],"age_min":null,"age_max":40}
 
 "HR-менеджер с опытом подбора IT-специалистов" ->
-{"skills":["подбор персонала"],"experience_years_min":null,"experience_years_max":null,"region":null,"position_keywords":["HR-менеджер","HR manager"],"gender":null,"industry":["IT"],"age_min":null,"age_max":null}
+{"skills":["подбор IT-специалистов"],"experience_years_min":null,"experience_years_max":null,"region":null,"position_keywords":["HR-менеджер","HR manager","IT recruiter","рекрутер"],"gender":null,"industry":["IT"],"age_min":null,"age_max":null}
 
 Ответ — только JSON."""
 
@@ -575,13 +597,202 @@ def _extract_json(text: str) -> dict[str, Any] | None:
 def _empty_parsed() -> dict[str, Any]:
     return {
         "skills": [],
+        "must_position": [],
+        "must_skills": [],
+        "should_skills": [],
+        "soft_signals": [],
+        "hard_skills": [],
+        "risky_skills": [],
+        "risky_demoted_to_should": 0,
+        "risky_demoted_to_soft": 0,
+        "semantic_jargon_terms_total": 0,
+        "semantic_terms_promoted_to_should": 0,
+        "semantic_terms_promoted_to_must": 0,
+        "semantic_terms_demoted_to_soft": 0,
+        "semantic_profile": [],
+        "skill_risk_profile": [],
         "experience_years_min": None,
+        "experience_years_max": None,
         "region": None,
         "position_keywords": [],
         "gender": None,
         "industry": [],
+        "age_min": None,
         "age_max": None,
     }
+
+
+def _normalize_skill_groups(raw_groups: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_groups, list):
+        return []
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    intent_aliases = {
+        "must": "required",
+        "required": "required",
+        "hard": "required",
+        "should": "preferred",
+        "preferred": "preferred",
+        "nice_to_have": "preferred",
+        "optional": "preferred",
+        "soft": "signal",
+        "signal": "signal",
+    }
+    for item in raw_groups:
+        canonical = ""
+        synonyms: list[str] = []
+        search_equivalents: list[str] = []
+        intent_strength: str | None = None
+        query_confidence: float | None = None
+        if isinstance(item, dict):
+            canonical = str(item.get("canonical") or "").strip()
+            raw_syn = item.get("synonyms")
+            if isinstance(raw_syn, list):
+                synonyms = [str(s).strip() for s in raw_syn if str(s).strip()]
+            raw_eq = item.get("search_equivalents")
+            if isinstance(raw_eq, list):
+                search_equivalents = [str(s).strip() for s in raw_eq if str(s).strip()]
+            raw_intent = str(item.get("intent_strength") or "").strip().lower()
+            intent_strength = intent_aliases.get(raw_intent)
+            raw_conf = item.get("query_confidence")
+            if isinstance(raw_conf, (int, float)):
+                query_confidence = float(raw_conf)
+                if query_confidence > 1.0:
+                    query_confidence = query_confidence / 100.0
+                query_confidence = max(0.0, min(1.0, query_confidence))
+        elif isinstance(item, str):
+            canonical = item.strip()
+        if not canonical:
+            continue
+        key = canonical.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        syn_seen: set[str] = set()
+        clean_synonyms: list[str] = []
+        clean_equivalents: list[str] = []
+        for syn in [*synonyms, *search_equivalents]:
+            syn_key = syn.lower()
+            if syn_key == key or syn_key in syn_seen:
+                continue
+            syn_seen.add(syn_key)
+            clean_synonyms.append(syn)
+            clean_equivalents.append(syn)
+        skill_obj: dict[str, Any] = {
+            "canonical": canonical,
+            "synonyms": clean_synonyms,
+            "search_equivalents": clean_equivalents,
+        }
+        if intent_strength:
+            skill_obj["intent_strength"] = intent_strength
+        if query_confidence is not None:
+            skill_obj["query_confidence"] = round(query_confidence, 3)
+        out.append(skill_obj)
+    return out
+
+
+_RISKY_SKILL_PATTERNS = (
+    re.compile(r"\b(вайб|vibe)\w*\b", re.IGNORECASE),
+    re.compile(r"\b(ai\s*pair|pair\s*programming)\b", re.IGNORECASE),
+    re.compile(r"\b(copilot|cursor\s*ide|курсор\w*)\b", re.IGNORECASE),
+    re.compile(r"\b(rockstar|ninja|guru|evangelist)\b", re.IGNORECASE),
+)
+_HAS_LETTERS_RE = re.compile(r"[a-zа-яё]", re.IGNORECASE)
+
+
+def _score_skill_hard_confidence(canonical: str, synonyms: list[str]) -> float:
+    text = str(canonical or "").strip()
+    norm = text.lower()
+    score = 0.55
+    if not text:
+        return 0.0
+    if not _HAS_LETTERS_RE.search(text):
+        return 0.0
+    if any(rx.search(norm) for rx in _RISKY_SKILL_PATTERNS):
+        score -= 0.45
+    if len(text) < 2 or len(text) > 64:
+        score -= 0.25
+    if " " not in text and "/" not in text:
+        score += 0.1
+    if synonyms:
+        score += 0.1
+        if any(2 <= len(str(s).strip()) <= 48 for s in synonyms):
+            score += 0.05
+    else:
+        score -= 0.05
+    return max(0.0, min(1.0, score))
+
+
+def _merge_skill_groups(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for bucket in groups:
+        for item in bucket:
+            canonical = str(item.get("canonical") or "").strip()
+            if not canonical:
+                continue
+            key = canonical.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            skill_obj: dict[str, Any] = {
+                "canonical": canonical,
+                "synonyms": [str(s).strip() for s in (item.get("synonyms") or []) if str(s).strip()],
+            }
+            search_equivalents = [
+                str(s).strip() for s in (item.get("search_equivalents") or []) if str(s).strip()
+            ]
+            if search_equivalents:
+                skill_obj["search_equivalents"] = search_equivalents
+            intent_strength = str(item.get("intent_strength") or "").strip()
+            if intent_strength:
+                skill_obj["intent_strength"] = intent_strength
+            query_confidence = item.get("query_confidence")
+            if isinstance(query_confidence, (int, float)):
+                skill_obj["query_confidence"] = round(max(0.0, min(1.0, float(query_confidence))), 3)
+            out.append(skill_obj)
+    return out
+
+
+def _split_hard_and_risky(
+    groups: list[dict[str, Any]],
+    *,
+    source: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    hard: list[dict[str, Any]] = []
+    risky: list[dict[str, Any]] = []
+    profile: list[dict[str, Any]] = []
+    for item in groups:
+        canonical = str(item.get("canonical") or "").strip()
+        synonyms = [str(s).strip() for s in (item.get("synonyms") or []) if str(s).strip()]
+        search_equivalents = [
+            str(s).strip() for s in (item.get("search_equivalents") or []) if str(s).strip()
+        ]
+        if not canonical:
+            continue
+        llm_conf = item.get("query_confidence")
+        confidence = _score_skill_hard_confidence(canonical, [*synonyms, *search_equivalents])
+        if isinstance(llm_conf, (int, float)):
+            confidence = 0.6 * confidence + 0.4 * max(0.0, min(1.0, float(llm_conf)))
+        target = hard if confidence >= 0.55 else risky
+        target.append(
+            {
+                "canonical": canonical,
+                "synonyms": synonyms,
+                "search_equivalents": search_equivalents,
+                "intent_strength": item.get("intent_strength"),
+                "query_confidence": item.get("query_confidence"),
+            }
+        )
+        profile.append(
+            {
+                "canonical": canonical,
+                "hard_confidence": round(confidence, 3),
+                "risk": "hard" if confidence >= 0.55 else "risky",
+                "source": source,
+            }
+        )
+    return hard, risky, profile
 
 
 def _normalize_llm_output(raw: dict[str, Any]) -> dict[str, Any]:
@@ -589,6 +800,76 @@ def _normalize_llm_output(raw: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(skills, list):
         skills = []
     skills = [str(s).strip() for s in skills if s]
+
+    must_position = raw.get("must_position")
+    if not isinstance(must_position, list):
+        must_position = []
+    must_position = [str(p).strip() for p in must_position if str(p).strip()]
+
+    must_skills = _normalize_skill_groups(raw.get("must_skills"))
+    should_skills = _normalize_skill_groups(raw.get("should_skills"))
+    semantic_skills = _normalize_skill_groups(raw.get("semantic_skills"))
+
+    if semantic_skills:
+        sem_must: list[dict[str, Any]] = []
+        sem_should: list[dict[str, Any]] = []
+        sem_soft: list[str] = []
+        semantic_profile: list[dict[str, Any]] = []
+        for skill in semantic_skills:
+            canonical = str(skill.get("canonical") or "").strip()
+            if not canonical:
+                continue
+            equivalents = [
+                str(x).strip()
+                for x in (skill.get("search_equivalents") or skill.get("synonyms") or [])
+                if str(x).strip()
+            ]
+            intent = str(skill.get("intent_strength") or "preferred").strip().lower()
+            confidence_raw = skill.get("query_confidence")
+            confidence = (
+                max(0.0, min(1.0, float(confidence_raw)))
+                if isinstance(confidence_raw, (int, float))
+                else 0.5
+            )
+            is_risky = any(rx.search(canonical.lower()) for rx in _RISKY_SKILL_PATTERNS)
+            normalized_skill = {
+                "canonical": canonical,
+                "synonyms": list(skill.get("synonyms") or []),
+                "search_equivalents": equivalents,
+                "intent_strength": intent,
+                "query_confidence": round(confidence, 3),
+            }
+            if intent == "signal" or confidence < 0.3:
+                sem_soft.append(canonical)
+                target = "soft"
+            elif intent == "required" and confidence >= 0.62 and (not is_risky or confidence >= 0.82):
+                sem_must.append(normalized_skill)
+                target = "must"
+            else:
+                sem_should.append(normalized_skill)
+                target = "should"
+            semantic_profile.append(
+                {
+                    "canonical": canonical,
+                    "intent_strength": intent,
+                    "query_confidence": round(confidence, 3),
+                    "target_bucket": target,
+                    "equivalents_count": len(equivalents),
+                    "is_risky_term": is_risky,
+                }
+            )
+        must_skills = _merge_skill_groups(must_skills, sem_must)
+        should_skills = _merge_skill_groups(should_skills, sem_should)
+    else:
+        semantic_profile = []
+        sem_soft = []
+
+    soft_signals = raw.get("soft_signals")
+    if not isinstance(soft_signals, list):
+        soft_signals = []
+    soft_signals = [str(s).strip() for s in soft_signals if str(s).strip()]
+    if sem_soft:
+        soft_signals = list(dict.fromkeys([*soft_signals, *sem_soft]))
 
     exp_min = raw.get("experience_years_min")
     if exp_min is not None and not isinstance(exp_min, (int, float)):
@@ -616,19 +897,99 @@ def _normalize_llm_output(raw: dict[str, Any]) -> dict[str, Any]:
         industry = []
     industry = [str(i).strip() for i in industry if i]
 
+    exp_max = raw.get("experience_years_max")
+    if exp_max is not None and not isinstance(exp_max, (int, float)):
+        exp_max = None
+    if exp_max is not None:
+        exp_max = int(exp_max)
+
+    age_min = raw.get("age_min")
+    if age_min is not None and not isinstance(age_min, (int, float)):
+        age_min = None
+    if age_min is not None:
+        age_min = int(age_min)
+
     age_max = raw.get("age_max")
     if age_max is not None and not isinstance(age_max, (int, float)):
         age_max = None
     if age_max is not None:
         age_max = int(age_max)
 
+    hard_must, risky_must, must_profile = _split_hard_and_risky(must_skills, source="must_skills")
+    hard_should, risky_should, should_profile = _split_hard_and_risky(
+        should_skills,
+        source="should_skills",
+    )
+    fallback_groups = [{"canonical": s, "synonyms": []} for s in skills]
+    hard_fallback: list[dict[str, Any]] = []
+    risky_fallback: list[dict[str, Any]] = []
+    fallback_profile: list[dict[str, Any]] = []
+    if not must_skills and fallback_groups:
+        hard_fallback, risky_fallback, fallback_profile = _split_hard_and_risky(
+            fallback_groups,
+            source="skills_fallback",
+        )
+
+    demoted_to_should = len(risky_must) + len(risky_fallback)
+    demoted_to_soft = sum(
+        1
+        for item in (must_profile + should_profile + fallback_profile)
+        if item["risk"] == "risky" and float(item["hard_confidence"]) < 0.2
+    )
+    risky_soft = [
+        item["canonical"]
+        for item in (must_profile + should_profile + fallback_profile)
+        if item["risk"] == "risky" and float(item["hard_confidence"]) < 0.2
+    ]
+    risky_soft_set = {x.lower() for x in risky_soft}
+    should_skills = _merge_skill_groups(
+        hard_should,
+        risky_should,
+        risky_must,
+        [x for x in risky_fallback if x["canonical"].lower() not in risky_soft_set],
+    )
+    must_skills = _merge_skill_groups(hard_must, hard_fallback)
+    if risky_soft:
+        soft_signals = list(dict.fromkeys([*soft_signals, *risky_soft]))
+
+    if not must_position:
+        must_position = list(pos_kw)
+    canonical_skills = [x["canonical"] for x in must_skills + should_skills]
+    if skills:
+        skills = list(dict.fromkeys([*skills, *canonical_skills]))
+    else:
+        skills = canonical_skills
+
+    hard_skills = [x["canonical"] for x in _merge_skill_groups(hard_must, hard_should, hard_fallback)]
+    risky_skills = [x["canonical"] for x in _merge_skill_groups(risky_must, risky_should, risky_fallback)]
+
+    semantic_promoted_to_must = sum(1 for row in semantic_profile if row["target_bucket"] == "must")
+    semantic_promoted_to_should = sum(1 for row in semantic_profile if row["target_bucket"] == "should")
+    semantic_demoted_to_soft = sum(1 for row in semantic_profile if row["target_bucket"] == "soft")
+
     return {
         "skills": skills,
+        "must_position": must_position,
+        "must_skills": must_skills,
+        "should_skills": should_skills,
+        "soft_signals": soft_signals,
+        "hard_skills": hard_skills,
+        "risky_skills": risky_skills,
+        "risky_demoted_to_should": demoted_to_should,
+        "risky_demoted_to_soft": demoted_to_soft,
+        "semantic_jargon_terms_total": sum(1 for row in semantic_profile if row["is_risky_term"]),
+        "semantic_terms_promoted_to_should": semantic_promoted_to_should,
+        "semantic_terms_promoted_to_must": semantic_promoted_to_must,
+        "semantic_terms_demoted_to_soft": semantic_demoted_to_soft,
+        "semantic_profile": semantic_profile,
+        "skill_risk_profile": must_profile + should_profile + fallback_profile,
         "experience_years_min": exp_min,
+        "experience_years_max": exp_max,
         "region": region,
         "position_keywords": pos_kw,
         "gender": gender,
         "industry": industry,
+        "age_min": age_min,
         "age_max": age_max,
     }
 

@@ -17,6 +17,7 @@ from app.schemas.search_filters import ResumeSearchFilters
 from app.services import mock_hh
 from app.services.hh_errors import classify_hh_http_status
 from app.services.hh_filter_mapper import flatten_params_for_httpx, merge_resume_search_params
+from app.services.hh_query_planner import HHQueryPlan
 
 HH_AUTH_URL = "https://hh.ru/oauth/authorize"
 HH_TOKEN_URL = "https://hh.ru/oauth/token"
@@ -404,10 +405,17 @@ async def search_resumes(
     page: int,
     per_page: int,
     *,
+    query_plan: HHQueryPlan | None = None,
     db: Session | None = None,
     hh_token_user_id: uuid.UUID | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
-    merged = merge_resume_search_params(parsed, filters, page, per_page)
+    merged = merge_resume_search_params(
+        parsed,
+        filters,
+        page,
+        per_page,
+        query_plan=query_plan,
+    )
 
     if settings.feature_use_mock_hh:
         all_items = mock_hh.mock_resume_database()

@@ -15,7 +15,6 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user, get_db, get_settings_admin
 from app.api.hh_access import ensure_hh_access_token
 from app.config import get_estaff_credentials_from_db, settings
-from app.models.candidate_profile import CandidateProfile
 from app.models.estaff_export import EstaffExport, EstaffExportStatus
 from app.models.favorite import Favorite
 from app.models.system_settings import SystemSettings
@@ -40,13 +39,11 @@ from app.schemas.estaff import (
     EstaffVacancyItemOut,
 )
 from app.services import encryption, hh_client
-from app.services.candidate_unified import candidate_profile_to_export_norm
 from app.services.estaff_candidate_prepare import (
     EstaffMandatoryDataError,
     prepare_candidate_payload_for_export,
 )
 from app.services.estaff_hr_bundle import prepare_hr_llm_bundle_for_export_item
-from app.services.telegram_search import telegram_profile_owned_by_user
 from app.services.estaff_client import (
     EStaffClientError,
     EstaffVacancyRow,
@@ -80,18 +77,9 @@ def _shorten_error_message_for_db(text: str, max_len: int = _MAX_ERROR_MESSAGE_D
     return s[: max_len - 1] + "…"
 
 
-def _looks_like_internal_profile_uuid(candidate_id: str) -> bool:
-    """UUID профиля Telegram; id резюме HeadHunter обычно не в формате UUID."""
-    try:
-        uuid.UUID((candidate_id or "").strip())
-    except ValueError:
-        return False
-    return True
-
-
 def _legacy_hh_resume_id_field(stored_candidate_key: str) -> str | None:
-    """Устаревшее поле ответа: только для кандидатов HeadHunter (не UUID-профиль)."""
-    if _looks_like_internal_profile_uuid(stored_candidate_key):
+    """Устаревшее поле ответа: совпадает с candidate_id (обратная совместимость)."""
+    if not (stored_candidate_key or "").strip():
         return None
     return stored_candidate_key
 
@@ -138,19 +126,6 @@ def _merge_favorite_contacts_into_hh_norm(
         contact_list.append({"type": {"id": "email"}, "value": email})
     if phone and not existing_phone:
         contact_list.append({"type": {"id": "cell"}, "value": phone})
-
-
-def _telegram_profile_by_candidate_id(
-    db: Session, candidate_id: str
-) -> CandidateProfile | None:
-    try:
-        uid = uuid.UUID((candidate_id or "").strip())
-    except ValueError:
-        return None
-    p = db.get(CandidateProfile, uid)
-    if p and p.source_type == "telegram":
-        return p
-    return None
 
 
 def _detail_dict(row: EstaffExport) -> dict[str, Any]:
@@ -375,11 +350,7 @@ async def post_estaff_export(
             detail=f"Не более {MAX_EXPORT_ITEMS} резюме за один запрос",
         )
 
-    needs_hh = any(
-        it.candidate is None
-        and _telegram_profile_by_candidate_id(db, it.effective_candidate_id()) is None
-        for it in body.items
-    )
+    needs_hh = any(it.candidate is None for it in body.items)
 
     access: str | None = None
     if needs_hh and not settings.feature_use_mock_hh:
@@ -426,36 +397,22 @@ async def post_estaff_export(
                     "Данные candidate переданы с клиента; разрешение справочников на сервере не выполнялось.",
                 )
             else:
-                tg_prof = _telegram_profile_by_candidate_id(db, cand_key)
-                if tg_prof is not None:
-                    if not telegram_profile_owned_by_user(db, tg_prof, user.id):
-                        raise PermissionError("Нет доступа к этому кандидату из Telegram")
-                    norm = candidate_profile_to_export_norm(tg_prof)
-                    payload, w = await prepare_candidate_payload_for_export(
-                        norm,
-                        server_name=server_name,
-                        api_token=api_token,
-                        fetch_voc_items=_fetch_voc_items,
-                        candidate_export_key=str(tg_prof.id),
-                    )
-                    prep_warnings.extend(w)
-                else:
-                    norm = await hh_client.fetch_resume(
-                        access,
-                        cand_key,
-                        keep_raw=True,
-                        db=db,
-                        hh_token_user_id=user.id,
-                    )
-                    _merge_favorite_contacts_into_hh_norm(db, user.id, cand_key, norm)
-                    payload, w = await prepare_candidate_payload_for_export(
-                        norm,
-                        server_name=server_name,
-                        api_token=api_token,
-                        fetch_voc_items=_fetch_voc_items,
-                        candidate_export_key=cand_key,
-                    )
-                    prep_warnings.extend(w)
+                norm = await hh_client.fetch_resume(
+                    access,
+                    cand_key,
+                    keep_raw=True,
+                    db=db,
+                    hh_token_user_id=user.id,
+                )
+                _merge_favorite_contacts_into_hh_norm(db, user.id, cand_key, norm)
+                payload, w = await prepare_candidate_payload_for_export(
+                    norm,
+                    server_name=server_name,
+                    api_token=api_token,
+                    fetch_voc_items=_fetch_voc_items,
+                    candidate_export_key=cand_key,
+                )
+                prep_warnings.extend(w)
         except PermissionError as exc:
             row.status = EstaffExportStatus.error.value
             row.error_message = str(exc)

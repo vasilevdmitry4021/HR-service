@@ -39,7 +39,7 @@ class EstaffExportItemIn(BaseModel):
     candidate_id: str | None = Field(
         default=None,
         max_length=128,
-        description="Внутренний идентификатор кандидата: UUID профиля (Telegram) или id резюме HeadHunter.",
+        description="Внутренний идентификатор кандидата: id резюме HeadHunter.",
     )
     hh_resume_id: str | None = Field(
         default=None,
@@ -104,7 +104,7 @@ class EstaffExportResultOut(BaseModel):
     candidate_id: str
     hh_resume_id: str | None = Field(
         default=None,
-        description="Для HeadHunter совпадает с candidate_id; для Telegram пусто (совместимость поля).",
+        description="Для HeadHunter совпадает с candidate_id.",
     )
     status: str
     estaff_candidate_id: str | None = None

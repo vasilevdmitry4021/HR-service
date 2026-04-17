@@ -228,13 +228,8 @@ function CandidateDetailInner({
                   url={data.hh_resume_url}
                   size="default"
                   className="w-full sm:w-auto"
-                  label={
-                    data.source_type === "telegram"
-                      ? "Открыть сообщение в Telegram"
-                      : undefined
-                  }
                 />
-                {pdfExportEnabled && data.source_type !== "telegram" && (
+                {pdfExportEnabled && (
                   <Button
                     type="button"
                     variant="outline"

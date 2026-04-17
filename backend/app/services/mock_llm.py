@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any  # noqa: F401
 
 
 def parse_query_mock(query: str) -> dict[str, Any]:
@@ -95,8 +95,31 @@ def parse_query_mock(query: str) -> dict[str, Any]:
     skills = list(dict.fromkeys(skills))
     position_keywords = list(dict.fromkeys(position_keywords))
 
+    must_position = list(position_keywords)
+    must_skills: list[dict[str, Any]] = [
+        {"canonical": s, "synonyms": []} for s in skills
+    ]
+    should_skills: list[dict[str, Any]] = []
+    soft_signals: list[str] = []
+
+    soft_markers = [
+        ("вайбкод", "вайбкодинг"),
+        ("vibe cod", "vibe coding"),
+        ("ai pair", "AI pair programming"),
+        ("copilot", "GitHub Copilot"),
+        ("cursor", "Cursor IDE"),
+    ]
+    for needle, label in soft_markers:
+        if needle in text:
+            soft_signals.append(label)
+    soft_signals = list(dict.fromkeys(soft_signals))
+
     return {
         "skills": skills,
+        "must_position": must_position,
+        "must_skills": must_skills,
+        "should_skills": should_skills,
+        "soft_signals": soft_signals,
         "experience_years_min": exp_min,
         "region": region,
         "position_keywords": position_keywords,

@@ -508,6 +508,70 @@ def test_search_mock_hh_returns_candidates(
     assert "summary" not in data
 
 
+def test_search_strict_role_filter_excludes_developer_titles(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "strict_numeric_filters", True)
+    monkeypatch.setattr(settings, "strict_filter_mode", "hide")
+    monkeypatch.setattr(settings, "strict_position_allow_empty_title", False)
+
+    parsed = {
+        "position_keywords": ["аналитик", "системный аналитик"],
+        "must_position": ["системный аналитик"],
+        "skills": [],
+    }
+
+    async def fake_search(*args: object, **kwargs: object) -> tuple[list, int]:
+        _ = args, kwargs
+        return [
+            {
+                "id": "a1",
+                "hh_resume_id": "hh-a1",
+                "title": "Системный аналитик",
+                "full_name": "Analyst One",
+                "area": "Москва",
+                "skills": ["BPMN"],
+            },
+            {
+                "id": "d1",
+                "hh_resume_id": "hh-d1",
+                "title": "Python Developer",
+                "full_name": "Dev One",
+                "area": "Москва",
+                "skills": ["Python"],
+            },
+            {
+                "id": "e1",
+                "hh_resume_id": "hh-e1",
+                "title": "Backend инженер",
+                "full_name": "Engineer One",
+                "area": "Москва",
+                "skills": ["Java"],
+            },
+        ], 3
+
+    with patch(
+        "app.api.search.nlp_service.parse_natural_query",
+        return_value=(parsed, 0.95, 5),
+    ):
+        with patch(
+            "app.api.search.hh_client.search_resumes",
+            new_callable=AsyncMock,
+            side_effect=fake_search,
+        ):
+            r = client.post(
+                "/api/v1/search",
+                headers=auth_headers,
+                json={"query": "Системный аналитик", "page": 0, "per_page": 20},
+            )
+    assert r.status_code == 200, r.text
+    items = r.json()["items"]
+    assert len(items) == 1
+    assert items[0]["title"] == "Системный аналитик"
+
+
 def test_search_second_page_uses_snapshot_no_hh(
     client: TestClient, auth_headers: dict[str, str]
 ) -> None:
@@ -565,6 +629,60 @@ def test_search_second_page_uses_snapshot_no_hh(
         assert len(d2["items"]) == 15
         assert d2["found"] == 35
         assert calls == []
+
+
+def test_search_sort_by_experience_applies_to_full_snapshot(
+    client: TestClient,
+    auth_headers: dict[str, str],
+) -> None:
+    async def fake_search(*args: object, **kwargs: object) -> tuple[list, int]:
+        page = int(args[3]) if len(args) > 3 else 0
+        per_page = int(args[4]) if len(args) > 4 else 50
+        all_items = _make_mock_resumes(35)
+        for i, row in enumerate(all_items):
+            row["experience_years"] = 100 - i
+        total = len(all_items)
+        start = page * per_page
+        chunk = all_items[start : start + per_page]
+        return chunk, total
+
+    with patch(
+        "app.api.search.hh_client.search_resumes",
+        new_callable=AsyncMock,
+        side_effect=fake_search,
+    ):
+        r1 = client.post(
+            "/api/v1/search",
+            headers=auth_headers,
+            json={
+                "query": "Python",
+                "page": 0,
+                "per_page": 20,
+                "sort_by": "experience_asc",
+            },
+        )
+        assert r1.status_code == 200
+        d1 = r1.json()
+        sid = d1.get("snapshot_id")
+        assert sid
+        first_page_experience = [x["experience_years"] for x in d1["items"]]
+        assert first_page_experience == list(range(66, 86))
+
+        r2 = client.post(
+            "/api/v1/search",
+            headers=auth_headers,
+            json={
+                "query": "Python",
+                "page": 1,
+                "per_page": 20,
+                "snapshot_id": sid,
+                "sort_by": "experience_asc",
+            },
+        )
+        assert r2.status_code == 200
+        d2 = r2.json()
+        second_page_experience = [x["experience_years"] for x in d2["items"]]
+        assert second_page_experience == list(range(86, 101))
 
 
 def test_favorite_create_with_llm_analysis_json(
