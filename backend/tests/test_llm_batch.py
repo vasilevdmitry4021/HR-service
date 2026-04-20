@@ -119,3 +119,51 @@ def test_analyze_resumes_batch_size_respected() -> None:
     assert len(result) == 4
     assert result["r0"]["llm_score"] == 50
     assert result["r3"]["llm_score"] == 60
+
+
+def test_format_resume_for_prescore_batch_includes_semantic_summary_fragments() -> None:
+    resume = {
+        "id": "r1",
+        "title": "Senior Python Developer",
+        "skills": ["Python", "FastAPI", "PostgreSQL"],
+        "experience_years": 7,
+        "area": "Москва",
+        "about": "Проектирую backend-сервисы и интеграции с внешними API.",
+        "work_experience": [
+            {
+                "position": "Lead Backend Engineer",
+                "company": "ACME",
+                "description": "Развивал микросервисную архитектуру и высоконагруженные API.",
+            },
+            {
+                "position": "Python Developer",
+                "company": "Beta",
+                "description": "Вёл доменный модуль рекрутинга, автоматизацию отбора и интеграции.",
+            },
+        ],
+    }
+
+    formatted = llm_resume_analyzer._format_resume_for_prescore_batch(resume)
+
+    assert "[resume_id=r1]" in formatted
+    assert "о себе:" in formatted
+    assert "последние места работы:" in formatted
+    assert "ключевые фрагменты:" in formatted
+
+
+def test_format_resume_for_prescore_batch_degrades_without_enrichment() -> None:
+    resume = {
+        "id": "r2",
+        "title": "Junior QA",
+        "skills": ["Testing"],
+        "experience_years": 1,
+        "area": "Казань",
+    }
+
+    formatted = llm_resume_analyzer._format_resume_for_prescore_batch(resume)
+
+    assert "[resume_id=r2]" in formatted
+    assert "должность: Junior QA" in formatted
+    assert "навыки: Testing" in formatted
+    assert "о себе:" not in formatted
+    assert "последние места работы:" not in formatted

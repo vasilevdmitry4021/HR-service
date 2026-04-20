@@ -86,6 +86,7 @@ class CandidateDetailOut(CandidateOut):
 class SearchIn(BaseModel):
     query: str = Field(default="", max_length=4000)
     source_scope: Literal["hh"] = "hh"
+    search_mode: Literal["precise", "mass"] = "precise"
     sort_by: Literal[
         "server",
         "llm_desc",
@@ -108,7 +109,9 @@ class SearchOut(BaseModel):
     parsed_params: dict[str, Any]
     snapshot_id: str | None = None
     found_raw_hh: int | None = None
+    search_metrics: dict[str, Any] | None = None
     source_scope: Literal["hh"] = "hh"
+    search_mode: Literal["precise", "mass"] = "precise"
 
 
 class EvaluateIn(BaseModel):
@@ -152,6 +155,9 @@ class EvaluateProgressOut(BaseModel):
     llm_scored_count: int = 0
     fallback_scored_count: int = 0
     coverage_ratio: float = 0.0
+    llm_coverage_ratio: float = 0.0
+    unresolved_count: int = 0
+    llm_only_complete: bool = False
     completed_count: int
     interactive_total_count: int = 0
     background_total_count: int = 0

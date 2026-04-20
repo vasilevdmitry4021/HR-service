@@ -7,27 +7,17 @@ from app.services import hh_query_planner
 
 
 @pytest.mark.asyncio
-async def test_fetch_hh_pages_relaxes_risky_group_first(monkeypatch) -> None:
+async def test_fetch_hh_pages_relax_removes_skills_group(monkeypatch) -> None:
     parsed = {
         "must_position": ["System Analyst"],
         "must_skills": [
-            {"canonical": "Python", "synonyms": [], "intent_strength": "required", "query_confidence": 0.9},
-            {
-                "canonical": "вайбкодинг",
-                "synonyms": ["vibe coding"],
-                "intent_strength": "preferred",
-                "query_confidence": 0.58,
-                "search_equivalents": ["AI-assisted coding", "Copilot"],
-            },
+            {"canonical": "Python", "synonyms": []},
         ],
         "should_skills": [],
-        "soft_signals": [],
-        "hard_skills": ["Python"],
-        "risky_skills": ["вайбкодинг"],
     }
-    plans = hh_query_planner.build_plans(parsed, {})
+    plans = hh_query_planner.build_plans(parsed, {}, search_mode="precise")
     primary = next(p for p in plans if p.label == "primary")
-    assert any(kind == "should_risky" for kind, _ in primary.groups)
+    assert any(kind == "skills" for kind, _ in primary.groups)
 
     monkeypatch.setattr(search_api.settings, "hh_query_relax_max_steps", 2)
     monkeypatch.setattr(search_api.settings, "search_recall_target_min", 4)
@@ -47,7 +37,7 @@ async def test_fetch_hh_pages_relaxes_risky_group_first(monkeypatch) -> None:
         text = (query_plan.text if query_plan else "").lower()
         if page > 0:
             return [], 0
-        if "вайбкодинг" in text:
+        if "python" in text:
             return [], 0
         return [{"id": "r1"}, {"id": "r2"}, {"id": "r3"}, {"id": "r4"}], 4
 
@@ -64,26 +54,23 @@ async def test_fetch_hh_pages_relaxes_risky_group_first(monkeypatch) -> None:
     assert found_total >= 4
     assert loaded == 4
     assert metrics["relax_used"] is True
-    assert any(x["risky_groups"] > 0 for x in metrics["queries"] if x["label"] == "primary")
     assert any(x["relax_step"] == 1 for x in metrics["queries"])
     assert any(isinstance(x.get("group_term_sizes"), dict) for x in metrics["queries"])
     assert any(x.get("relaxed") is True for x in metrics["queries"] if x["relax_step"] > 0)
 
 
 @pytest.mark.asyncio
-async def test_fetch_hh_pages_skips_broad_if_target_already_reached(monkeypatch) -> None:
+async def test_fetch_hh_pages_uses_only_primary_in_new_planner(monkeypatch) -> None:
     parsed = {
         "must_position": ["System Analyst"],
         "must_skills": [
-            {"canonical": "Python", "synonyms": [], "intent_strength": "required", "query_confidence": 0.9},
+            {"canonical": "Python", "synonyms": []},
         ],
         "should_skills": [],
-        "soft_signals": [],
-        "hard_skills": ["Python"],
-        "risky_skills": [],
     }
-    plans = hh_query_planner.build_plans(parsed, {})
-    assert any(p.label == "broad" for p in plans)
+    plans = hh_query_planner.build_plans(parsed, {}, search_mode="precise")
+    assert len(plans) == 1
+    assert plans[0].label == "primary"
 
     monkeypatch.setattr(search_api.settings, "search_recall_target_min", 2)
 
@@ -107,7 +94,7 @@ async def test_fetch_hh_pages_skips_broad_if_target_already_reached(monkeypatch)
         call_labels.append(label)
         if label.startswith("primary"):
             return [{"id": "r1"}, {"id": "r2"}], 2
-        return [{"id": "r-broad"}], 1
+        return [{"id": "r-extra"}], 1
 
     monkeypatch.setattr(search_api.hh_client, "search_resumes", fake_search_resumes)
     rows, found_total, loaded, metrics = await search_api._fetch_hh_resume_pages(
@@ -121,5 +108,5 @@ async def test_fetch_hh_pages_skips_broad_if_target_already_reached(monkeypatch)
     assert found_total >= 2
     assert loaded == 2
     assert len(rows) == 2
-    assert all(not label.startswith("broad") for label in call_labels)
-    assert all(q["label"] != "broad" for q in metrics["queries"])
+    assert call_labels == ["primary"]
+    assert all(q["label"] == "primary" for q in metrics["queries"])

@@ -28,6 +28,13 @@ def real_hh_settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
     return patched
 
 
+@pytest.fixture(autouse=True)
+def _reset_professional_role_cache() -> None:
+    hh_client.reset_professional_role_reference_cache_for_tests()
+    yield
+    hh_client.reset_professional_role_reference_cache_for_tests()
+
+
 @pytest.mark.asyncio
 async def test_build_authorization_url_contains_client_and_state(
     monkeypatch: pytest.MonkeyPatch,
@@ -256,3 +263,47 @@ async def test_fetch_resume_raises_view_limit_exceeded_message(
 
     assert exc.value.status_code == 403
     assert exc.value.detail == "Превышен дневной лимит просмотров резюме"
+
+
+@pytest.mark.asyncio
+async def test_get_professional_roles_reference_uses_runtime_cache(
+    real_hh_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(hh_client.settings, "hh_professional_roles_cache_ttl_seconds", 60)
+    payload = [
+        {
+            "id": "1",
+            "name": "IT",
+            "roles": [
+                {"id": "10", "name": "Системный аналитик"},
+                {"id": "11", "name": "Бизнес-аналитик"},
+            ],
+        }
+    ]
+    with respx.mock(assert_all_called=True) as router:
+        route = router.get(f"{hh_client.HH_API}/professional_roles").mock(
+            return_value=Response(200, json=payload)
+        )
+        first, src1 = await hh_client.get_professional_roles_reference("token")
+        second, src2 = await hh_client.get_professional_roles_reference("token")
+    assert src1 == "hh_api"
+    assert src2 == "cache"
+    assert first.id_to_name[10] == "Системный аналитик"
+    assert second.id_to_name[11] == "Бизнес-аналитик"
+    assert len(route.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_professional_roles_reference_timeout_maps_to_hh_client_error(
+    real_hh_settings: Settings,
+) -> None:
+    with respx.mock(assert_all_called=True) as router:
+        route = router.get(f"{hh_client.HH_API}/professional_roles").mock(
+            side_effect=hh_client.httpx.TimeoutException("timeout")
+        )
+        with pytest.raises(hh_client.HHClientError) as exc:
+            await hh_client.get_professional_roles_reference("token")
+    assert len(route.calls) == 1
+    assert exc.value.status_code == 503
+    assert "professional_roles" in exc.value.detail

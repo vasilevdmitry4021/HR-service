@@ -34,6 +34,7 @@ from app.schemas.search import (
     SearchParseOut,
 )
 from app.services import hh_client
+from app.services import hh_filter_mapper
 from app.services import llm_client
 from app.services import llm_evaluation
 from app.services import skill_expansion
@@ -327,6 +328,7 @@ async def _run_evaluate_job(
                 phase_scored = int(evt.get("phase_scored_count") or 0)
                 phase_llm_scored = int(evt.get("phase_llm_scored_count") or 0)
                 phase_fallback = int(evt.get("phase_fallback_count") or 0)
+                phase_unresolved = int(evt.get("phase_unresolved_count") or 0)
                 if phase == "interactive":
                     evaluate_progress.update_counters(
                         job_id,
@@ -338,6 +340,7 @@ async def _run_evaluate_job(
                             "interactive_scored_count": phase_scored,
                             "interactive_llm_scored_count": phase_llm_scored,
                             "interactive_fallback_count": phase_fallback,
+                            "interactive_unresolved_count": phase_unresolved,
                         },
                     )
                 elif phase == "background":
@@ -351,6 +354,7 @@ async def _run_evaluate_job(
                             "background_scored_count": phase_scored,
                             "background_llm_scored_count": phase_llm_scored,
                             "background_fallback_count": phase_fallback,
+                            "background_unresolved_count": phase_unresolved,
                         },
                     )
 
@@ -374,17 +378,46 @@ async def _run_evaluate_job(
             parsed_params=snap.parsed_params,
             query=snap.query,
             filters=snap.filters,
+            search_metrics=snap.search_metrics,
             evaluated=True,
             analyzed=False,
             source_scope=snap.source_scope,
         )
         replace_snapshot(user_id, snapshot_id, new_snap)
-        evaluate_progress.mark_done(
-            job_id,
-            scores=_scores_map(updated),
-            processing_time_seconds=time.monotonic() - started,
-            metrics=metrics,
-        )
+        scores_map = _scores_map(updated)
+        terminal_status = str(metrics.get("status") or "done")
+        llm_only_complete = bool(metrics.get("llm_only_complete"))
+        if terminal_status == "done" and llm_only_complete:
+            evaluate_progress.mark_done(
+                job_id,
+                scores=scores_map,
+                processing_time_seconds=time.monotonic() - started,
+                metrics=metrics,
+            )
+        elif terminal_status == "error":
+            evaluate_progress.merge_metrics(job_id, metrics)
+            unresolved_count = int(metrics.get("unresolved_count") or 0)
+            evaluate_progress.mark_failed(
+                job_id,
+                (
+                    f"Оценка завершилась ошибкой: без LLM-score осталось {unresolved_count} резюме."
+                    if unresolved_count > 0
+                    else "Оценка завершилась ошибкой: не получены LLM-score."
+                ),
+            )
+        else:
+            unresolved_count = int(metrics.get("unresolved_count") or 0)
+            evaluate_progress.mark_partial(
+                job_id,
+                scores=scores_map,
+                processing_time_seconds=time.monotonic() - started,
+                metrics=metrics,
+                error=(
+                    f"Оценка завершена частично: без LLM-score осталось {unresolved_count} резюме."
+                    if unresolved_count > 0
+                    else "Оценка завершена частично: не все резюме получили LLM-score."
+                ),
+            )
     except HHClientError as exc:
         logger.warning("Оценка снимка остановлена ошибкой HH: %s", exc.detail)
         evaluate_progress.mark_failed(job_id, exc.detail)
@@ -454,6 +487,7 @@ async def _run_analyze_job(
             parsed_params=snap.parsed_params,
             query=snap.query,
             filters=snap.filters,
+            search_metrics=snap.search_metrics,
             evaluated=True,
             analyzed=True,
             source_scope=snap.source_scope,
@@ -486,6 +520,8 @@ async def _fetch_hh_resume_pages(
     filters: Any,
     *,
     plans: list[hh_query_planner.HHQueryPlan] | None = None,
+    effective_area_ids: list[int] | None = None,
+    professional_role_ids: list[int] | None = None,
     max_resumes: int,
     per_page: int,
     db: Session | None = None,
@@ -499,6 +535,9 @@ async def _fetch_hh_resume_pages(
     found_total = 0
     query_metrics: list[dict[str, Any]] = []
     relax_used = False
+    relax_steps_used = 0
+    primary_found = 0
+    primary_loaded = 0
 
     if not plans:
         plans = [
@@ -514,7 +553,7 @@ async def _fetch_hh_resume_pages(
         *,
         relax_step: int = 0,
     ) -> tuple[int, int]:
-        nonlocal relax_used
+        nonlocal relax_used, relax_steps_used
         local_found = 0
         local_loaded = 0
         local_raw = 0
@@ -527,6 +566,7 @@ async def _fetch_hh_resume_pages(
                 page,
                 page_size,
                 query_plan=plan if plan.text else None,
+                professional_role_ids=professional_role_ids,
                 db=db,
                 hh_token_user_id=hh_token_user_id,
             )
@@ -572,17 +612,37 @@ async def _fetch_hh_resume_pages(
         )
         if relax_step > 0:
             relax_used = True
+            relax_steps_used = max(relax_steps_used, int(relax_step))
         return local_found, local_loaded
 
     primary_candidates = [p for p in plans if p.label.startswith("primary")]
     if not primary_candidates:
         primary_candidates = [plans[0]]
     primary_base = primary_candidates[0]
-    found, _loaded = await _fetch_by_plan(primary_base, relax_step=0)
+    found, loaded = await _fetch_by_plan(primary_base, relax_step=0)
     found_total = max(found_total, found)
+    primary_found = int(found)
+    primary_loaded = int(loaded)
 
+    base_target_min = max(0, int(settings.search_recall_target_min))
+    target_min = base_target_min
+    if effective_area_ids:
+        target_min = max(
+            0,
+            min(
+                base_target_min,
+                int(settings.search_recall_target_min_with_area or base_target_min),
+            ),
+        )
     relax_max_steps = max(0, int(settings.hh_query_relax_max_steps or 3))
-    target_min = max(0, int(settings.search_recall_target_min))
+    if effective_area_ids:
+        relax_max_steps = max(
+            0,
+            min(
+                relax_max_steps,
+                int(settings.hh_query_relax_max_steps_with_area or relax_max_steps),
+            ),
+        )
     if found < target_min:
         for step in range(1, relax_max_steps + 1):
             relaxed = hh_query_planner.relax(primary_base, step)
@@ -607,8 +667,15 @@ async def _fetch_hh_resume_pages(
     metrics = {
         "queries": query_metrics,
         "recall_pool_size": len(all_items),
+        "raw_pool_size": len(all_items),
         "dedup_dropped": max(0, sum(m["raw"] for m in query_metrics) - len(all_items)),
         "relax_used": relax_used,
+        "relax_steps_used": relax_steps_used,
+        "primary_found": primary_found,
+        "primary_loaded": primary_loaded,
+        "recall_target_min_base": base_target_min,
+        "recall_target_min_used": target_min,
+        "area_applied": bool(effective_area_ids),
     }
     return all_items, found_total, len(all_items), metrics
 
@@ -711,6 +778,7 @@ async def evaluate_resumes(
         parsed_params=snap.parsed_params,
         query=snap.query,
         filters=snap.filters,
+        search_metrics=snap.search_metrics,
         evaluated=True,
         analyzed=False,
         source_scope=snap.source_scope,
@@ -815,6 +883,7 @@ async def analyze_resumes(
         parsed_params=snap.parsed_params,
         query=snap.query,
         filters=snap.filters,
+        search_metrics=snap.search_metrics,
         evaluated=True,
         analyzed=True,
         source_scope=snap.source_scope,
@@ -1022,6 +1091,9 @@ async def evaluate_resumes_progress(
         llm_scored_count=int(state.get("llm_scored_count") or 0),
         fallback_scored_count=int(state.get("fallback_scored_count") or 0),
         coverage_ratio=float(state.get("coverage_ratio") or 0.0),
+        llm_coverage_ratio=float(state.get("llm_coverage_ratio") or state.get("coverage_ratio") or 0.0),
+        unresolved_count=int(state.get("unresolved_count") or 0),
+        llm_only_complete=bool(state.get("llm_only_complete")),
         completed_count=int(state.get("completed_count") or 0),
         interactive_total_count=int(state.get("interactive_total_count") or 0),
         background_total_count=int(state.get("background_total_count") or 0),
@@ -1046,10 +1118,12 @@ async def search(
 ) -> SearchOut:
     search_started = time.monotonic()
     uid = str(user.id)
+    search_mode = body.search_mode if body.search_mode in {"precise", "mass"} else "precise"
     parsed, _conf, _ms = nlp_service.parse_natural_query(body.query, db=db)
-    parsed = {**parsed, "text": body.query}
+    parsed = {**parsed, "text": body.query, "search_mode": search_mode}
     parsed_params = {k: v for k, v in parsed.items() if k != "text"}
     parsed_params.setdefault("expanded_synonyms", {})
+    parsed_params["search_mode"] = search_mode
     filters_dump = (
         body.filters.model_dump(mode="json", exclude_none=True) if body.filters else None
     )
@@ -1079,7 +1153,13 @@ async def search(
             parsed_params=snap.parsed_params,
             snapshot_id=body.snapshot_id.strip(),
             found_raw_hh=snap.found_raw_hh,
+            search_metrics=snap.search_metrics,
             source_scope=snap.source_scope,
+            search_mode=(
+                str(snap.parsed_params.get("search_mode"))
+                if isinstance(snap.parsed_params.get("search_mode"), str)
+                else "precise"
+            ),
         )
 
     if body.page != 0:
@@ -1110,9 +1190,35 @@ async def search(
         "semantic_terms_demoted_to_soft": 0,
         "semantic_profile": [],
         "hard_terms_used_in_primary": 0,
+        "area": {
+            "effective": None,
+            "effective_ids": [],
+            "source": "none",
+            "parsed_region": parsed.get("region"),
+        },
+        "primary_found": 0,
+        "relax_steps_used": 0,
+        "raw_pool_size": 0,
+        "count_after_strict_filter": 0,
+        "search_mode": search_mode,
+        "role_strategy": "professional_role_only",
+        "skills_strategy": f"skills_in_text_{'and' if search_mode == 'precise' else 'or'}",
+        "text_operator": "AND" if search_mode == "precise" else "OR",
+        "professional_role_resolution_source": "none",
+        "professional_role_match_debug": [],
+        "professional_role_ids": [],
+        "skill_ids": [],
+        "text_terms": [],
     }
 
     if scope == "hh":
+        effective_area_ids, area_source = hh_filter_mapper.resolve_area_priority(parsed, body.filters)
+        search_metrics["area"] = {
+            "effective": effective_area_ids[0] if effective_area_ids else None,
+            "effective_ids": effective_area_ids or [],
+            "source": area_source,
+            "parsed_region": parsed.get("region"),
+        }
         access: str | None = None
         if not settings.feature_use_mock_hh:
             access = await ensure_hh_access_token(db, user.id)
@@ -1123,6 +1229,47 @@ async def search(
                 )
         else:
             access = None
+
+        resolved_professional_role_ids: list[int] = []
+        resolved_professional_role_debug: list[dict[str, Any]] = []
+        professional_role_reference = None
+        explicit_professional_role = (
+            body.filters.professional_role
+            if body.filters is not None and body.filters.professional_role is not None
+            else None
+        )
+        if explicit_professional_role is not None:
+            search_metrics["professional_role_resolution_source"] = "panel"
+        elif settings.feature_hh_auto_professional_role:
+            try:
+                professional_role_reference, role_source = await hh_client.get_professional_roles_reference(
+                    access,
+                    db=db,
+                    hh_token_user_id=user.id,
+                )
+                search_metrics["professional_role_resolution_source"] = role_source
+            except HHClientError as exc:
+                logger.warning(
+                    "Не удалось загрузить справочник professional_roles: %s",
+                    exc.detail,
+                )
+                search_metrics["professional_role_resolution_source"] = "none"
+            except Exception as exc:
+                logger.warning(
+                    "Ошибка загрузки справочника professional_roles: %s",
+                    exc,
+                )
+                search_metrics["professional_role_resolution_source"] = "none"
+            if professional_role_reference is not None:
+                (
+                    resolved_professional_role_ids,
+                    resolved_professional_role_debug,
+                ) = hh_filter_mapper.resolve_professional_roles(
+                    parsed,
+                    professional_role_reference,
+                )
+                search_metrics["professional_role_match_debug"] = resolved_professional_role_debug
+                search_metrics["professional_role_ids"] = resolved_professional_role_ids
 
         hh_page = max(1, min(settings.search_hh_page_size, 100))
         max_fetch = max(
@@ -1159,7 +1306,7 @@ async def search(
             search_metrics["skill_expansion_cache"] = expand_stats
 
             t_plan = time.monotonic()
-            plans = hh_query_planner.build_plans(parsed, expanded)
+            plans = hh_query_planner.build_plans(parsed, expanded, search_mode=search_mode)
             search_metrics["latency_ms"]["plan"] = int((time.monotonic() - t_plan) * 1000)
             search_metrics["risky_terms_total"] = len(parsed.get("risky_skills") or [])
             search_metrics["risky_terms_demoted_to_should"] = int(
@@ -1193,9 +1340,35 @@ async def search(
                     if isinstance(x, dict) and str(x.get("canonical") or "").strip()
                 ]
             primary_plan = next((p for p in plans if p.label == "primary"), None) if plans else None
-            search_metrics["hard_terms_used_in_primary"] = (
-                sum(1 for kind, _ in (primary_plan.groups if primary_plan else ()) if kind.startswith("must_"))
+            search_metrics["hard_terms_used_in_primary"] = int(
+                sum(1 for kind, _ in (primary_plan.groups if primary_plan else ()) if kind == "skills")
             )
+            if primary_plan is not None:
+                search_metrics["text_terms"] = [
+                    text.strip() for kind, text in primary_plan.groups if kind == "skills" and text.strip()
+                ]
+
+            params_for_diagnostics = hh_filter_mapper.merge_resume_search_params(
+                parsed,
+                body.filters,
+                page=0,
+                per_page=body.per_page,
+                query_plan=primary_plan,
+                search_mode=search_mode,
+                professional_role_ids=resolved_professional_role_ids,
+                professional_roles_reference=professional_role_reference,
+            )
+            if not search_metrics["professional_role_ids"]:
+                raw_roles = params_for_diagnostics.get("professional_role")
+                if isinstance(raw_roles, list):
+                    search_metrics["professional_role_ids"] = [
+                        int(x) for x in raw_roles if isinstance(x, int)
+                    ]
+                elif isinstance(raw_roles, int):
+                    search_metrics["professional_role_ids"] = [raw_roles]
+            raw_skill_ids = params_for_diagnostics.get("skill")
+            if isinstance(raw_skill_ids, list):
+                search_metrics["skill_ids"] = [int(x) for x in raw_skill_ids if isinstance(x, int)]
 
         try:
             t_fetch = time.monotonic()
@@ -1204,6 +1377,8 @@ async def search(
                 parsed,
                 body.filters,
                 plans=plans,
+                effective_area_ids=effective_area_ids,
+                professional_role_ids=resolved_professional_role_ids,
                 max_resumes=max_fetch,
                 per_page=hh_page,
                 db=db,
@@ -1212,8 +1387,19 @@ async def search(
             search_metrics["latency_ms"]["fetch"] = int((time.monotonic() - t_fetch) * 1000)
             search_metrics["hh_queries"] = hh_fetch_metrics.get("queries", [])
             search_metrics["relax_used"] = bool(hh_fetch_metrics.get("relax_used"))
+            search_metrics["relax_steps_used"] = int(hh_fetch_metrics.get("relax_steps_used") or 0)
+            search_metrics["primary_found"] = int(hh_fetch_metrics.get("primary_found") or 0)
             search_metrics["recall_pool_size"] = int(hh_fetch_metrics.get("recall_pool_size") or 0)
+            search_metrics["raw_pool_size"] = int(hh_fetch_metrics.get("raw_pool_size") or 0)
             search_metrics["dedup_dropped"] = int(hh_fetch_metrics.get("dedup_dropped") or 0)
+            search_metrics["recall_target_min_base"] = int(
+                hh_fetch_metrics.get("recall_target_min_base")
+                or settings.search_recall_target_min
+            )
+            search_metrics["recall_target_min_used"] = int(
+                hh_fetch_metrics.get("recall_target_min_used")
+                or settings.search_recall_target_min
+            )
         except PermissionError as e:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
         except HHClientError as e:
@@ -1225,6 +1411,7 @@ async def search(
             ) from exc
 
         hh_rows = _build_search_items(parsed, raw_items, body.filters)
+        search_metrics["count_after_strict_filter"] = len(hh_rows)
 
     serialized = hh_rows
 
@@ -1238,6 +1425,7 @@ async def search(
         parsed_params=parsed_params,
         query=body.query,
         filters=filters_dump,
+        search_metrics=search_metrics,
         evaluated=False,
         analyzed=False,
         source_scope=scope,
@@ -1286,5 +1474,7 @@ async def search(
         parsed_params=parsed_params,
         snapshot_id=snapshot_id,
         found_raw_hh=hh_found,
+        search_metrics=search_metrics,
         source_scope=scope,
+        search_mode=search_mode,
     )

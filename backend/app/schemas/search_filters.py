@@ -15,8 +15,11 @@ class ResumeSearchFilters(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    area: int | None = Field(default=None, description="ID региона HH (например 1 — Москва)")
-    professional_role: int | None = None
+    area: int | list[int] | None = Field(
+        default=None,
+        description="ID региона HH или список ID регионов (например [1, 2]).",
+    )
+    professional_role: int | list[int] | None = None
     industry: int | None = None
     skill: list[int] | None = None
     experience: ExperienceBucket | None = None

@@ -29,6 +29,9 @@ def create_job(*, user_id: str, snapshot_id: str, total_count: int) -> str:
         "llm_scored_count": 0,
         "fallback_scored_count": 0,
         "coverage_ratio": 0.0,
+        "llm_coverage_ratio": 0.0,
+        "unresolved_count": max(0, int(total_count)),
+        "llm_only_complete": False,
         "phase": "interactive",
         "interactive_total_count": 0,
         "background_total_count": 0,
@@ -116,6 +119,9 @@ def add_partial_scores(
         state["completed_count"] = len(existing)
         total = max(0, int(state.get("total_count") or 0))
         state["coverage_ratio"] = round((len(scored_ids) / total), 4) if total > 0 else 1.0
+        state["llm_coverage_ratio"] = state["coverage_ratio"]
+        state["unresolved_count"] = max(0, total - len(scored_ids))
+        state["llm_only_complete"] = bool((state["unresolved_count"] or 0) == 0)
         phase_ids = {rid for rid in scores.keys() if rid}
         phase_scored_ids = {rid for rid, score in scores.items() if rid and isinstance(score, int)}
         if phase == "interactive":
@@ -203,6 +209,9 @@ def mark_done(
         llm_scored_count=int(state.get("llm_scored_count") or 0),
         fallback_scored_count=int(state.get("fallback_scored_count") or 0),
         coverage_ratio=round((scored_count / total_count), 4) if total_count > 0 else 1.0,
+        llm_coverage_ratio=round((scored_count / total_count), 4) if total_count > 0 else 1.0,
+        unresolved_count=max(0, total_count - scored_count),
+        llm_only_complete=max(0, total_count - scored_count) == 0,
         interactive_done_count=int(state.get("interactive_done_count") or 0),
         background_done_count=int(state.get("background_done_count") or 0),
         interactive_llm_scored_count=int(state.get("interactive_llm_scored_count") or 0),
@@ -212,6 +221,47 @@ def mark_done(
         processing_time_seconds=round(float(processing_time_seconds), 3),
         metrics=metrics_final,
         error=None,
+    )
+
+
+def mark_partial(
+    job_id: str,
+    *,
+    scores: dict[str, int | None],
+    processing_time_seconds: float,
+    metrics: dict[str, Any],
+    error: str | None = None,
+) -> None:
+    state = get_job(job_id) or {}
+    scored_count = sum(1 for score in scores.values() if isinstance(score, int))
+    total_count = max(0, int(state.get("total_count") or len(scores)))
+    unresolved_count = max(0, int(metrics.get("unresolved_count") or (total_count - scored_count)))
+    metrics_current = dict(state.get("metrics") or {})
+    metrics_final = {**metrics_current, **dict(metrics)}
+    completed_count = max(int(state.get("completed_count") or 0), len(scores))
+    _update(
+        job_id,
+        status="partial",
+        stage="partial",
+        phase="done",
+        scores=dict(scores),
+        scored_count=scored_count,
+        completed_count=completed_count,
+        llm_scored_count=int(state.get("llm_scored_count") or scored_count),
+        fallback_scored_count=int(state.get("fallback_scored_count") or 0),
+        coverage_ratio=round((scored_count / total_count), 4) if total_count > 0 else 1.0,
+        llm_coverage_ratio=round((scored_count / total_count), 4) if total_count > 0 else 1.0,
+        unresolved_count=unresolved_count,
+        llm_only_complete=False,
+        interactive_done_count=int(state.get("interactive_done_count") or 0),
+        background_done_count=int(state.get("background_done_count") or 0),
+        interactive_llm_scored_count=int(state.get("interactive_llm_scored_count") or 0),
+        background_llm_scored_count=int(state.get("background_llm_scored_count") or 0),
+        interactive_fallback_count=int(state.get("interactive_fallback_count") or 0),
+        background_fallback_count=int(state.get("background_fallback_count") or 0),
+        processing_time_seconds=round(float(processing_time_seconds), 3),
+        metrics=metrics_final,
+        error=(error or "").strip() or None,
     )
 
 

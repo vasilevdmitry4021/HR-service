@@ -255,10 +255,19 @@ export async function fetchSearchHistory(skip = 0, limit = 20) {
 }
 
 export type HhAreaItem = { id: number; name: string };
+export type HhProfessionalRoleItem = { id: number; name: string };
 
 /** Справочник регионов РФ (HeadHunter), кэшируется на сервере */
 export async function fetchReferenceAreasRussia(): Promise<HhAreaItem[]> {
   const data = await apiFetch<{ items: HhAreaItem[] }>("/reference/areas");
+  return data.items ?? [];
+}
+
+/** Справочник профессиональных ролей HeadHunter */
+export async function fetchReferenceProfessionalRoles(): Promise<HhProfessionalRoleItem[]> {
+  const data = await apiFetch<{ items: HhProfessionalRoleItem[] }>(
+    "/reference/professional-roles",
+  );
   return data.items ?? [];
 }
 

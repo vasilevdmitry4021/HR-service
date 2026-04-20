@@ -17,11 +17,12 @@ from app.services.llm_resume_analyzer import _format_resume_for_prescore_batch
 
 logger = logging.getLogger(__name__)
 
-PRESCORE_BATCH_PROMPT = """Ты — HR-скринер. По каждому резюме дай одну оценку соответствия требованиям (0–100).
-Главный фактор оценки — совпадение ключевых навыков. Должность, опыт и регион корректируют оценку, но не должны перевешивать явное skill-match.
-Учитывай навыки, должность, опыт; синонимы и разные языки эквивалентны (Python = питон).
-Близкие роли и смежные должности — допустимы с умеренным снижением оценки.
-Небольшие числовые расхождения по опыту — не повод для минимальной оценки, если навыки и роль релевантны.
+PRESCORE_BATCH_PROMPT = """Ты — HR-скринер. Для каждого резюме дай ОДИН числовой score соответствия требованиям (0–100).
+Это быстрый pre-screening: объяснения, strengths/gaps и любые дополнительные поля не нужны.
+Главный фактор — совпадение ключевых навыков и релевантного опыта из semantic summary.
+Оценивай не только теги навыков, но и задачи/проекты, домен, стек, контекст последних ролей.
+Синонимы, англ/рус варианты и близкие роли учитывай как эквивалентные с умеренным снижением.
+Небольшие расхождения по числам (опыт, регион) не обнуляют score, если роль и стек релевантны.
 
 Требования:
 - Должность: {position}
@@ -31,13 +32,13 @@ PRESCORE_BATCH_PROMPT = """Ты — HR-скринер. По каждому ре�
 - Бонусные сигналы: {soft_signals}
 - Эквиваленты: {synonyms_summary}
 
-Резюме (сжатый формат для быстрой оценки: должность, опыт, регион, фрагменты «о себе» и описаний работы):
+Резюме (compact payload + semantic summary):
 {resumes_block}
 
 Верни СТРОГО ТОЛЬКО JSON-массив (без markdown и комментариев), в том же порядке, что резюме в списке.
 Длина массива должна совпадать с количеством резюме.
 Каждый элемент: {{"resume_id": "<id из списка>", "score": <целое 0-100>}}
-Если сомневаешься, все равно верни приблизительный целый score.
+Никаких дополнительных ключей. Если сомневаешься, все равно верни приблизительный целый score.
 Формат ответа:
 [{{"resume_id": "<id1>", "score": 73}}, {{"resume_id": "<id2>", "score": 41}}]"""
 
@@ -504,6 +505,7 @@ def prescore_resumes_batch(
     """
     if not resumes:
         return {}, {
+            "status": "done",
             "prescore_elapsed_ms": 0,
             "llm_calls_total": 0,
             "llm_calls_refill": 0,
@@ -517,6 +519,11 @@ def prescore_resumes_batch(
             "fallback_parse_fail_count": 0,
             "fallback_timeout_count": 0,
             "fallback_limit_exhausted_count": 0,
+            "unresolved_count": 0,
+            "recovery_batches_total": 0,
+            "single_resume_attempts_total": 0,
+            "single_resume_fail_count": 0,
+            "llm_only_complete": True,
         }
 
     def rid_of(r: dict[str, Any]) -> str:
@@ -533,208 +540,148 @@ def prescore_resumes_batch(
     refill_attempted_total = 0
     budget_exhausted = False
     fallback_reason_by_id: dict[str, str] = {}
+    unresolved_ids: set[str] = set()
+    single_attempt_by_id: dict[str, int] = {}
+    single_resume_attempts_total = 0
+    single_resume_fail_count = 0
+    recovery_batches_total = 0
 
     cfg = llm_client.get_llm_config(db)
     llm_enabled = bool((cfg.endpoint or "").strip())
 
     model = (cfg.fast_model or cfg.model or "qwen2.5:7b").strip()
     base_batch_size = max(1, min(50, int(cfg.llm_fast_batch_size or 5)))
-    batch_size = base_batch_size
-    refill_batch_size = max(1, min(20, int(settings.llm_prescore_refill_batch_size or 5)))
-    refill_time_limit_s = max(
-        1.0,
-        float(settings.llm_prescore_refill_max_seconds or 30.0),
+    recovery_enabled = bool(getattr(settings, "llm_prescore_recovery_enabled", True))
+    single_retry_max_attempts = max(
+        1,
+        int(getattr(settings, "llm_prescore_single_retry_max_attempts", 3) or 3),
+    )
+    recovery_max_depth = max(
+        1,
+        int(getattr(settings, "llm_prescore_recovery_max_depth", 10) or 10),
     )
     budget_seconds = float(max_seconds) if max_seconds is not None else None
-    refill_min_gain = max(0, int(settings.llm_prescore_refill_min_gain or 0))
-    refill_low_gain_stop_cycles = 3
     header = _format_prescore_header(requirements)
+    fallback_enabled = bool(settings.llm_prescore_enable_fallback)
 
-    total_batches = max(1, (len(resumes) + max(1, batch_size) - 1) // max(1, batch_size))
-    start = 0
-    batch_idx = 0
-    consecutive_parse_fail = 0
-    while start < len(resumes):
-        chunk = resumes[start : start + batch_size]
-        chunk_start = start
-        start += len(chunk)
-        if not llm_enabled:
-            for row in chunk:
-                rid = rid_of(row)
-                if rid:
-                    fallback_reason_by_id[rid] = "limit-exhausted"
-            continue
-        if budget_seconds is not None and (time.monotonic() - t0) >= budget_seconds:
-            budget_exhausted = True
-            for row in chunk:
-                rid = rid_of(row)
-                if rid and rid not in out:
-                    fallback_reason_by_id[rid] = "limit-exhausted"
-            continue
-        batch_idx += 1
-        batch_started = time.monotonic()
-        resumes_block = "\n".join(_format_resume_for_prescore_batch(r) for r in chunk)
-        prompt = PRESCORE_BATCH_PROMPT.format(**header, resumes_block=resumes_block)
-        prompt_chars_total += len(prompt)
-        prompt_count += 1
-        arr, retry_count, fail_reason = _fetch_prescore_array(
-            prompt,
-            model,
-            batch_label=f"батч {chunk_start}..{chunk_start + len(chunk) - 1}",
-            db=db,
-        )
-        llm_calls_total += 1 + retry_count
-        if not arr:
-            parse_fail_count += 1
-            consecutive_parse_fail += 1
-            for row in chunk:
-                rid = rid_of(row)
-                if rid and rid not in out:
-                    fallback_reason_by_id[rid] = fail_reason
-            if consecutive_parse_fail >= 2 and batch_size > 1:
-                batch_size = max(1, batch_size // 2)
-            logger.info(
-                "pre-screening batch: phase=%s batch_index=%s/%s batch_size=%s missing_scores=%s retry_count=%s elapsed_ms=%s",
-                phase,
-                batch_idx,
-                total_batches,
-                len(chunk),
-                len(chunk),
-                retry_count,
-                int((time.monotonic() - batch_started) * 1000),
-            )
-            continue
-        consecutive_parse_fail = 0
-        chunk_scores = _scores_from_array_for_chunk(arr, chunk, rid_of)
-        out.update(chunk_scores)
-        missing_scores = max(0, len(chunk) - len(chunk_scores))
-        for row in chunk:
-            rid = rid_of(row)
-            if rid and rid not in chunk_scores and rid not in out:
-                fallback_reason_by_id.setdefault(rid, "limit-exhausted")
-        missing_ratio = float(missing_scores / len(chunk)) if chunk else 0.0
-        if missing_ratio >= 0.5 and batch_size > 1:
-            batch_size = max(1, batch_size // 2)
-        elif missing_ratio <= 0.1 and batch_size < base_batch_size:
-            batch_size += 1
-        logger.info(
-            "pre-screening batch: phase=%s batch_index=%s/%s batch_size=%s missing_scores=%s retry_count=%s elapsed_ms=%s",
-            phase,
-            batch_idx,
-            total_batches,
-            len(chunk),
-            missing_scores,
-            retry_count,
-            int((time.monotonic() - batch_started) * 1000),
-        )
-        if progress_callback is not None:
-            progress_callback(
-                {
-                    "stage": "prescore",
-                    "event": "batch_done",
-                    "batch_index": batch_idx,
-                    "total_batches": total_batches,
-                    "batch_size": len(chunk),
-                    "missing_scores": missing_scores,
-                    "scored_count": len(out),
-                    "llm_scored_count": len(out),
-                    "fallback_scored_count": 0,
-                    "total_count": len(resumes),
-                    "retry_count": retry_count,
-                    "scores_delta": dict(chunk_scores),
-                    "phase": phase,
-                }
-            )
-
-    if settings.llm_prescore_refill_enabled and llm_enabled:
-        max_refill = max(0, int(settings.llm_prescore_refill_max_llm_calls or 0))
-        refill_calls = 0
-        refill_started = time.monotonic()
-        low_gain_streak = 0
-        while refill_calls < max_refill:
+    pending: list[tuple[list[dict[str, Any]], int, int]] = [(list(resumes), base_batch_size, 0)]
+    batch_seq = 0
+    while pending:
+        rows, task_batch_size, depth = pending.pop(0)
+        chunk_start = 0
+        while chunk_start < len(rows):
+            chunk = rows[chunk_start : chunk_start + max(1, task_batch_size)]
+            chunk_start += len(chunk)
+            if not chunk:
+                continue
             if budget_seconds is not None and (time.monotonic() - t0) >= budget_seconds:
                 budget_exhausted = True
-                for row in resumes:
+                for row in chunk + rows[chunk_start:]:
                     rid = rid_of(row)
                     if rid and rid not in out:
-                        fallback_reason_by_id.setdefault(rid, "limit-exhausted")
+                        unresolved_ids.add(rid)
+                        fallback_reason_by_id[rid] = "limit-exhausted"
+                for left_rows, _left_size, _left_depth in pending:
+                    for row in left_rows:
+                        rid = rid_of(row)
+                        if rid and rid not in out:
+                            unresolved_ids.add(rid)
+                            fallback_reason_by_id[rid] = "limit-exhausted"
+                pending.clear()
                 break
-            if (time.monotonic() - refill_started) >= refill_time_limit_s:
-                logger.warning(
-                    "pre-screening refill остановлен по лимиту времени: elapsed_ms=%s limit_seconds=%s",
-                    int((time.monotonic() - refill_started) * 1000),
-                    refill_time_limit_s,
-                )
-                break
-            missing = [
-                r
-                for r in resumes
-                if rid_of(r) and rid_of(r) not in out
-            ]
-            if not missing:
-                break
-            refill_chunk = missing[:refill_batch_size]
-            refill_attempted_total += len(refill_chunk)
-            refill_batch_started = time.monotonic()
-            resumes_block = "\n".join(
-                _format_resume_for_prescore_batch(r) for r in refill_chunk
-            )
-            prompt = PRESCORE_BATCH_PROMPT.format(
-                **header,
-                resumes_block=resumes_block,
-            )
+            if not llm_enabled:
+                for row in chunk:
+                    rid = rid_of(row)
+                    if rid and rid not in out:
+                        unresolved_ids.add(rid)
+                        fallback_reason_by_id[rid] = "limit-exhausted"
+                continue
+
+            batch_seq += 1
+            batch_started = time.monotonic()
+            resumes_block = "\n".join(_format_resume_for_prescore_batch(r) for r in chunk)
+            prompt = PRESCORE_BATCH_PROMPT.format(**header, resumes_block=resumes_block)
             prompt_chars_total += len(prompt)
             prompt_count += 1
             arr, retry_count, fail_reason = _fetch_prescore_array(
                 prompt,
                 model,
-                batch_label=f"refill {refill_calls + 1}, size={len(refill_chunk)}",
+                batch_label=f"batch#{batch_seq} depth={depth} size={len(chunk)}",
                 db=db,
             )
-            refill_calls += 1 + retry_count
             llm_calls_total += 1 + retry_count
-            llm_calls_refill += 1 + retry_count
+            if depth > 0:
+                llm_calls_refill += 1 + retry_count
+            if len(chunk) == 1:
+                single_resume_attempts_total += 1 + retry_count
             if not arr:
                 parse_fail_count += 1
-                low_gain_streak += 1
-                for row in refill_chunk:
-                    rid = rid_of(row)
-                    if rid and rid not in out:
-                        fallback_reason_by_id[rid] = fail_reason
-                logger.info(
-                    "pre-screening refill: phase=%s chunk_size=%s missing_scores=%s retry_count=%s elapsed_ms=%s",
-                    phase,
-                    len(refill_chunk),
-                    len(refill_chunk),
-                    retry_count,
-                    int((time.monotonic() - refill_batch_started) * 1000),
-                )
-                if low_gain_streak >= refill_low_gain_stop_cycles:
-                    break
-                continue
-            chunk_scores = _scores_from_array_for_chunk(arr, refill_chunk, rid_of)
-            refill_gain = len(chunk_scores)
-            refill_gain_total += refill_gain
-            if refill_gain < refill_min_gain:
-                low_gain_streak += 1
+                chunk_scores = {}
             else:
-                low_gain_streak = 0
+                chunk_scores = _scores_from_array_for_chunk(arr, chunk, rid_of)
             out.update(chunk_scores)
-            missing_scores = max(0, len(refill_chunk) - len(chunk_scores))
+            missing_rows: list[dict[str, Any]] = []
+            for row in chunk:
+                rid = rid_of(row)
+                if rid and rid not in chunk_scores and rid not in out:
+                    missing_rows.append(row)
+
+            if missing_rows:
+                if len(chunk) == 1:
+                    row = missing_rows[0]
+                    rid = rid_of(row)
+                    if rid:
+                        attempt_no = int(single_attempt_by_id.get(rid, 0)) + 1
+                        single_attempt_by_id[rid] = attempt_no
+                        can_retry_single = (
+                            recovery_enabled
+                            and attempt_no < single_retry_max_attempts
+                            and not budget_exhausted
+                        )
+                        if can_retry_single:
+                            pending.append(([row], 1, depth + 1))
+                            recovery_batches_total += 1
+                        else:
+                            unresolved_ids.add(rid)
+                            fallback_reason_by_id[rid] = fail_reason if fail_reason else "parse-fail"
+                            single_resume_fail_count += 1
+                else:
+                    can_split = (
+                        recovery_enabled
+                        and depth < recovery_max_depth
+                        and task_batch_size > 1
+                    )
+                    if can_split:
+                        next_batch = max(1, (task_batch_size + 1) // 2)
+                        pending.append((missing_rows, next_batch, depth + 1))
+                        recovery_batches_total += 1
+                        refill_attempted_total += len(missing_rows)
+                    else:
+                        for row in missing_rows:
+                            rid = rid_of(row)
+                            if rid and rid not in out:
+                                unresolved_ids.add(rid)
+                                fallback_reason_by_id[rid] = fail_reason if fail_reason else "limit-exhausted"
+
+            missing_scores = len(missing_rows)
+            if depth > 0:
+                refill_gain_total += len(chunk_scores)
             logger.info(
-                "pre-screening refill: phase=%s chunk_size=%s missing_scores=%s retry_count=%s elapsed_ms=%s",
+                "pre-screening batch: phase=%s depth=%s batch_size=%s missing_scores=%s retry_count=%s elapsed_ms=%s",
                 phase,
-                len(refill_chunk),
+                depth,
+                len(chunk),
                 missing_scores,
                 retry_count,
-                int((time.monotonic() - refill_batch_started) * 1000),
+                int((time.monotonic() - batch_started) * 1000),
             )
             if progress_callback is not None:
                 progress_callback(
                     {
                         "stage": "prescore",
-                        "event": "refill_done",
-                        "batch_size": len(refill_chunk),
+                        "event": "batch_done" if depth == 0 else "recovery_done",
+                        "batch_index": batch_seq,
+                        "batch_size": len(chunk),
                         "missing_scores": missing_scores,
                         "scored_count": len(out),
                         "llm_scored_count": len(out),
@@ -746,34 +693,13 @@ def prescore_resumes_batch(
                         "phase": phase,
                     }
                 )
-            if low_gain_streak >= refill_low_gain_stop_cycles:
-                logger.info(
-                    "pre-screening refill остановлен по низкой эффективности: phase=%s refill_gain=%s min_gain=%s streak=%s",
-                    phase,
-                    refill_gain,
-                    refill_min_gain,
-                    low_gain_streak,
-                )
-                break
-
-        still = sum(
-            1 for r in resumes if rid_of(r) and rid_of(r) not in out
-        )
-        if still:
-            logger.warning(
-                "pre-screening: без числовой оценки осталось резюме: %s (из %s)",
-                still,
-                len(resumes),
-            )
-            for r in resumes:
-                rid = rid_of(r)
-                if rid and rid not in out:
-                    fallback_reason_by_id.setdefault(rid, "limit-exhausted")
+        if budget_exhausted:
+            break
 
     llm_scored_count = len(out)
     fallback_scored_count = 0
     fallback_reasons = {"parse-fail": 0, "timeout": 0, "limit-exhausted": 0}
-    if settings.llm_prescore_enable_fallback:
+    if fallback_enabled:
         out, fallback_reasons, fallback_scored_count = _fill_missing_scores(
             requirements,
             resumes,
@@ -791,8 +717,19 @@ def prescore_resumes_batch(
         if refill_attempted_total > 0
         else 0.0
     )
+    unresolved_count = max(
+        0,
+        sum(1 for r in resumes if (rid := rid_of(r)) and rid not in out),
+    )
+    if fallback_enabled:
+        unresolved_count = 0
     coverage_ratio = float(len(out) / len(resumes)) if resumes else 1.0
+    llm_only_complete = unresolved_count == 0
+    status = "done"
+    if not llm_only_complete:
+        status = "error" if not llm_enabled else "partial"
     return out, {
+        "status": status,
         "prescore_elapsed_ms": elapsed_ms,
         "llm_calls_total": llm_calls_total,
         "llm_calls_refill": llm_calls_refill,
@@ -806,4 +743,9 @@ def prescore_resumes_batch(
         "fallback_parse_fail_count": int(fallback_reasons["parse-fail"]),
         "fallback_timeout_count": int(fallback_reasons["timeout"]),
         "fallback_limit_exhausted_count": int(fallback_reasons["limit-exhausted"]),
+        "unresolved_count": int(unresolved_count),
+        "recovery_batches_total": int(recovery_batches_total),
+        "single_resume_attempts_total": int(single_resume_attempts_total),
+        "single_resume_fail_count": int(single_resume_fail_count),
+        "llm_only_complete": bool(llm_only_complete),
     }

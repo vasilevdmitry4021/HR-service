@@ -153,6 +153,113 @@ def _shorten_text(text: str, max_chars: int) -> str:
     return t[: max_chars - 1] + "…"
 
 
+def _clean_inline_text(text: Any) -> str:
+    if not isinstance(text, str):
+        return ""
+    return " ".join(text.replace("\r", " ").replace("\n", " ").split())
+
+
+def _top_resume_fragments(
+    resume: dict[str, Any],
+    *,
+    max_items: int = 8,
+    max_item_chars: int = 140,
+) -> list[str]:
+    items: list[str] = []
+    seen: set[str] = set()
+
+    work_items = resume.get("work_experience") or []
+    for it in work_items:
+        if not isinstance(it, dict):
+            continue
+        position = _clean_inline_text(it.get("position"))
+        company = _clean_inline_text(it.get("company"))
+        description = _clean_inline_text(it.get("description"))
+        head = " - ".join(x for x in (position, company) if x)
+        if head:
+            key = head.lower()
+            if key not in seen:
+                seen.add(key)
+                items.append(_shorten_text(head, max_item_chars))
+        for piece in re.split(r"[.;\n]", description):
+            text = _clean_inline_text(piece)
+            if len(text) < 25:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(_shorten_text(text, max_item_chars))
+            if len(items) >= max_items:
+                return items
+
+    for source in (
+        _clean_inline_text(resume.get("about")),
+        _clean_inline_text(resume.get("raw_text")),
+    ):
+        for piece in re.split(r"[.;\n]", source):
+            text = _clean_inline_text(piece)
+            if len(text) < 30:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(_shorten_text(text, max_item_chars))
+            if len(items) >= max_items:
+                return items
+    return items
+
+
+def build_prescore_semantic_summary(
+    resume: dict[str, Any],
+    *,
+    max_chars: int = 1700,
+    highlights_limit: int = 8,
+    recent_jobs_limit: int = 3,
+) -> str:
+    """Короткая semantic summary для pre-score без explainability-полей."""
+    title = _shorten_text(_clean_inline_text(resume.get("title")), 80)
+    skills = _truncate_skills(resume.get("skills") or [], max_items=10)
+    exp = resume.get("experience_years", 0)
+    area = _shorten_text(_clean_inline_text(resume.get("area")), 80)
+    about = _resume_about_for_prompt(resume, max_chars=420)
+    parts = [
+        f"должность: {title or 'не указана'}",
+        f"навыки: {skills or 'не указаны'}",
+        f"опыт: {exp} лет",
+        f"регион: {area or 'не указан'}",
+    ]
+    if about != "не указано":
+        parts.append(f"о себе: {_clean_inline_text(about)}")
+
+    jobs: list[str] = []
+    work_items = resume.get("work_experience") or []
+    for it in work_items[: max(0, recent_jobs_limit)]:
+        if not isinstance(it, dict):
+            continue
+        position = _clean_inline_text(it.get("position"))
+        company = _clean_inline_text(it.get("company"))
+        description = _clean_inline_text(it.get("description"))
+        head = " - ".join(x for x in (position, company) if x)
+        if description:
+            jobs.append(_shorten_text(f"{head}: {description}" if head else description, 220))
+        elif head:
+            jobs.append(_shorten_text(head, 220))
+    if jobs:
+        parts.append("последние места работы: " + " || ".join(jobs))
+
+    highlights = _top_resume_fragments(
+        resume,
+        max_items=max(1, highlights_limit),
+        max_item_chars=150,
+    )
+    if highlights:
+        parts.append("ключевые фрагменты: " + " | ".join(highlights))
+
+    return _shorten_text(" | ".join(parts), max_chars)
+
+
 def _resume_about_for_prompt(resume: dict[str, Any], max_chars: int = 14_000) -> str:
     raw = resume.get("about")
     if not isinstance(raw, str) or not raw.strip():
@@ -234,24 +341,17 @@ def _format_resume_for_batch(
 def _format_resume_for_prescore_batch(resume: dict[str, Any]) -> str:
     """Компактный формат для pre-score: только ключевые признаки и короткие фрагменты."""
     rid = str(resume.get("id", resume.get("hh_resume_id", "")))
-    title = _shorten_text(str(resume.get("title") or "").strip(), 80)
-    exp = resume.get("experience_years", 0)
-    area = _shorten_text(str(resume.get("area") or "").strip(), 80)
-    skills = _truncate_skills(resume.get("skills") or [], max_items=10)
-    about = _resume_about_for_prompt(resume, max_chars=500)
-    work = _resume_work_summary_for_prompt(resume, max_chars=900)
-    parts = [
-        f"[resume_id={rid}]",
-        f"должность: {title or 'не указана'}",
-        f"навыки: {skills or 'не указаны'}",
-        f"опыт: {exp} лет",
-        f"регион: {area or 'не указан'}",
-    ]
-    if about != "не указано":
-        parts.append(f"о себе: {about.replace(chr(10), ' ')}")
-    if work != "не указано":
-        parts.append(f"опыт работы: {work.replace(chr(10), ' | ')}")
-    return " | ".join(parts)
+    provided_summary = _clean_inline_text(resume.get("semantic_summary"))
+    if provided_summary:
+        summary = _shorten_text(provided_summary, 1700)
+    else:
+        summary = build_prescore_semantic_summary(
+            resume,
+            max_chars=1700,
+            highlights_limit=8,
+            recent_jobs_limit=3,
+        )
+    return f"[resume_id={rid}] {summary}"
 
 
 def _format_resume_for_analyze_batch(resume: dict[str, Any]) -> str:

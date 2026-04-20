@@ -1,4 +1,5 @@
 export type ParsedParams = Record<string, unknown>;
+export type SearchMode = "precise" | "mass";
 
 export type LLMAnalysis = {
   llm_score: number | null;
@@ -37,6 +38,29 @@ export type Candidate = {
   incompleteness_flags?: string[];
 };
 
+export type SearchMetrics = {
+  area?: {
+    effective?: number | null;
+    effective_ids?: number[];
+    source?: "panel" | "parsed_region" | "none" | string;
+    parsed_region?: string | null;
+  };
+  primary_found?: number;
+  relax_steps_used?: number;
+  raw_pool_size?: number;
+  count_after_strict_filter?: number;
+  recall_target_min_base?: number;
+  recall_target_min_used?: number;
+  search_mode?: SearchMode;
+  role_strategy?: string;
+  skills_strategy?: string;
+  text_operator?: "AND" | "OR" | string;
+  professional_role_ids?: number[];
+  skill_ids?: number[];
+  text_terms?: string[];
+  [key: string]: unknown;
+};
+
 export type SearchResponse = {
   items: Candidate[];
   found: number;
@@ -46,7 +70,9 @@ export type SearchResponse = {
   parsed_params: ParsedParams;
   snapshot_id?: string | null;
   found_raw_hh?: number | null;
+  search_metrics?: SearchMetrics | null;
   source_scope?: "hh";
+  search_mode?: SearchMode;
 };
 
 /** Ответ POST /search/{snapshot_id}/evaluate — только id резюме и числовой балл */
@@ -73,7 +99,7 @@ export type EvaluateStartResponse = {
 
 export type EvaluateProgressResponse = {
   job_id: string;
-  status: string;
+  status: "queued" | "running" | "done" | "partial" | "error" | string;
   stage: string;
   phase: "interactive" | "background" | "done" | string;
   total_count: number;
@@ -81,6 +107,9 @@ export type EvaluateProgressResponse = {
   llm_scored_count: number;
   fallback_scored_count: number;
   coverage_ratio: number;
+  llm_coverage_ratio: number;
+  unresolved_count: number;
+  llm_only_complete: boolean;
   completed_count: number;
   interactive_total_count: number;
   background_total_count: number;

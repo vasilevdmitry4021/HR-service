@@ -14,7 +14,7 @@ describe("search-filters", () => {
       experience: "between3And6",
       gender: "female",
     });
-    expect(s.area).toBe(3);
+    expect(s.area).toEqual([3]);
     expect(s.experience).toBe("between3And6");
     expect(s.gender).toBe("female");
   });
@@ -23,10 +23,10 @@ describe("search-filters", () => {
     expect(filtersToApiPayload(emptySearchFilters())).toEqual({ currency: "RUR" });
     const p = filtersToApiPayload({
       ...emptySearchFilters(),
-      area: 1,
+      area: [1],
       age_from: "25",
     });
-    expect(p).toEqual({ area: 1, age_from: 25, currency: "RUR" });
+    expect(p).toEqual({ area: [1], age_from: 25, currency: "RUR" });
   });
 
   describe("filtersToReadableSummary", () => {
@@ -35,19 +35,19 @@ describe("search-filters", () => {
     });
 
     it("возвращает метку региона только для area", () => {
-      const s = { ...emptySearchFilters(), area: 2 };
-      expect(filtersToReadableSummary(s)).toEqual(["Санкт-Петербург"]);
+      const s = { ...emptySearchFilters(), area: [2] };
+      expect(filtersToReadableSummary(s)).toEqual(["Регионы: Санкт-Петербург"]);
     });
 
     it("возвращает комбинацию полей", () => {
       const s = {
         ...emptySearchFilters(),
-        area: 2,
+        area: [2],
         experience: "between3And6",
         gender: "male",
       };
       expect(filtersToReadableSummary(s)).toEqual([
-        "Санкт-Петербург",
+        "Регионы: Санкт-Петербург",
         "3–6 лет",
         "Мужской",
       ]);
@@ -71,14 +71,14 @@ describe("search-filters", () => {
     });
 
     it("для неизвестного id региона выводит номер", () => {
-      const s = { ...emptySearchFilters(), area: 999_999 };
-      expect(filtersToReadableSummary(s)).toEqual(["Регион №999999"]);
+      const s = { ...emptySearchFilters(), area: [999_999] };
+      expect(filtersToReadableSummary(s)).toEqual(["Регионы: Регион №999999"]);
     });
 
     it("берёт подпись из переданной карты id→название", () => {
-      const s = { ...emptySearchFilters(), area: 42 };
+      const s = { ...emptySearchFilters(), area: [42] };
       const m = new Map<number, string>([[42, "Тестовый регион"]]);
-      expect(filtersToReadableSummary(s, m)).toEqual(["Тестовый регион"]);
+      expect(filtersToReadableSummary(s, m)).toEqual(["Регионы: Тестовый регион"]);
     });
   });
 });

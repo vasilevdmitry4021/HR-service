@@ -60,6 +60,25 @@ def _or_group(values: list[str]) -> str:
     return f"({' OR '.join(terms)})"
 
 
+def _join_terms(values: list[str], operator: str) -> str:
+    terms: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        quoted = _quote_token(value)
+        if not quoted:
+            continue
+        key = quoted.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        terms.append(quoted)
+    if not terms:
+        return ""
+    if len(terms) == 1:
+        return terms[0]
+    return f"({f' {operator} '.join(terms)})"
+
+
 def to_hh_text(groups: list[str]) -> str:
     """
     HH требует КАПС-операторы (AND/OR/NOT), иначе они трактуются как слова.
@@ -164,12 +183,52 @@ def _flatten_skill_terms(skill_obj: dict[str, Any], expanded_synonyms: dict[str,
     return out
 
 
+def _collect_role_terms(parsed: dict[str, Any]) -> list[str]:
+    role_terms = parsed.get("must_position") or parsed.get("position_keywords") or []
+    if not isinstance(role_terms, list):
+        return []
+    return [str(x).strip() for x in role_terms if str(x).strip()]
+
+
+def _collect_skill_terms(parsed: dict[str, Any], expanded_synonyms: dict[str, list[str]]) -> list[str]:
+    collected: list[str] = []
+    seen: set[str] = set()
+
+    def add_term(value: str) -> None:
+        normalized = _norm(value)
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        collected.append(value.strip())
+
+    semantic_groups: list[dict[str, Any]] = []
+    for group_key in ("must_skills", "should_skills"):
+        raw_groups = parsed.get(group_key)
+        if isinstance(raw_groups, list):
+            semantic_groups.extend(x for x in raw_groups if isinstance(x, dict))
+    for item in semantic_groups:
+        for term in _flatten_skill_terms(item, expanded_synonyms):
+            add_term(term)
+
+    if collected:
+        return collected
+
+    fallback = parsed.get("hard_skills")
+    if not isinstance(fallback, list) or not fallback:
+        fallback = parsed.get("skills")
+    if isinstance(fallback, list):
+        for item in fallback:
+            if isinstance(item, str):
+                add_term(item)
+    return collected
+
+
 def _hh_field_for_kind(kind: str, *, use_search_field: bool) -> str:
     if not use_search_field:
         return "everywhere"
     if kind == "role":
         return "position"
-    if kind.startswith("must_") or kind.startswith("should"):
+    if kind == "skills":
         return "skill"
     return "everywhere"
 
@@ -178,88 +237,18 @@ def _primary_groups(
     parsed: dict[str, Any],
     expanded_synonyms: dict[str, list[str]],
     *,
-    use_search_field: bool = False,
+    search_mode: str,
 ) -> list[tuple[str, str]]:
     groups: list[tuple[str, str]] = []
-    hard_skills_raw = parsed.get("hard_skills")
-    risky_skills_raw = parsed.get("risky_skills")
-    hard_skills = {
-        _norm(str(x))
-        for x in hard_skills_raw
-        if isinstance(hard_skills_raw, list) and str(x).strip()
-    }
-    risky_skills = {
-        _norm(str(x))
-        for x in risky_skills_raw
-        if isinstance(risky_skills_raw, list) and str(x).strip()
-    }
-    role_terms = parsed.get("must_position") or parsed.get("position_keywords") or []
-    role_group = _or_group([str(x) for x in role_terms if str(x).strip()])
+    role_group = _or_group(_collect_role_terms(parsed))
     if role_group:
         groups.append(("role", role_group))
-
-    must_skills = parsed.get("must_skills")
-    if not isinstance(must_skills, list):
-        must_skills = []
-    risky_terms: list[str] = []
-    should_terms: list[str] = []
-    for idx, skill_obj in enumerate(must_skills):
-        if not isinstance(skill_obj, dict):
-            continue
-        canonical = str(skill_obj.get("canonical") or "").strip()
-        if not canonical:
-            continue
-        canonical_norm = _norm(canonical)
-        terms = _flatten_skill_terms(skill_obj, expanded_synonyms)
-        intent = _norm(str(skill_obj.get("intent_strength") or "required")) or "required"
-        conf_raw = skill_obj.get("query_confidence")
-        query_conf = max(0.0, min(1.0, float(conf_raw))) if isinstance(conf_raw, (int, float)) else 0.7
-        if canonical_norm in risky_skills:
-            risky_terms.extend(terms)
-            continue
-        if intent != "required" or query_conf < 0.62:
-            should_terms.extend(terms)
-            continue
-        if hard_skills and canonical_norm not in hard_skills:
-            risky_terms.extend(terms)
-            continue
-        group = _or_group(terms)
-        if group:
-            groups.append((f"must_{idx}", group))
-
-    should_skills = parsed.get("should_skills")
-    if isinstance(should_skills, list):
-        for item in should_skills:
-            if isinstance(item, dict):
-                canonical = str(item.get("canonical") or "").strip()
-                terms = _flatten_skill_terms(item, expanded_synonyms)
-                conf_raw = item.get("query_confidence")
-                query_conf = (
-                    max(0.0, min(1.0, float(conf_raw)))
-                    if isinstance(conf_raw, (int, float))
-                    else 0.55
-                )
-                intent = _norm(str(item.get("intent_strength") or "preferred")) or "preferred"
-                if intent == "signal" or query_conf < 0.25:
-                    risky_terms.extend(terms)
-                elif canonical and _norm(canonical) in risky_skills:
-                    risky_terms.extend(terms)
-                else:
-                    should_terms.extend(terms)
-        risky_group = _or_group(risky_terms)
-        if risky_group:
-            groups.append(("should_risky", risky_group))
-        should_group = _or_group(should_terms)
-        if should_group:
-            groups.append(("should", should_group))
+    skill_terms = _collect_skill_terms(parsed, expanded_synonyms)
+    skill_operator = "AND" if search_mode == "precise" else "OR"
+    skills_group = _join_terms(skill_terms, skill_operator)
+    if skills_group:
+        groups.append(("skills", skills_group))
     return groups
-
-
-def _is_role_sensitive(parsed: dict[str, Any]) -> bool:
-    role_terms = parsed.get("must_position") or parsed.get("position_keywords") or []
-    if not isinstance(role_terms, list):
-        return False
-    return any(_norm(str(x)) for x in role_terms if str(x).strip())
 
 
 def _make_parts(
@@ -273,71 +262,40 @@ def _make_parts(
     )
 
 
-def build_plans(parsed: dict[str, Any], expanded_synonyms: dict[str, list[str]]) -> list[HHQueryPlan]:
+def build_plans(
+    parsed: dict[str, Any],
+    expanded_synonyms: dict[str, list[str]],
+    *,
+    search_mode: str = "precise",
+) -> list[HHQueryPlan]:
     max_length = max(200, int(settings.hh_query_max_text_length or 1500))
     use_sf = bool(settings.hh_query_use_search_field)
-    plans: list[HHQueryPlan] = []
-    groups = _primary_groups(parsed, expanded_synonyms, use_search_field=use_sf)
-    if groups:
-        primary = HHQueryPlan(
-            label="primary",
-            text=to_hh_text([g for _, g in groups]),
-            priority=100,
-            search_field="text" if use_sf else None,
-            groups=tuple(groups),
-            parts=_make_parts(groups, use_search_field=use_sf),
-        )
-        plans.extend(_apply_length_guard(primary, max_length))
-
-        broad_groups = [g for g in groups if g[0] == "role"]
-        must_groups = [g for g in groups if g[0].startswith("must_")]
-        if must_groups and not _is_role_sensitive(parsed):
-            broad_groups.append(must_groups[0])
-        if broad_groups:
-            broad = HHQueryPlan(
-                label="broad",
-                text=to_hh_text([g for _, g in broad_groups]),
-                priority=70,
-                search_field="text" if use_sf else None,
-                groups=tuple(broad_groups),
-                parts=_make_parts(broad_groups, use_search_field=use_sf),
-            )
-            plans.extend(_apply_length_guard(broad, max_length))
-
-    soft_signals = parsed.get("soft_signals")
-    if isinstance(soft_signals, list) and len(soft_signals) >= 2:
-        bonus_group = _or_group([str(x) for x in soft_signals if str(x).strip()])
-        if bonus_group:
-            bonus_groups = [("bonus", bonus_group)]
-            bonus = HHQueryPlan(
-                label="bonus",
-                text=bonus_group,
-                priority=40,
-                search_field="text" if use_sf else None,
-                groups=(("bonus", bonus_group),),
-                parts=_make_parts(bonus_groups, use_search_field=use_sf),
-            )
-            plans.extend(_apply_length_guard(bonus, max_length))
-
-    return plans
+    groups = _primary_groups(
+        parsed,
+        expanded_synonyms,
+        search_mode="mass" if search_mode == "mass" else "precise",
+    )
+    if not groups:
+        return []
+    primary = HHQueryPlan(
+        label="primary",
+        text=to_hh_text([g for _, g in groups]),
+        priority=100,
+        search_field="text" if use_sf else None,
+        groups=tuple(groups),
+        parts=_make_parts(groups, use_search_field=use_sf),
+    )
+    return _apply_length_guard(primary, max_length)
 
 
 def relax(plan: HHQueryPlan, level: int) -> HHQueryPlan:
     if level <= 0:
         return plan
     groups = list(plan.groups)
-    for _ in range(level):
-        risky_idx = next((i for i, (kind, _) in enumerate(groups) if kind == "should_risky"), None)
-        if risky_idx is not None:
-            groups.pop(risky_idx)
-            continue
-        should_idx = next((i for i, (kind, _) in enumerate(groups) if kind == "should"), None)
-        if should_idx is not None:
-            groups.pop(should_idx)
-            continue
-        must_idxs = [i for i, (kind, _) in enumerate(groups) if kind.startswith("must_")]
-        if must_idxs:
-            groups.pop(must_idxs[-1])
+    # В новом режиме `precise/mass` не используем отдельные ветки relax,
+    # но сохраняем совместимость вызова: при relax убираем группу skills.
+    if level > 0:
+        groups = [pair for pair in groups if pair[0] != "skills"]
     relaxed_text = to_hh_text([g for _, g in groups])
     use_sf = bool(settings.hh_query_use_search_field)
     return replace(

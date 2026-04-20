@@ -819,6 +819,16 @@ def filter_resumes(
 
     aid = mp.get("area")
     if aid is not None:
-        out = [r for r in out if r.get("area_id") == int(aid)]
+        if isinstance(aid, list):
+            area_ids: set[int] = set()
+            for raw in aid:
+                try:
+                    area_ids.add(int(raw))
+                except (TypeError, ValueError):
+                    continue
+            if area_ids:
+                out = [r for r in out if int(r.get("area_id") or -1) in area_ids]
+        else:
+            out = [r for r in out if r.get("area_id") == int(aid)]
 
     return out

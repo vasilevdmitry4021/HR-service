@@ -12,3 +12,14 @@ class AreaItemOut(BaseModel):
 
 class AreasListOut(BaseModel):
     items: list[AreaItemOut]
+
+
+class ProfessionalRoleItemOut(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: int = Field(description="Идентификатор профроли в API HeadHunter")
+    name: str = Field(description="Название профессиональной роли")
+
+
+class ProfessionalRolesListOut(BaseModel):
+    items: list[ProfessionalRoleItemOut]

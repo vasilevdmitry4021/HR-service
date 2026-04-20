@@ -25,13 +25,13 @@ describe("FilterPanel", () => {
     await user.click(screen.getByRole("button", { name: /^Санкт-Петербург$/i }));
     expect(onChange).toHaveBeenCalled();
     const last = onChange.mock.calls.at(-1)?.[0];
-    expect(last?.area).toBe(2);
+    expect(last?.area).toEqual([2]);
   });
 
   it("сбрасывает фильтры по кнопке", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
-    const value = { ...emptySearchFilters(), area: 1 };
+    const value = { ...emptySearchFilters(), area: [1] };
 
     render(
       <FilterPanel
@@ -45,6 +45,6 @@ describe("FilterPanel", () => {
     await user.click(screen.getByRole("button", { name: /Сбросить фильтры/i }));
     expect(onChange).toHaveBeenCalled();
     const reset = onChange.mock.calls.at(-1)?.[0];
-    expect(reset?.area).toBe("");
+    expect(reset?.area).toEqual([]);
   });
 });

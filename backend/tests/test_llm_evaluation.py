@@ -11,7 +11,7 @@ from app.services import llm_evaluation
 
 
 @pytest.mark.asyncio
-async def test_evaluate_all_resumes_uses_stubs_without_hh_fetch() -> None:
+async def test_evaluate_all_resumes_passes_compact_prescore_payload_without_hh_fetch() -> None:
     resumes = [
         {
             "id": "resume-1",
@@ -69,13 +69,73 @@ async def test_evaluate_all_resumes_uses_stubs_without_hh_fetch() -> None:
     fetch_resume_mock.assert_not_awaited()
     assert len(captured_prescore_rows) == 1
     prescore_row = captured_prescore_rows[0]
-    assert "about" not in prescore_row
-    assert "work_experience" not in prescore_row
+    assert prescore_row["about"].startswith("Полное описание профиля")
+    assert isinstance(prescore_row.get("work_experience"), list)
+    assert prescore_row.get("semantic_summary")
     assert "education" not in prescore_row
     assert metrics["cache_hit"] == 0
     assert metrics["cache_miss"] == 0
     assert metrics["hh_fetch_count"] == 0
     assert items[0]["llm_score"] == 88
+
+
+@pytest.mark.asyncio
+async def test_evaluate_prescore_degrades_to_stub_if_enrichment_fails() -> None:
+    resumes = [
+        {
+            "id": "resume-1",
+            "hh_resume_id": "resume-1",
+            "title": "Python Developer",
+            "skills": ["Python"],
+            "experience_years": 4,
+        }
+    ]
+    parsed = {"text": "python developer", "skills": ["Python"]}
+    captured_prescore_rows: list[dict[str, object]] = []
+
+    def fake_prescore(requirements, rows, db=None, **kwargs):
+        _ = requirements, db, kwargs
+        captured_prescore_rows.extend(rows)
+        return (
+            {str(row.get("id")): 70 for row in rows},
+            {
+                "prescore_elapsed_ms": 5,
+                "llm_calls_total": 1,
+                "llm_calls_refill": 0,
+                "avg_prompt_chars": 10,
+                "parse_fail_count": 0,
+                "refill_gain_ratio": 0.0,
+                "budget_exhausted": False,
+                "llm_scored_count": len(rows),
+                "fallback_scored_count": 0,
+                "coverage_ratio": 1.0,
+            },
+        )
+
+    with patch(
+        "app.services.llm_evaluation._enrich_resumes_for_llm",
+        side_effect=RuntimeError("boom"),
+    ):
+        with patch(
+            "app.services.llm_evaluation.llm_prescoring.prescore_resumes_batch",
+            side_effect=fake_prescore,
+        ):
+            items, _metrics = await llm_evaluation.evaluate_all_resumes(
+                "token",
+                resumes,
+                parsed,
+                db=object(),
+                user_id=uuid.uuid4(),
+            )
+
+    assert len(captured_prescore_rows) == 1
+    prescore_row = captured_prescore_rows[0]
+    assert prescore_row["id"] == "resume-1"
+    assert prescore_row["title"] == "Python Developer"
+    assert "about" not in prescore_row
+    assert "work_experience" not in prescore_row
+    assert "semantic_summary" not in prescore_row
+    assert items[0]["llm_score"] == 70
 
 
 @pytest.mark.asyncio
@@ -344,3 +404,96 @@ def test_simple_sort_does_not_promote_bonus_without_must_skills() -> None:
     }
     sorted_rows = llm_evaluation._sort_by_simple_criteria(resumes, parsed)
     assert sorted_rows[0]["id"] == "primary-ok"
+
+
+@pytest.mark.asyncio
+async def test_evaluate_all_resumes_sets_partial_on_unresolved(monkeypatch) -> None:
+    resumes = [
+        {"id": "r1", "hh_resume_id": "r1", "title": "A", "skills": ["Python"], "experience_years": 3},
+        {"id": "r2", "hh_resume_id": "r2", "title": "B", "skills": ["Python"], "experience_years": 3},
+    ]
+    parsed = {"text": "python", "skills": ["Python"]}
+    monkeypatch.setattr(llm_evaluation.settings, "evaluate_interactive_top_n", 2)
+
+    def fake_prescore(requirements, rows, db=None, **kwargs):
+        _ = requirements, db, kwargs
+        return {"r1": 80}, {
+            "prescore_elapsed_ms": 1,
+            "llm_calls_total": 1,
+            "llm_calls_refill": 1,
+            "avg_prompt_chars": 10,
+            "parse_fail_count": 1,
+            "refill_gain_ratio": 0.0,
+            "budget_exhausted": False,
+            "llm_scored_count": 1,
+            "fallback_scored_count": 0,
+            "coverage_ratio": 0.5,
+            "unresolved_count": 1,
+            "recovery_batches_total": 1,
+            "single_resume_attempts_total": 2,
+            "single_resume_fail_count": 1,
+            "llm_only_complete": False,
+            "status": "partial",
+        }
+
+    with patch(
+        "app.services.llm_evaluation.llm_prescoring.prescore_resumes_batch",
+        side_effect=fake_prescore,
+    ):
+        items, metrics = await llm_evaluation.evaluate_all_resumes(
+            None,
+            resumes,
+            parsed,
+            db=object(),
+            user_id=uuid.uuid4(),
+        )
+
+    assert len(items) == 2
+    assert metrics["status"] == "partial"
+    assert metrics["llm_only_complete"] is False
+    assert metrics["unresolved_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_evaluate_all_resumes_sets_error_when_no_scores(monkeypatch) -> None:
+    resumes = [
+        {"id": "r1", "hh_resume_id": "r1", "title": "A", "skills": ["Python"], "experience_years": 3},
+    ]
+    parsed = {"text": "python", "skills": ["Python"]}
+    monkeypatch.setattr(llm_evaluation.settings, "evaluate_interactive_top_n", 1)
+
+    def fake_prescore(requirements, rows, db=None, **kwargs):
+        _ = requirements, rows, db, kwargs
+        return {}, {
+            "prescore_elapsed_ms": 1,
+            "llm_calls_total": 1,
+            "llm_calls_refill": 1,
+            "avg_prompt_chars": 10,
+            "parse_fail_count": 1,
+            "refill_gain_ratio": 0.0,
+            "budget_exhausted": False,
+            "llm_scored_count": 0,
+            "fallback_scored_count": 0,
+            "coverage_ratio": 0.0,
+            "unresolved_count": 1,
+            "recovery_batches_total": 1,
+            "single_resume_attempts_total": 3,
+            "single_resume_fail_count": 1,
+            "llm_only_complete": False,
+            "status": "error",
+        }
+
+    with patch(
+        "app.services.llm_evaluation.llm_prescoring.prescore_resumes_batch",
+        side_effect=fake_prescore,
+    ):
+        _items, metrics = await llm_evaluation.evaluate_all_resumes(
+            None,
+            resumes,
+            parsed,
+            db=object(),
+            user_id=uuid.uuid4(),
+        )
+
+    assert metrics["status"] == "error"
+    assert metrics["unresolved_count"] == 1

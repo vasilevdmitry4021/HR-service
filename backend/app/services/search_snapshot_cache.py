@@ -29,6 +29,7 @@ class SearchSnapshotData:
     parsed_params: dict[str, Any]
     query: str
     filters: dict[str, Any] | None
+    search_metrics: dict[str, Any] | None = None
     evaluated: bool = False
     analyzed: bool = False
     source_scope: str = "hh"
@@ -41,6 +42,7 @@ class SearchSnapshotData:
             "parsed_params": self.parsed_params,
             "query": self.query,
             "filters": self.filters,
+            "search_metrics": self.search_metrics,
             "evaluated": self.evaluated,
             "analyzed": self.analyzed,
             "source_scope": self.source_scope,
@@ -55,6 +57,7 @@ class SearchSnapshotData:
             parsed_params=dict(d.get("parsed_params") or {}),
             query=str(d.get("query") or ""),
             filters=d.get("filters"),
+            search_metrics=d.get("search_metrics"),
             evaluated=bool(d.get("evaluated", False)),
             analyzed=bool(d.get("analyzed", False)),
             source_scope=str(d.get("source_scope") or "hh"),

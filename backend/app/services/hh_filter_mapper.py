@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.config import settings
 from app.schemas.search_filters import ResumeSearchFilters
 from app.services.hh_query_planner import HHQueryPlan
+
+if TYPE_CHECKING:
+    from app.services.hh_client import HHProfessionalRoleReference
 
 _RISKY_SKILL_PATTERNS = (
     re.compile(r"\b(вайб|vibe)\w*\b", re.IGNORECASE),
@@ -20,6 +23,22 @@ REGION_NAME_TO_AREA_ID: dict[str, int] = {
     "екатеринбург": 3,
     "новосибирск": 4,
 }
+_AREA_ALIASES: dict[str, int] = {
+    "мск": 1,
+    "moscow": 1,
+    "москва и область": 1,
+    "санкт петербург": 2,
+    "санктпетербург": 2,
+    "спб": 2,
+    "питер": 2,
+    "петербург": 2,
+    "saint petersburg": 2,
+    "spb": 2,
+    "екб": 3,
+    "екат": 3,
+    "новосиб": 4,
+    "нск": 4,
+}
 
 EXPERIENCE_FROM_MIN_YEARS: dict[tuple[int, int | None], str] = {
     (0, 1): "noExperience",
@@ -28,21 +47,12 @@ EXPERIENCE_FROM_MIN_YEARS: dict[tuple[int, int | None], str] = {
     (6, None): "moreThan6",
 }
 
-_DEFAULT_ROLE_TERM_MAP: dict[int, tuple[str, ...]] = {
-    # HH "Аналитик" (ID 10) — консервативный fallback для role-запросов аналитиков.
-    10: (
-        "аналитик",
-        "аналитик данных",
-        "data analyst",
-        "бизнес-аналитик",
-        "business analyst",
-        "системный аналитик",
-        "system analyst",
-        "systems analyst",
-    )
-}
-
-_ROLE_TERM_SPLIT_RE = re.compile(r"[|,]+")
+_ANALYST_GENERAL_TERMS = {"аналитик", "analyst"}
+_CANONICAL_ANALYST_NAMES = (
+    "системный аналитик",
+    "бизнес-аналитик",
+    "bi-аналитик, аналитик данных",
+)
 
 
 def _normalize_role_term(value: str) -> str:
@@ -52,34 +62,7 @@ def _normalize_role_term(value: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _parse_role_map(raw_map: str) -> dict[int, tuple[str, ...]]:
-    parsed_map: dict[int, tuple[str, ...]] = {}
-    for raw_part in str(raw_map or "").split(";"):
-        part = raw_part.strip()
-        if not part or "=" not in part:
-            continue
-        role_raw, terms_raw = part.split("=", 1)
-        role_id = int(role_raw.strip()) if role_raw.strip().isdigit() else None
-        if role_id is None:
-            continue
-        terms = tuple(
-            norm
-            for norm in (_normalize_role_term(t) for t in _ROLE_TERM_SPLIT_RE.split(terms_raw))
-            if norm
-        )
-        if terms:
-            parsed_map[role_id] = terms
-    return parsed_map
-
-
-def _role_term_map() -> dict[int, tuple[str, ...]]:
-    configured = _parse_role_map(settings.hh_auto_professional_role_map)
-    if configured:
-        return configured
-    return _DEFAULT_ROLE_TERM_MAP
-
-
-def infer_professional_role(parsed: dict[str, Any]) -> int | None:
+def _collect_role_candidates(parsed: dict[str, Any]) -> list[str]:
     role_candidates: list[str] = []
     for field_name in ("must_position", "position_keywords"):
         terms = parsed.get(field_name)
@@ -89,26 +72,116 @@ def infer_professional_role(parsed: dict[str, Any]) -> int | None:
                     normalized = _normalize_role_term(term)
                     if normalized:
                         role_candidates.append(normalized)
+    return role_candidates
+
+
+def _unique_role_ids(role_ids: list[int]) -> list[int]:
+    seen: set[int] = set()
+    out: list[int] = []
+    for role_id in role_ids:
+        if role_id in seen:
+            continue
+        seen.add(role_id)
+        out.append(role_id)
+    return out
+
+
+def resolve_professional_roles(
+    parsed: dict[str, Any],
+    professional_roles_reference: HHProfessionalRoleReference | None,
+) -> tuple[list[int], list[dict[str, Any]]]:
+    if professional_roles_reference is None:
+        return [], []
+    role_candidates = _collect_role_candidates(parsed)
     if not role_candidates:
-        return None
+        return [], []
 
-    best_role: int | None = None
-    best_score = -1
-    for role_id, vocab in _role_term_map().items():
-        local_score = -1
-        for query_term in role_candidates:
-            for known_term in vocab:
-                if query_term == known_term:
-                    local_score = max(local_score, 200 + len(known_term))
-                elif known_term in query_term or query_term in known_term:
-                    local_score = max(local_score, 100 + len(known_term))
-        if local_score > best_score:
-            best_score = local_score
-            best_role = role_id
+    normalized_index = professional_roles_reference.normalized_role_name_to_ids
+    if not normalized_index:
+        return [], []
 
-    if best_score < 0:
-        return None
-    return best_role
+    role_scores: dict[int, int] = {}
+    match_debug: list[dict[str, Any]] = []
+    for query_term in role_candidates:
+        matched_names: list[str] = []
+        for role_name, role_ids in normalized_index.items():
+            score = -1
+            if query_term == role_name:
+                score = 200 + len(role_name)
+            elif role_name in query_term or query_term in role_name:
+                score = 100 + len(role_name)
+            if score < 0:
+                continue
+            matched_names.append(role_name)
+            for role_id in role_ids:
+                role_scores[role_id] = max(role_scores.get(role_id, 0), score)
+        if matched_names:
+            matched_ids: list[int] = []
+            for role_name in matched_names:
+                matched_ids.extend(normalized_index.get(role_name, ()))
+            match_debug.append(
+                {
+                    "term": query_term,
+                    "strategy": "names_first",
+                    "matched_role_names": sorted(set(matched_names)),
+                    "matched_role_ids": _unique_role_ids(sorted(matched_ids)),
+                }
+            )
+
+    contains_generic_analyst = any(term in _ANALYST_GENERAL_TERMS for term in role_candidates)
+    if contains_generic_analyst:
+        analyst_role_ids: list[int] = []
+        analyst_role_names: list[str] = []
+        canonical_terms = [_normalize_role_term(name) for name in _CANONICAL_ANALYST_NAMES]
+        for canonical_name in canonical_terms:
+            canonical_matched: list[int] = []
+            for role_name, role_ids in normalized_index.items():
+                if (
+                    canonical_name == role_name
+                    or canonical_name in role_name
+                    or role_name in canonical_name
+                ):
+                    analyst_role_names.append(role_name)
+                    canonical_matched.extend(role_ids)
+                    for role_id in role_ids:
+                        role_scores[role_id] = max(
+                            role_scores.get(role_id, 0),
+                            150 + len(role_name),
+                        )
+            analyst_role_ids.extend(_unique_role_ids(canonical_matched))
+        analyst_role_ids = _unique_role_ids(analyst_role_ids)
+        if analyst_role_ids:
+            match_debug.append(
+                {
+                    "term": "аналитик",
+                    "strategy": "canonical_analyst_fanout",
+                    "matched_role_names": sorted(set(analyst_role_names)),
+                    "matched_role_ids": analyst_role_ids,
+                }
+            )
+            return analyst_role_ids, match_debug
+
+    if not role_scores:
+        return [], match_debug
+
+    best_role = max(role_scores, key=role_scores.get)
+    return [best_role], match_debug
+
+
+def infer_professional_roles(
+    parsed: dict[str, Any],
+    professional_roles_reference: HHProfessionalRoleReference | None = None,
+) -> list[int]:
+    roles, _ = resolve_professional_roles(parsed, professional_roles_reference)
+    return roles
+
+
+def infer_professional_role(
+    parsed: dict[str, Any],
+    professional_roles_reference: HHProfessionalRoleReference | None = None,
+) -> int | None:
+    roles = infer_professional_roles(parsed, professional_roles_reference)
+    return roles[0] if roles else None
 
 
 def experience_from_years_min(years_min: int | None) -> str | None:
@@ -123,11 +196,103 @@ def experience_from_years_min(years_min: int | None) -> str | None:
 def _area_from_parsed_region(region: str | None) -> int | None:
     if not region:
         return None
-    key = region.strip().lower()
-    return REGION_NAME_TO_AREA_ID.get(key)
+    key = re.sub(r"[^a-zа-я0-9]+", " ", str(region or "").strip().lower().replace("ё", "е"))
+    key = re.sub(r"\s+", " ", key).strip()
+    if not key:
+        return None
+    return REGION_NAME_TO_AREA_ID.get(key) or _AREA_ALIASES.get(key)
 
 
-def resume_search_text_for_hh(parsed: dict[str, Any]) -> str | None:
+def resolve_area_priority(
+    parsed: dict[str, Any],
+    filters: ResumeSearchFilters | dict[str, Any] | None,
+) -> tuple[list[int] | None, str]:
+    """
+    Единая политика региона для HH:
+    1) Явный region из панели фильтров имеет максимальный приоритет.
+    2) Если panel-region не задан, используем регион, извлеченный из текста запроса.
+    """
+    fdict: dict[str, Any] = {}
+    if isinstance(filters, ResumeSearchFilters):
+        fdict = filters.model_dump(exclude_none=True)
+    elif isinstance(filters, dict):
+        fdict = {k: v for k, v in filters.items() if v is not None}
+
+    area = fdict.get("area")
+    if area is not None:
+        if isinstance(area, list):
+            area_ids = []
+            for raw in area:
+                try:
+                    area_ids.append(int(raw))
+                except (TypeError, ValueError):
+                    continue
+            uniq = list(dict.fromkeys(area_ids))
+            if uniq:
+                return uniq, "panel"
+            return None, "none"
+        try:
+            return [int(area)], "panel"
+        except (TypeError, ValueError):
+            return None, "none"
+    parsed_area = _area_from_parsed_region(parsed.get("region"))
+    if parsed_area is not None:
+        return [parsed_area], "parsed_region"
+    return None, "none"
+
+
+def _skill_terms_from_parsed(parsed: dict[str, Any]) -> list[str]:
+    terms: list[str] = []
+    seen: set[str] = set()
+
+    def add_term(value: str) -> None:
+        normalized = _normalize_role_term(value)
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        terms.append(value.strip())
+
+    semantic_skill_groups: list[dict[str, Any]] = []
+    for group_key in ("must_skills", "should_skills"):
+        raw_groups = parsed.get(group_key)
+        if isinstance(raw_groups, list):
+            semantic_skill_groups.extend([x for x in raw_groups if isinstance(x, dict)])
+    for item in semantic_skill_groups:
+        canonical = str(item.get("canonical") or "").strip()
+        equivalents = item.get("search_equivalents")
+        eq_terms = (
+            [str(x).strip() for x in equivalents if str(x).strip()]
+            if isinstance(equivalents, list)
+            else []
+        )
+        is_risky = any(rx.search(canonical.lower()) for rx in _RISKY_SKILL_PATTERNS) if canonical else False
+        if canonical and not is_risky:
+            add_term(canonical)
+        if is_risky and eq_terms:
+            for term in eq_terms[:3]:
+                add_term(term)
+        elif canonical and not eq_terms:
+            add_term(canonical)
+
+    if terms:
+        return terms
+
+    fallback_terms = parsed.get("hard_skills")
+    if not isinstance(fallback_terms, list) or not fallback_terms:
+        fallback_terms = parsed.get("skills")
+    if isinstance(fallback_terms, list):
+        for item in fallback_terms:
+            if isinstance(item, str):
+                add_term(item)
+    return terms
+
+
+def resume_search_text_for_hh(
+    parsed: dict[str, Any],
+    *,
+    search_mode: str = "precise",
+    include_role_terms: bool = True,
+) -> str | None:
     """
     Текст для параметра HH ``text``.
 
@@ -150,48 +315,20 @@ def resume_search_text_for_hh(parsed: dict[str, Any]) -> str | None:
         seen_lower.add(key)
         parts.append(t)
 
-    position_terms = parsed.get("position_keywords")
-    if isinstance(position_terms, list):
-        for item in position_terms:
-            if isinstance(item, str):
-                add_chunk(item)
-
-    # В legacy-контуре сначала используем канонизированные semantic skills:
-    # жаргон заменяется профессиональным каноном/эквивалентами.
-    semantic_skill_groups: list[dict[str, Any]] = []
-    for group_key in ("must_skills", "should_skills"):
-        raw_groups = parsed.get(group_key)
-        if isinstance(raw_groups, list):
-            semantic_skill_groups.extend([x for x in raw_groups if isinstance(x, dict)])
-    if semantic_skill_groups:
-        for item in semantic_skill_groups:
-            canonical = str(item.get("canonical") or "").strip()
-            equivalents = item.get("search_equivalents")
-            eq_terms = (
-                [str(x).strip() for x in equivalents if str(x).strip()]
-                if isinstance(equivalents, list)
-                else []
-            )
-            is_risky = any(rx.search(canonical.lower()) for rx in _RISKY_SKILL_PATTERNS) if canonical else False
-            if canonical and not is_risky:
-                add_chunk(canonical)
-            if is_risky and eq_terms:
-                for term in eq_terms[:3]:
-                    add_chunk(term)
-            elif canonical and not eq_terms:
-                add_chunk(canonical)
-    else:
-        # Fallback на старые поля: hard_skills предпочтительнее legacy skills.
-        skills_terms = parsed.get("hard_skills")
-        if not isinstance(skills_terms, list) or not skills_terms:
-            skills_terms = parsed.get("skills")
-        if isinstance(skills_terms, list):
-            for item in skills_terms:
+    if include_role_terms:
+        position_terms = parsed.get("position_keywords")
+        if isinstance(position_terms, list):
+            for item in position_terms:
                 if isinstance(item, str):
                     add_chunk(item)
 
+    skill_terms = _skill_terms_from_parsed(parsed)
+    for term in skill_terms:
+        add_chunk(term)
+
     if parts:
-        return " ".join(parts)
+        operator = " AND " if search_mode == "precise" else " OR "
+        return operator.join(parts)
     return raw_str or None
 
 
@@ -201,6 +338,9 @@ def merge_resume_search_params(
     page: int,
     per_page: int,
     query_plan: HHQueryPlan | None = None,
+    search_mode: str = "precise",
+    professional_role_ids: list[int] | None = None,
+    professional_roles_reference: HHProfessionalRoleReference | None = None,
 ) -> dict[str, Any]:
     """
     Объединяет распознанный запрос и панель фильтров в плоский словарь параметров.
@@ -214,7 +354,11 @@ def merge_resume_search_params(
 
     params: dict[str, Any] = {"page": page, "per_page": per_page}
 
-    text = query_plan.text if query_plan is not None else resume_search_text_for_hh(parsed)
+    text = (
+        query_plan.text
+        if query_plan is not None
+        else resume_search_text_for_hh(parsed, search_mode=search_mode, include_role_terms=False)
+    )
     use_indexed_fields = (
         query_plan is not None
         and settings.hh_query_use_search_field
@@ -242,19 +386,19 @@ def merge_resume_search_params(
     elif text:
         params["text"] = text
 
-    area = fdict.get("area")
-    if area is None:
-        area = _area_from_parsed_region(parsed.get("region"))
-    if area is not None:
-        params["area"] = area
+    area_ids, _area_source = resolve_area_priority(parsed, filters)
+    if area_ids:
+        params["area"] = area_ids
 
     explicit_prof_role = fdict.get("professional_role")
     if explicit_prof_role is not None:
         params["professional_role"] = explicit_prof_role
+    elif professional_role_ids:
+        params["professional_role"] = [int(x) for x in professional_role_ids if isinstance(x, int)]
     elif settings.feature_hh_auto_professional_role:
-        inferred_prof_role = infer_professional_role(parsed)
-        if inferred_prof_role is not None:
-            params["professional_role"] = inferred_prof_role
+        inferred_prof_roles = infer_professional_roles(parsed, professional_roles_reference)
+        if inferred_prof_roles:
+            params["professional_role"] = inferred_prof_roles
     if fdict.get("industry") is not None:
         params["industry"] = fdict["industry"]
 
@@ -308,9 +452,9 @@ def flatten_params_for_httpx(params: dict[str, Any]) -> list[tuple[str, Any]]:
     """
     flat: list[tuple[str, Any]] = []
     for key, val in params.items():
-        if key == "skill" and isinstance(val, list):
+        if key in {"skill", "professional_role", "area"} and isinstance(val, list):
             for s in val:
-                flat.append(("skill", s))
+                flat.append((key, s))
         elif key == "employment" and isinstance(val, list):
             for e in val:
                 flat.append(("employment", e))

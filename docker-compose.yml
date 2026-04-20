@@ -111,7 +111,7 @@ services:
       # Кэш Next.js в именованном томе: при bind-mount с Windows (OneDrive) ./frontend/.next часто даёт EACCES
       - frontend_next_build:/app/.next
     # Том node_modules не обновляется сам при смене package-lock; npm ci подтягивает новые пакеты (например sonner).
-    command: sh -c "npm ci && npm run dev"
+    command: sh -c "(npm ci --prefer-offline --no-audit || npm ci --prefer-offline --no-audit || npm ci --no-audit) && npm run dev"
     depends_on:
       backend:
         condition: service_healthy

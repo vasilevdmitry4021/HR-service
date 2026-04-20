@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlencode
 
@@ -31,6 +33,90 @@ class HHClientError(Exception):
         self.status_code = status_code
         self.detail = detail
         super().__init__(detail)
+
+
+@dataclass(frozen=True)
+class HHProfessionalRoleReference:
+    id_to_name: dict[int, str]
+    normalized_role_name_to_ids: dict[str, tuple[int, ...]]
+
+
+_PROFESSIONAL_ROLE_CACHE_LOCK = asyncio.Lock()
+_professional_role_cache_value: HHProfessionalRoleReference | None = None
+_professional_role_cache_expires_at: float = 0.0
+
+_MOCK_PROFESSIONAL_ROLE_PAYLOAD: list[dict[str, Any]] = [
+    {
+        "id": "1",
+        "name": "IT",
+        "roles": [
+            {"id": "10", "name": "Системный аналитик"},
+            {"id": "11", "name": "Бизнес-аналитик"},
+            {"id": "12", "name": "BI-аналитик, аналитик данных"},
+            {"id": "96", "name": "Программист, разработчик"},
+        ],
+    }
+]
+
+
+def _normalize_professional_role_name(value: str) -> str:
+    text = str(value or "").strip().lower().replace("ё", "е")
+    text = re.sub(r"[^a-zа-я0-9+\- ]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _build_professional_role_reference(payload: Any) -> HHProfessionalRoleReference:
+    id_to_name: dict[int, str] = {}
+    normalized_index: dict[str, list[int]] = {}
+    # Реальный ответ HH: {"categories": [{"id": "...", "name": "...", "roles": [...]}, ...]}
+    # Поддерживаем также list/dict для совместимости с тестами/моками.
+    groups_payload: list[Any]
+    if isinstance(payload, dict):
+        categories = payload.get("categories")
+        if isinstance(categories, list):
+            groups_payload = categories
+        else:
+            groups_payload = [payload]
+    elif isinstance(payload, list):
+        groups_payload = payload
+    else:
+        return HHProfessionalRoleReference(id_to_name={}, normalized_role_name_to_ids={})
+    for group in groups_payload:
+        if not isinstance(group, dict):
+            continue
+        roles = group.get("roles")
+        if not isinstance(roles, list):
+            continue
+        for role in roles:
+            if not isinstance(role, dict):
+                continue
+            role_id_raw = role.get("id")
+            role_name = str(role.get("name") or "").strip()
+            if not role_name:
+                continue
+            try:
+                role_id = int(str(role_id_raw).strip())
+            except (TypeError, ValueError):
+                continue
+            id_to_name[role_id] = role_name
+            normalized_name = _normalize_professional_role_name(role_name)
+            if not normalized_name:
+                continue
+            bucket = normalized_index.setdefault(normalized_name, [])
+            if role_id not in bucket:
+                bucket.append(role_id)
+    return HHProfessionalRoleReference(
+        id_to_name=id_to_name,
+        normalized_role_name_to_ids={
+            key: tuple(sorted(ids)) for key, ids in normalized_index.items() if ids
+        },
+    )
+
+
+def reset_professional_role_reference_cache_for_tests() -> None:
+    global _professional_role_cache_value, _professional_role_cache_expires_at
+    _professional_role_cache_value = None
+    _professional_role_cache_expires_at = 0.0
 
 
 def build_authorization_url(
@@ -398,6 +484,88 @@ async def _maybe_retry_hh_after_401(
     return new_access
 
 
+async def get_professional_roles_reference(
+    access_token: str | None,
+    *,
+    db: Session | None = None,
+    hh_token_user_id: uuid.UUID | None = None,
+    force_refresh: bool = False,
+) -> tuple[HHProfessionalRoleReference, str]:
+    global _professional_role_cache_value, _professional_role_cache_expires_at
+    if settings.feature_use_mock_hh:
+        return _build_professional_role_reference(_MOCK_PROFESSIONAL_ROLE_PAYLOAD), "hh_api"
+    if not access_token:
+        raise PermissionError("HeadHunter is not connected")
+
+    now = time.monotonic()
+    if (
+        not force_refresh
+        and _professional_role_cache_value is not None
+        and now < _professional_role_cache_expires_at
+    ):
+        return _professional_role_cache_value, "cache"
+
+    async with _PROFESSIONAL_ROLE_CACHE_LOCK:
+        now = time.monotonic()
+        if (
+            not force_refresh
+            and _professional_role_cache_value is not None
+            and now < _professional_role_cache_expires_at
+        ):
+            return _professional_role_cache_value, "cache"
+
+        timeout_s = max(0.1, float(settings.hh_professional_roles_timeout_seconds or 3.0))
+        ttl_s = float(settings.hh_professional_roles_cache_ttl_seconds or 0)
+        token = access_token
+        async with httpx.AsyncClient() as client:
+            try:
+                r = await client.get(
+                    f"{HH_API}/professional_roles",
+                    headers=_hh_headers(token),
+                    timeout=timeout_s,
+                )
+                _raise_if_hh_error(r)
+            except HHClientError as exc:
+                retry_tok = await _maybe_retry_hh_after_401(exc, token, db, hh_token_user_id)
+                if retry_tok is None:
+                    raise
+                token = retry_tok
+                r = await client.get(
+                    f"{HH_API}/professional_roles",
+                    headers=_hh_headers(token),
+                    timeout=timeout_s,
+                )
+                _raise_if_hh_error(r)
+            except httpx.TimeoutException as exc:
+                raise HHClientError(
+                    503,
+                    "Справочник professional_roles временно недоступен (timeout).",
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise HHClientError(
+                    503,
+                    "Справочник professional_roles временно недоступен (transport error).",
+                ) from exc
+
+        try:
+            payload = r.json()
+        except ValueError as exc:
+            raise HHClientError(
+                503,
+                "Некорректный ответ HeadHunter для справочника professional_roles.",
+            ) from exc
+
+        reference = _build_professional_role_reference(payload)
+        if not reference.id_to_name:
+            raise HHClientError(
+                503,
+                "Справочник professional_roles вернул пустой набор ролей.",
+            )
+        _professional_role_cache_value = reference
+        _professional_role_cache_expires_at = now + ttl_s if ttl_s > 0 else now
+        return reference, "hh_api"
+
+
 async def search_resumes(
     access_token: str | None,
     parsed: dict[str, Any],
@@ -406,6 +574,7 @@ async def search_resumes(
     per_page: int,
     *,
     query_plan: HHQueryPlan | None = None,
+    professional_role_ids: list[int] | None = None,
     db: Session | None = None,
     hh_token_user_id: uuid.UUID | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
@@ -415,6 +584,8 @@ async def search_resumes(
         page,
         per_page,
         query_plan=query_plan,
+        search_mode=str(parsed.get("search_mode") or "precise"),
+        professional_role_ids=professional_role_ids,
     )
 
     if settings.feature_use_mock_hh:

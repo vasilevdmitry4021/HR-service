@@ -12,7 +12,7 @@ from sqlalchemy import update
 from app.config import settings
 from app.models.favorite import Favorite
 from app.services import search_snapshot_cache
-from app.services.hh_client import HHClientError
+from app.services.hh_client import HHClientError, HHProfessionalRoleReference
 
 
 @pytest.fixture(autouse=True)
@@ -37,6 +37,21 @@ def _make_mock_resumes(n: int) -> list[dict]:
         }
         for i in range(n)
     ]
+
+
+def _professional_role_reference() -> HHProfessionalRoleReference:
+    return HHProfessionalRoleReference(
+        id_to_name={
+            10: "Системный аналитик",
+            11: "Бизнес-аналитик",
+            12: "BI-аналитик, аналитик данных",
+        },
+        normalized_role_name_to_ids={
+            "системный аналитик": (10,),
+            "бизнес-аналитик": (11,),
+            "bi-аналитик аналитик данных": (12,),
+        },
+    )
 
 
 def test_evaluate_snapshot_updates_items(
@@ -344,6 +359,85 @@ def test_evaluate_snapshot_progress_returns_hh_limit_error(
                 )
 
 
+def test_evaluate_snapshot_progress_marks_partial_when_unresolved(
+    client: TestClient,
+    auth_headers: dict[str, str],
+) -> None:
+    async def fake_search(*args: object, **kwargs: object) -> tuple[list, int]:
+        return _make_mock_resumes(3), 3
+
+    async def fake_eval(
+        access: str | None,
+        resumes: list,
+        parsed_params: dict,
+        db: object,
+        *,
+        user_id: uuid.UUID | None = None,
+        progress_callback=None,
+    ):
+        _ = access, parsed_params, db, user_id, progress_callback
+        out = []
+        for i, row in enumerate(resumes):
+            d = dict(row)
+            d["llm_score"] = 90 if i == 0 else None
+            out.append(d)
+        return out, {
+            "status": "partial",
+            "coverage_ratio": 0.3333,
+            "llm_only_complete": False,
+            "unresolved_count": 2,
+            "llm_scored_count": 1,
+            "fallback_scored_count": 0,
+        }
+
+    with patch("app.api.search._llm_endpoint_configured", return_value=True):
+        with patch(
+            "app.api.search.hh_client.search_resumes",
+            new_callable=AsyncMock,
+            side_effect=fake_search,
+        ):
+            r0 = client.post(
+                "/api/v1/search",
+                headers=auth_headers,
+                json={"query": "Python", "page": 0, "per_page": 20},
+            )
+            assert r0.status_code == 200
+            sid = r0.json().get("snapshot_id")
+            assert sid
+
+            with patch(
+                "app.api.search.llm_evaluation.evaluate_all_resumes",
+                new_callable=AsyncMock,
+                side_effect=fake_eval,
+            ):
+                rs = client.post(
+                    f"/api/v1/search/{sid}/evaluate/start",
+                    headers=auth_headers,
+                    json={},
+                )
+                assert rs.status_code == 200, rs.text
+                job_id = rs.json()["job_id"]
+
+                partial = None
+                for _ in range(30):
+                    sleep(0.02)
+                    rp = client.get(
+                        f"/api/v1/search/{sid}/evaluate/progress",
+                        headers=auth_headers,
+                        params={"job_id": job_id},
+                    )
+                    assert rp.status_code == 200, rp.text
+                    payload = rp.json()
+                    if payload["status"] == "partial":
+                        partial = payload
+                        break
+
+                assert partial is not None
+                assert partial["status"] == "partial"
+                assert partial["llm_only_complete"] is False
+                assert partial["unresolved_count"] == 2
+
+
 def test_analyze_snapshot_progress_polling(
     client: TestClient,
     auth_headers: dict[str, str],
@@ -506,6 +600,190 @@ def test_search_mock_hh_returns_candidates(
     assert "parsed_params" in data
     assert data.get("snapshot_id")
     assert "summary" not in data
+
+
+def test_search_metrics_exposes_area_priority_and_pipeline_counters(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "feature_hh_boolean_query", False)
+    monkeypatch.setattr(settings, "search_recall_target_min", 60)
+    monkeypatch.setattr(settings, "search_recall_target_min_with_area", 40)
+    monkeypatch.setattr(settings, "hh_query_relax_max_steps", 3)
+    monkeypatch.setattr(settings, "hh_query_relax_max_steps_with_area", 2)
+
+    parsed = {"region": "СПб", "position_keywords": ["Python developer"], "skills": ["Python"]}
+
+    async def fake_search(*args: object, **kwargs: object) -> tuple[list, int]:
+        _ = args, kwargs
+        return _make_mock_resumes(1), 12
+
+    with patch(
+        "app.api.search.nlp_service.parse_natural_query",
+        return_value=(parsed, 0.95, 5),
+    ):
+        with patch(
+            "app.api.search.hh_client.search_resumes",
+            new_callable=AsyncMock,
+            side_effect=fake_search,
+        ):
+            r = client.post(
+                "/api/v1/search",
+                headers=auth_headers,
+                json={
+                    "query": "Python developer в СПб",
+                    "page": 0,
+                    "per_page": 20,
+                    "filters": {"area": [1]},
+                },
+            )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    metrics = data.get("search_metrics") or {}
+    area_meta = metrics.get("area") or {}
+    assert area_meta.get("effective") == 1
+    assert area_meta.get("effective_ids") == [1]
+    assert area_meta.get("source") == "panel"
+    assert area_meta.get("parsed_region") == "СПб"
+    assert metrics.get("primary_found") == 12
+    assert metrics.get("raw_pool_size") == 1
+    assert metrics.get("count_after_strict_filter") == 1
+    assert metrics.get("relax_steps_used") == 0
+    assert metrics.get("recall_target_min_base") == 60
+    assert metrics.get("recall_target_min_used") == 40
+
+
+def test_search_professional_roles_resolved_from_hh_reference(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "feature_hh_auto_professional_role", True)
+    parsed = {"position_keywords": ["аналитик"], "must_position": [], "skills": []}
+
+    async def fake_reference(*args: object, **kwargs: object):
+        _ = args, kwargs
+        return _professional_role_reference(), "hh_api"
+
+    async def fake_search(*args: object, **kwargs: object) -> tuple[list, int]:
+        assert kwargs.get("professional_role_ids") == [10, 11, 12]
+        return _make_mock_resumes(1), 1
+
+    with patch(
+        "app.api.search.nlp_service.parse_natural_query",
+        return_value=(parsed, 0.95, 5),
+    ):
+        with patch(
+            "app.api.search.hh_client.get_professional_roles_reference",
+            new_callable=AsyncMock,
+            side_effect=fake_reference,
+        ):
+            with patch(
+                "app.api.search.hh_client.search_resumes",
+                new_callable=AsyncMock,
+                side_effect=fake_search,
+            ):
+                r = client.post(
+                    "/api/v1/search",
+                    headers=auth_headers,
+                    json={"query": "аналитик", "page": 0, "per_page": 20},
+                )
+
+    assert r.status_code == 200, r.text
+    metrics = r.json().get("search_metrics") or {}
+    assert metrics.get("professional_role_resolution_source") == "hh_api"
+    assert metrics.get("professional_role_ids") == [10, 11, 12]
+    assert any(
+        item.get("strategy") == "canonical_analyst_fanout"
+        for item in (metrics.get("professional_role_match_debug") or [])
+    )
+
+
+def test_search_professional_roles_resolution_degrades_on_reference_error(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "feature_hh_auto_professional_role", True)
+    parsed = {"position_keywords": ["системный аналитик"], "must_position": [], "skills": []}
+
+    async def fake_search(*args: object, **kwargs: object) -> tuple[list, int]:
+        role_ids = kwargs.get("professional_role_ids")
+        assert role_ids in ([], None)
+        return _make_mock_resumes(1), 1
+
+    with patch(
+        "app.api.search.nlp_service.parse_natural_query",
+        return_value=(parsed, 0.95, 5),
+    ):
+        with patch(
+            "app.api.search.hh_client.get_professional_roles_reference",
+            new_callable=AsyncMock,
+            side_effect=HHClientError(503, "timeout"),
+        ):
+            with patch(
+                "app.api.search.hh_client.search_resumes",
+                new_callable=AsyncMock,
+                side_effect=fake_search,
+            ):
+                r = client.post(
+                    "/api/v1/search",
+                    headers=auth_headers,
+                    json={"query": "системный аналитик", "page": 0, "per_page": 20},
+                )
+
+    assert r.status_code == 200, r.text
+    metrics = r.json().get("search_metrics") or {}
+    assert metrics.get("professional_role_resolution_source") == "none"
+    assert metrics.get("professional_role_ids") == []
+
+
+def test_search_mode_mass_reflected_in_response_and_metrics(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "feature_hh_boolean_query", True)
+
+    parsed = {
+        "position_keywords": ["Системный аналитик"],
+        "must_position": ["Системный аналитик"],
+        "must_skills": [{"canonical": "Kafka", "synonyms": ["Apache Kafka"]}],
+        "should_skills": [{"canonical": "микросервисы", "synonyms": ["microservices"]}],
+    }
+
+    async def fake_search(*args: object, **kwargs: object) -> tuple[list, int]:
+        _ = args, kwargs
+        return _make_mock_resumes(2), 2
+
+    with patch(
+        "app.api.search.nlp_service.parse_natural_query",
+        return_value=(parsed, 0.95, 5),
+    ):
+        with patch(
+            "app.api.search.hh_client.search_resumes",
+            new_callable=AsyncMock,
+            side_effect=fake_search,
+        ):
+            r = client.post(
+                "/api/v1/search",
+                headers=auth_headers,
+                json={
+                    "query": "системный аналитик с Kafka и микросервисами",
+                    "search_mode": "mass",
+                    "page": 0,
+                    "per_page": 20,
+                },
+            )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data.get("search_mode") == "mass"
+    assert data.get("parsed_params", {}).get("search_mode") == "mass"
+    metrics = data.get("search_metrics") or {}
+    assert metrics.get("search_mode") == "mass"
+    assert metrics.get("text_operator") == "OR"
+    assert metrics.get("skills_strategy") == "skills_in_text_or"
 
 
 def test_search_strict_role_filter_excludes_developer_titles(

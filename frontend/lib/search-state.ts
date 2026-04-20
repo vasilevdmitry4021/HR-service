@@ -1,4 +1,4 @@
-import type { SearchResponse } from "@/lib/types";
+import type { SearchMode, SearchResponse } from "@/lib/types";
 import type { ListSortKind } from "@/lib/search-results-list";
 
 export const HR_SEARCH_STATE_KEY = "hr_search_state";
@@ -52,6 +52,7 @@ export type SearchStatePayload = {
   listFilter?: string;
   listSort?: ListSortKind;
   perPage?: number;
+  searchMode?: SearchMode;
   snapshotEvalJob?: {
     snapshotId: string;
     jobId: string;
@@ -65,6 +66,9 @@ export type SearchStatePayload = {
     llmScored: number;
     fallbackScored: number;
     coverageRatio: number;
+    llmCoverageRatio: number;
+    unresolvedCount: number;
+    llmOnlyComplete: boolean;
     interactiveDone: number;
     interactiveTotal: number;
     backgroundDone: number;
@@ -131,6 +135,10 @@ export function readSearchState(): SearchStatePayload | null {
       (o.perPage === 20 || o.perPage === 50)
         ? o.perPage
         : undefined;
+    const searchMode =
+      o.searchMode === "mass" || o.searchMode === "precise"
+        ? o.searchMode
+        : undefined;
     const snapshotEvalJobRaw = o.snapshotEvalJob;
     const snapshotEvalJob =
       snapshotEvalJobRaw &&
@@ -173,6 +181,19 @@ export function readSearchState(): SearchStatePayload | null {
               Number(
                 (progressRaw as { coverageRatio?: unknown }).coverageRatio ?? 0,
               ) || 0,
+            llmCoverageRatio:
+              Number(
+                (progressRaw as { llmCoverageRatio?: unknown }).llmCoverageRatio ??
+                  (progressRaw as { coverageRatio?: unknown }).coverageRatio ??
+                  0,
+              ) || 0,
+            unresolvedCount:
+              Number(
+                (progressRaw as { unresolvedCount?: unknown }).unresolvedCount ?? 0,
+              ) || 0,
+            llmOnlyComplete: Boolean(
+              (progressRaw as { llmOnlyComplete?: unknown }).llmOnlyComplete,
+            ),
             interactiveDone:
               Number(
                 (progressRaw as { interactiveDone?: unknown }).interactiveDone ?? 0,
@@ -255,6 +276,7 @@ export function readSearchState(): SearchStatePayload | null {
       listFilter,
       listSort,
       perPage,
+      searchMode,
       snapshotEvalJob:
         snapshotEvalJob &&
         snapshotEvalJob.snapshotId.length > 0 &&

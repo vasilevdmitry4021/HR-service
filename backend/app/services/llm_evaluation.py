@@ -44,6 +44,58 @@ def _candidate_stub_from_row(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _compact_work_experience_for_prescore(
+    row: dict[str, Any],
+    *,
+    max_items: int = 3,
+    max_description_chars: int = 260,
+) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for item in (row.get("work_experience") or [])[: max(0, max_items)]:
+        if not isinstance(item, dict):
+            continue
+        position = str(item.get("position") or "").strip()
+        company = str(item.get("company") or "").strip()
+        description = str(item.get("description") or "").strip()
+        if description and len(description) > max_description_chars:
+            description = description[: max_description_chars - 1] + "…"
+        compact: dict[str, str] = {}
+        if position:
+            compact["position"] = position
+        if company:
+            compact["company"] = company
+        if description:
+            compact["description"] = description
+        if compact:
+            out.append(compact)
+    return out
+
+
+def _prescore_payload_from_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Компактный payload для prescore: fallback-friendly и пригодный для semantic summary."""
+    payload = _candidate_stub_from_row(row)
+    about = str(row.get("about") or "").strip()
+    if about:
+        payload["about"] = about[:600]
+    work = _compact_work_experience_for_prescore(row)
+    if work:
+        payload["work_experience"] = work
+    raw_text = str(row.get("raw_text") or "").strip()
+    if raw_text:
+        payload["raw_text"] = raw_text[:2200]
+    provided_summary = str(row.get("semantic_summary") or "").strip()
+    if provided_summary:
+        payload["semantic_summary"] = provided_summary[:1700]
+    elif about or work or raw_text:
+        payload["semantic_summary"] = llm_resume_analyzer.build_prescore_semantic_summary(
+            row,
+            max_chars=1700,
+            highlights_limit=8,
+            recent_jobs_limit=3,
+        )
+    return payload
+
+
 def _sort_by_simple_criteria(
     resumes: list[dict[str, Any]],
     parsed_params: dict[str, Any],
@@ -277,6 +329,10 @@ async def evaluate_all_resumes(
             "llm_scored_count": 0,
             "fallback_scored_count": 0,
             "coverage_ratio": 1.0,
+            "unresolved_count": 0,
+            "interactive_unresolved_count": 0,
+            "background_unresolved_count": 0,
+            "llm_only_complete": True,
             "llm_calls_total": 0,
             "llm_calls_refill": 0,
             "avg_prompt_chars": 0,
@@ -295,11 +351,22 @@ async def evaluate_all_resumes(
     )
     interactive_rows = sorted_resumes[:interactive_top_n]
     background_rows = sorted_resumes[interactive_top_n:]
+
+    def _phase_budget(raw_seconds: float | int | None) -> float | None:
+        if raw_seconds is None:
+            return None
+        try:
+            v = float(raw_seconds)
+        except (TypeError, ValueError):
+            return None
+        # <= 0: отключаем time budget, чтобы оценка шла до полного покрытия/ошибки.
+        return None if v <= 0 else max(1.0, v)
+
     async def _run_phase(
         phase: str,
         rows: list[dict[str, Any]],
         *,
-        max_seconds: float,
+        max_seconds: float | None,
     ) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, Any]]:
         if not rows:
             return [], {}, {
@@ -317,18 +384,53 @@ async def evaluate_all_resumes(
                 "llm_scored_count": 0,
                 "fallback_scored_count": 0,
                 "coverage_ratio": 1.0,
+                "unresolved_count": 0,
+                "recovery_batches_total": 0,
+                "single_resume_attempts_total": 0,
+                "single_resume_fail_count": 0,
+                "llm_only_complete": True,
+                "status": "done",
             }
-        stubs = [_candidate_stub_from_row(r) for r in rows]
-        enriched_rows = stubs
+        enriched_rows = rows
         enrich_stats = {"cache_hit": 0, "cache_miss": 0, "hh_fetch_count": 0}
         enrichment_elapsed_ms = 0
+        max_enrich = int(settings.evaluate_max_enrich_resumes or 0)
+        if max_enrich <= 0:
+            max_enrich = len(rows) if phase == "interactive" else 0
+        max_enrich = min(max_enrich, len(rows))
+        if max_enrich > 0:
+            enrich_started = time.monotonic()
+            try:
+                enriched_rows, enrich_stats = await _enrich_resumes_for_llm(
+                    rows,
+                    access_token,
+                    cache_user_id=user_id,
+                    max_enrich=max_enrich,
+                    db=db,
+                )
+            except HHClientError as e:
+                logger.warning(
+                    "evaluate enrichment failed for phase=%s with HH error: %s",
+                    phase,
+                    e,
+                )
+                enriched_rows = rows
+            except Exception as e:
+                logger.warning(
+                    "evaluate enrichment failed for phase=%s: %s",
+                    phase,
+                    e,
+                )
+                enriched_rows = rows
+            enrichment_elapsed_ms = int((time.monotonic() - enrich_started) * 1000)
+        prescore_rows = [_prescore_payload_from_row(r) for r in enriched_rows]
         if progress_callback is not None:
             progress_callback(
                 {
                     "stage": "enrichment",
                     "phase": phase,
                     "event": "done",
-                    "enriched_count": len(enriched_rows),
+                    "enriched_count": len(prescore_rows),
                     "total_count": len(rows),
                     "cache_hit": enrich_stats.get("cache_hit", 0),
                     "cache_miss": enrich_stats.get("cache_miss", 0),
@@ -337,7 +439,7 @@ async def evaluate_all_resumes(
         phase_scores, phase_prescore_stats = await asyncio.to_thread(
             llm_prescoring.prescore_resumes_batch,
             parsed_params,
-            enriched_rows,
+            prescore_rows,
             db,
             progress_callback=progress_callback,
             phase=phase,
@@ -353,10 +455,19 @@ async def evaluate_all_resumes(
                     "phase_llm_scored_count": int(phase_prescore_stats.get("llm_scored_count") or 0),
                     "phase_fallback_count": int(phase_prescore_stats.get("fallback_scored_count") or 0),
                     "phase_coverage_ratio": float(phase_prescore_stats.get("coverage_ratio") or 0.0),
+                    "phase_unresolved_count": int(phase_prescore_stats.get("unresolved_count") or 0),
+                    "phase_llm_only_complete": bool(phase_prescore_stats.get("llm_only_complete")),
                     "budget_exhausted": bool(phase_prescore_stats.get("budget_exhausted")),
                 }
             )
-        return enriched_rows, phase_scores, {
+        merged_rows = [{**rows[i], **prescore_rows[i]} for i in range(len(rows))]
+        unresolved_count = int(phase_prescore_stats.get("unresolved_count") or 0)
+        llm_only_complete = bool(
+            phase_prescore_stats.get("llm_only_complete")
+            if phase_prescore_stats.get("llm_only_complete") is not None
+            else unresolved_count == 0
+        )
+        return merged_rows, phase_scores, {
             "enrichment_elapsed_ms": enrichment_elapsed_ms,
             "prescore_elapsed_ms": int(phase_prescore_stats.get("prescore_elapsed_ms") or 0),
             "llm_calls_total": int(phase_prescore_stats.get("llm_calls_total") or 0),
@@ -371,13 +482,19 @@ async def evaluate_all_resumes(
             "llm_scored_count": int(phase_prescore_stats.get("llm_scored_count") or 0),
             "fallback_scored_count": int(phase_prescore_stats.get("fallback_scored_count") or 0),
             "coverage_ratio": float(phase_prescore_stats.get("coverage_ratio") or 0.0),
+            "unresolved_count": unresolved_count,
+            "recovery_batches_total": int(phase_prescore_stats.get("recovery_batches_total") or 0),
+            "single_resume_attempts_total": int(phase_prescore_stats.get("single_resume_attempts_total") or 0),
+            "single_resume_fail_count": int(phase_prescore_stats.get("single_resume_fail_count") or 0),
+            "llm_only_complete": llm_only_complete,
+            "status": str(phase_prescore_stats.get("status") or "done"),
         }
 
     interactive_started = time.monotonic()
     interactive_enriched, interactive_scores, interactive_stats = await _run_phase(
         "interactive",
         interactive_rows,
-        max_seconds=max(1.0, float(settings.llm_prescore_interactive_max_seconds or 12.0)),
+        max_seconds=_phase_budget(settings.llm_prescore_interactive_max_seconds),
     )
     interactive_elapsed_ms = int((time.monotonic() - interactive_started) * 1000)
 
@@ -385,7 +502,7 @@ async def evaluate_all_resumes(
     background_enriched, background_scores, background_stats = await _run_phase(
         "background",
         background_rows,
-        max_seconds=max(1.0, float(settings.llm_prescore_background_max_seconds or 45.0)),
+        max_seconds=_phase_budget(settings.llm_prescore_background_max_seconds),
     )
     background_elapsed_ms = int((time.monotonic() - background_started) * 1000)
 
@@ -437,7 +554,14 @@ async def evaluate_all_resumes(
                 head.append(row)
         rows = head + overflow_bonus + rest
     coverage_ratio = float(len(scores) / len(sorted_resumes)) if sorted_resumes else 1.0
-    status = "done" if coverage_ratio >= 1.0 else "partial"
+    unresolved_count = int(interactive_stats["unresolved_count"] + background_stats["unresolved_count"])
+    llm_only_complete = bool(interactive_stats["llm_only_complete"] and background_stats["llm_only_complete"])
+    if llm_only_complete:
+        status = "done"
+    elif len(scores) == 0 and len(sorted_resumes) > 0:
+        status = "error"
+    else:
+        status = "partial"
     return [t[0] for t in rows], {
         "status": status,
         "enrichment_elapsed_ms": int(interactive_stats["enrichment_elapsed_ms"] + background_stats["enrichment_elapsed_ms"]),
@@ -453,6 +577,10 @@ async def evaluate_all_resumes(
         "llm_scored_count": int(interactive_stats["llm_scored_count"] + background_stats["llm_scored_count"]),
         "fallback_scored_count": int(interactive_stats["fallback_scored_count"] + background_stats["fallback_scored_count"]),
         "coverage_ratio": round(coverage_ratio, 4),
+        "unresolved_count": unresolved_count,
+        "interactive_unresolved_count": int(interactive_stats["unresolved_count"]),
+        "background_unresolved_count": int(background_stats["unresolved_count"]),
+        "llm_only_complete": llm_only_complete,
         "llm_calls_total": int(interactive_stats["llm_calls_total"] + background_stats["llm_calls_total"]),
         "llm_calls_refill": int(interactive_stats["llm_calls_refill"] + background_stats["llm_calls_refill"]),
         "avg_prompt_chars": int(
@@ -479,6 +607,13 @@ async def evaluate_all_resumes(
         "background_budget_exhausted": bool(background_stats["budget_exhausted"]),
         "interactive_coverage_ratio": round(float(interactive_stats["coverage_ratio"]), 4),
         "background_coverage_ratio": round(float(background_stats["coverage_ratio"]), 4),
+        "recovery_batches_total": int(interactive_stats["recovery_batches_total"] + background_stats["recovery_batches_total"]),
+        "single_resume_attempts_total": int(
+            interactive_stats["single_resume_attempts_total"] + background_stats["single_resume_attempts_total"]
+        ),
+        "single_resume_fail_count": int(
+            interactive_stats["single_resume_fail_count"] + background_stats["single_resume_fail_count"]
+        ),
     }
 
 

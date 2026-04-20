@@ -11,6 +11,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { CircleHelp } from "lucide-react";
 
 import { ActiveFiltersSummary } from "@/components/search/ActiveFiltersSummary";
 import { AppNav } from "@/components/AppNav";
@@ -25,6 +26,14 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
+import { RadioGroup, RadioGroupItemWithLabel } from "@/components/ui/radio-group";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Sheet, SheetContent } from "@/components/ui/sheet";
 import {
   addFavorite,
@@ -36,6 +45,7 @@ import {
   deleteTemplate,
   fetchEvaluateSearchProgress,
   fetchFavorites,
+  fetchReferenceProfessionalRoles,
   fetchReferenceAreasRussia,
   fetchTemplates,
   removeFavorite,
@@ -57,6 +67,7 @@ import {
   hasAnyFilters,
   queryBaseWithoutFilterLine,
   type HhAreaOption,
+  type HhProfessionalRoleOption,
   type SearchFiltersState,
 } from "@/lib/search-filters";
 import {
@@ -68,6 +79,7 @@ import { cn } from "@/lib/utils";
 import type {
   Candidate,
   ParsedParams,
+  SearchMode,
   SearchResponse,
   SearchTemplateRow,
 } from "@/lib/types";
@@ -88,6 +100,9 @@ function mapProgressToUi(progress: {
   llm_scored_count?: number;
   fallback_scored_count?: number;
   coverage_ratio?: number;
+  llm_coverage_ratio?: number;
+  unresolved_count?: number;
+  llm_only_complete?: boolean;
   interactive_done_count?: number;
   interactive_total_count?: number;
   background_done_count?: number;
@@ -106,6 +121,9 @@ function mapProgressToUi(progress: {
     llmScored: progress.llm_scored_count ?? 0,
     fallbackScored: progress.fallback_scored_count ?? 0,
     coverageRatio: progress.coverage_ratio ?? 0,
+    llmCoverageRatio: progress.llm_coverage_ratio ?? progress.coverage_ratio ?? 0,
+    unresolvedCount: progress.unresolved_count ?? 0,
+    llmOnlyComplete: progress.llm_only_complete ?? false,
     interactiveDone,
     interactiveTotal,
     backgroundDone: progress.background_done_count ?? 0,
@@ -115,7 +133,7 @@ function mapProgressToUi(progress: {
     interactiveReady:
       interactiveTotal > 0
         ? interactiveDone >= interactiveTotal
-        : progress.phase === "background" || progress.status === "done",
+        : progress.phase === "background" || progress.status === "done" || progress.status === "partial",
   };
 }
 
@@ -123,6 +141,8 @@ function statusLabelRu(status: string): string {
   switch (status) {
     case "done":
       return "Завершено";
+    case "partial":
+      return "Завершено частично";
     case "error":
       return "Ошибка";
     case "running":
@@ -144,6 +164,8 @@ function stageLabelRu(stage: string): string {
       return "Дооцениваем оставшиеся резюме";
     case "done":
       return "Оценка завершена";
+    case "partial":
+      return "Оценка завершена частично";
     case "error":
       return "Ошибка оценки";
     default:
@@ -175,6 +197,7 @@ function SearchPageContent() {
   const hasHydrated = useAuthStore((s) => s._hasHydrated);
 
   const [q, setQ] = useState("");
+  const [searchMode, setSearchMode] = useState<SearchMode>("precise");
   const [filters, setFilters] = useState(emptySearchFilters());
   const [loading, setLoading] = useState(false);
   const [parsing, setParsing] = useState(false);
@@ -219,6 +242,9 @@ function SearchPageContent() {
     llmScored: number;
     fallbackScored: number;
     coverageRatio: number;
+    llmCoverageRatio: number;
+    unresolvedCount: number;
+    llmOnlyComplete: boolean;
     interactiveDone: number;
     interactiveTotal: number;
     backgroundDone: number;
@@ -243,6 +269,9 @@ function SearchPageContent() {
   const [hhAreas, setHhAreas] = useState<HhAreaOption[]>(FALLBACK_AREA_OPTIONS);
   const [hhAreasLoading, setHhAreasLoading] = useState(true);
   const [hhAreasHint, setHhAreasHint] = useState<string | null>(null);
+  const [hhProfessionalRoles, setHhProfessionalRoles] = useState<HhProfessionalRoleOption[]>([]);
+  const [hhProfessionalRolesLoading, setHhProfessionalRolesLoading] = useState(true);
+  const [hhProfessionalRolesHint, setHhProfessionalRolesHint] = useState<string | null>(null);
   const repeatAppliedRef = useRef(false);
   const [evalProgressVisible, setEvalProgressVisible] = useState(true);
   const [analyzeProgressVisible, setAnalyzeProgressVisible] = useState(true);
@@ -250,6 +279,7 @@ function SearchPageContent() {
   const evalIsActive =
     (snapshotEvalBusy || Boolean(snapshotEvalJob)) &&
     evalStatus !== "done" &&
+    evalStatus !== "partial" &&
     evalStatus !== "error";
   const evalCompleted = snapshotEvalProgress?.status === "done";
   const analyzeStatus =
@@ -268,7 +298,11 @@ function SearchPageContent() {
       setEvalProgressVisible(false);
       return;
     }
-    if (snapshotEvalProgress.status !== "done" && snapshotEvalProgress.status !== "error") {
+    if (
+      snapshotEvalProgress.status !== "done" &&
+      snapshotEvalProgress.status !== "partial" &&
+      snapshotEvalProgress.status !== "error"
+    ) {
       setEvalProgressVisible(true);
       return;
     }
@@ -294,6 +328,11 @@ function SearchPageContent() {
     for (const a of hhAreas) m.set(a.id, a.name);
     return m;
   }, [hhAreas]);
+  const roleLabels = useMemo(() => {
+    const m = new Map<number, string>();
+    for (const role of hhProfessionalRoles) m.set(role.id, role.name);
+    return m;
+  }, [hhProfessionalRoles]);
 
   useEffect(() => {
     if (!accessToken) return;
@@ -320,6 +359,30 @@ function SearchPageContent() {
       })
       .finally(() => {
         if (!cancelled) setHhAreasLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [accessToken]);
+
+  useEffect(() => {
+    if (!accessToken) return;
+    let cancelled = false;
+    setHhProfessionalRolesLoading(true);
+    setHhProfessionalRolesHint(null);
+    void fetchReferenceProfessionalRoles()
+      .then((items) => {
+        if (cancelled) return;
+        setHhProfessionalRoles(items);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setHhProfessionalRoles([]);
+          setHhProfessionalRolesHint("Справочник ролей HeadHunter временно недоступен.");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setHhProfessionalRolesLoading(false);
       });
     return () => {
       cancelled = true;
@@ -358,6 +421,7 @@ function SearchPageContent() {
     const saved = readSearchState();
     if (!saved) return;
     setQ(saved.query);
+    setSearchMode(saved.searchMode ?? "precise");
     setFilters(filtersFromApiPayload(saved.filters ?? undefined));
     setResults(saved.results);
     setActiveTab(saved.activeTab);
@@ -379,6 +443,7 @@ function SearchPageContent() {
     const t = window.setTimeout(() => {
       saveSearchState({
         query: q,
+        searchMode,
         filters: filtersToApiPayload(filters) ?? null,
         results,
         snapshotId: results?.snapshot_id ?? null,
@@ -396,6 +461,7 @@ function SearchPageContent() {
   }, [
     accessToken,
     q,
+    searchMode,
     filters,
     results,
     activeTab,
@@ -551,6 +617,7 @@ function SearchPageContent() {
   const handleClearSearch = useCallback(() => {
     snapshotEvalRunIdRef.current += 1;
     setQ("");
+    setSearchMode("precise");
     setFilters(emptySearchFilters());
     setResults(null);
     setParsePreview(null);
@@ -583,6 +650,7 @@ function SearchPageContent() {
       const payload = filtersToApiPayload(filters);
       const body: Record<string, unknown> = {
         query: queryForApi,
+        search_mode: searchMode,
         page,
         per_page: perPageArg,
         source_scope: sourceScope,
@@ -599,7 +667,7 @@ function SearchPageContent() {
         body: JSON.stringify(body),
       });
     },
-    [queryForApi, filters, sourceScope, listSort],
+    [queryForApi, searchMode, filters, sourceScope, listSort],
   );
 
   const runParseOnly = useCallback(async () => {
@@ -753,6 +821,10 @@ function SearchPageContent() {
             await refreshCurrentResultsPage();
             break;
           }
+          if (progress.status === "partial") {
+            await refreshCurrentResultsPage();
+            break;
+          }
           if (progress.status === "error") {
             throw new ApiError(
               progress.error?.trim() || "Не удалось оценить выдачу",
@@ -777,7 +849,11 @@ function SearchPageContent() {
   useEffect(() => {
     if (!accessToken) return;
     if (!snapshotEvalJob) return;
-    if (snapshotEvalProgress?.status === "done" || snapshotEvalProgress?.status === "error") {
+    if (
+      snapshotEvalProgress?.status === "done" ||
+      snapshotEvalProgress?.status === "partial" ||
+      snapshotEvalProgress?.status === "error"
+    ) {
       return;
     }
     void pollSnapshotEvaluation(snapshotEvalJob.snapshotId, snapshotEvalJob.jobId);
@@ -887,6 +963,9 @@ function SearchPageContent() {
       llmScored: 0,
       fallbackScored: 0,
       coverageRatio: 0,
+      llmCoverageRatio: 0,
+      unresolvedCount: 0,
+      llmOnlyComplete: false,
       interactiveDone: 0,
       interactiveTotal: 0,
       backgroundDone: 0,
@@ -1130,9 +1209,43 @@ function SearchPageContent() {
           canNext: results.pages > 0 && results.page < results.pages - 1,
         }
       : null;
+  const hhFoundRaw =
+    typeof results?.found_raw_hh === "number" ? results.found_raw_hh : null;
+  const hhRawPool =
+    typeof results?.search_metrics?.raw_pool_size === "number"
+      ? results.search_metrics.raw_pool_size
+      : null;
+  const strictFilteredCount = results?.found ?? 0;
+  const pageLocalCount = processedItems.length;
+  const tabVisibleCount = filteredItems.length;
+  const recallDiag = results?.search_metrics
+    ? {
+        primaryFound:
+          typeof results.search_metrics.primary_found === "number"
+            ? results.search_metrics.primary_found
+            : null,
+        relaxSteps:
+          typeof results.search_metrics.relax_steps_used === "number"
+            ? results.search_metrics.relax_steps_used
+            : null,
+      }
+    : null;
+  const effectiveSearchMode: SearchMode =
+    results?.search_mode === "mass" || results?.search_mode === "precise"
+      ? results.search_mode
+      : searchMode;
+  const hhTextOperator =
+    results?.search_metrics?.text_operator === "OR" ? "OR" : "AND";
+  const hhRoleIds = Array.isArray(results?.search_metrics?.professional_role_ids)
+    ? (results?.search_metrics?.professional_role_ids as number[])
+    : [];
+  const hhSkillIds = Array.isArray(results?.search_metrics?.skill_ids)
+    ? (results?.search_metrics?.skill_ids as number[])
+    : [];
+  const hhTextTerms = Array.isArray(results?.search_metrics?.text_terms)
+    ? (results?.search_metrics?.text_terms as string[])
+    : [];
 
-  const selectFieldClass =
-    "select-chevron h-9 rounded-md border border-input bg-background pl-2 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
   const progressValue = snapshotEvalProgress
     ? Math.min(snapshotEvalProgress.scored, snapshotEvalProgress.total)
     : 0;
@@ -1170,13 +1283,62 @@ function SearchPageContent() {
                 onClear={handleClearSearch}
                 showClear={showClear}
               />
+              <div className="rounded-lg border bg-muted/20 p-3">
+                <div className="flex items-center gap-1.5">
+                  <p className="text-xs font-medium text-foreground/80">Режим поиска</p>
+                  <div className="group relative inline-flex">
+                    <button
+                      type="button"
+                      aria-label="Пояснение режимов поиска"
+                      className="inline-flex h-4 w-4 items-center justify-center rounded-full text-foreground/45 transition-colors hover:text-foreground/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      <CircleHelp className="h-4 w-4" />
+                    </button>
+                    <div className="pointer-events-none absolute left-0 top-full z-20 mt-2 hidden w-72 rounded-md border bg-background p-3 text-xs leading-5 text-foreground shadow-md group-hover:block group-focus-within:block">
+                      <p>
+                        <span className="font-medium">Точечный поиск</span>: ищет
+                        кандидатов, у которых запрос максимально точно совпадает
+                        по ключевым условиям.
+                      </p>
+                      <p className="mt-2">
+                        <span className="font-medium">Массовый поиск</span>:
+                        расширяет выдачу и находит больше кандидатов даже при
+                        частичном совпадении условий.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+                <RadioGroup
+                  value={searchMode}
+                  onValueChange={(value) => setSearchMode(value as SearchMode)}
+                  className="mt-2 flex flex-wrap items-center gap-4"
+                >
+                  <RadioGroupItemWithLabel
+                    value="precise"
+                    label="Точечный поиск"
+                  />
+                  <RadioGroupItemWithLabel
+                    value="mass"
+                    label="Массовый поиск"
+                  />
+                </RadioGroup>
+              </div>
               <ActiveFiltersSummary
                 filters={filters}
                 areaLabels={areaLabels}
+                roleLabels={roleLabels}
                 parsedRegion={
                   (results?.parsed_params?.region ??
                     parsePreview?.params?.region) as string | undefined
                 }
+                effectiveAreaIds={
+                  Array.isArray(results?.search_metrics?.area?.effective_ids)
+                    ? results.search_metrics.area.effective_ids
+                    : typeof results?.search_metrics?.area?.effective === "number"
+                      ? [results.search_metrics.area.effective]
+                      : null
+                }
+                effectiveAreaSource={results?.search_metrics?.area?.source}
               />
             </div>
 
@@ -1254,7 +1416,11 @@ function SearchPageContent() {
                   {snapshotEvalProgress && evalProgressVisible && (
                     <div className={cn(
                       "space-y-2 rounded-lg border bg-muted/30 p-3 transition-opacity duration-500",
-                      (snapshotEvalProgress.status === "done" || snapshotEvalProgress.status === "error") && "opacity-50",
+                      (
+                        snapshotEvalProgress.status === "done" ||
+                        snapshotEvalProgress.status === "partial" ||
+                        snapshotEvalProgress.status === "error"
+                      ) && "opacity-50",
                     )}>
                       <Progress
                         value={progressValue}
@@ -1280,6 +1446,11 @@ function SearchPageContent() {
                         {" · дополнительно обработано: "}
                         {snapshotEvalProgress.fallbackScored}
                       </p>
+                      {snapshotEvalProgress.unresolvedCount > 0 && (
+                        <p className="text-xs text-amber-700">
+                          Не удалось получить LLM-score для {snapshotEvalProgress.unresolvedCount} резюме.
+                        </p>
+                      )}
                       <p className="text-xs text-muted-foreground">
                         Первичная оценка: {snapshotEvalProgress.interactiveDone} из{" "}
                         {snapshotEvalProgress.interactiveTotal}
@@ -1388,19 +1559,20 @@ function SearchPageContent() {
                       >
                         Размер страницы
                       </Label>
-                      <select
-                        id="per-page"
-                        className={cn(selectFieldClass, "w-full min-w-0")}
-                        value={perPage}
-                        onChange={(e) =>
-                          handlePerPageChange(
-                            Number(e.target.value) === 50 ? 50 : 20,
-                          )
+                      <Select
+                        value={String(perPage)}
+                        onValueChange={(val) =>
+                          handlePerPageChange(Number(val) === 50 ? 50 : 20)
                         }
                       >
-                        <option value={20}>20 резюме</option>
-                        <option value={50}>50 резюме</option>
-                      </select>
+                        <SelectTrigger id="per-page" className="w-full min-w-0">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="20">20 резюме</SelectItem>
+                          <SelectItem value="50">50 резюме</SelectItem>
+                        </SelectContent>
+                      </Select>
                     </div>
                     <div className="min-w-0 space-y-2 md:col-span-2 xl:col-span-4">
                       <Label
@@ -1409,28 +1581,26 @@ function SearchPageContent() {
                       >
                         Сортировка
                       </Label>
-                      <select
-                        id="list-sort"
-                        className={cn(selectFieldClass, "w-full min-w-0")}
+                      <Select
                         value={listSort}
-                        onChange={(e) =>
-                          handleListSortChange(e.target.value as ListSortKind)
+                        onValueChange={(val) =>
+                          handleListSortChange(val as ListSortKind)
                         }
                         disabled={loading}
                       >
-                        {LIST_SORT_OPTIONS.map((o) => (
-                          <option key={o.value} value={o.value}>
-                            {o.label}
-                          </option>
-                        ))}
-                      </select>
+                        <SelectTrigger id="list-sort" className="w-full min-w-0">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {LIST_SORT_OPTIONS.map((o) => (
+                            <SelectItem key={o.value} value={o.value}>
+                              {o.label}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
                     </div>
                   </div>
-                  <p className="text-xs leading-relaxed text-muted-foreground">
-                    Локальный поиск ниже относится к текущей странице списка.
-                    Сортировка применяется на сервере ко всему снимку поиска и
-                    учитывается при пагинации.
-                  </p>
                 </div>
               )}
 
@@ -1565,6 +1735,9 @@ function SearchPageContent() {
             value={filters}
             onChange={handleFiltersChange}
             areas={hhAreas}
+            professionalRoles={hhProfessionalRoles}
+            professionalRolesLoading={hhProfessionalRolesLoading}
+            professionalRolesHint={hhProfessionalRolesHint}
             areasLoading={hhAreasLoading}
             areasHint={hhAreasHint}
           />

@@ -6,7 +6,8 @@ export type ExperienceBucket =
 
 /** Состояние панели фильтров (совместимо с ResumeSearchFilters на бэкенде) */
 export type SearchFiltersState = {
-  area: number | "";
+  area: number[];
+  professional_role: number[];
   experience: ExperienceBucket | "";
   gender: "male" | "female" | "";
   age_from: string;
@@ -17,7 +18,8 @@ export type SearchFiltersState = {
 };
 
 export const emptySearchFilters = (): SearchFiltersState => ({
-  area: "",
+  area: [],
+  professional_role: [],
   experience: "",
   gender: "",
   age_from: "",
@@ -30,7 +32,8 @@ export const emptySearchFilters = (): SearchFiltersState => ({
 /** Проверяет, заданы ли какие-либо фильтры (кроме валюты по умолчанию) */
 export function hasAnyFilters(s: SearchFiltersState): boolean {
   return (
-    s.area !== "" ||
+    s.area.length > 0 ||
+    s.professional_role.length > 0 ||
     s.experience !== "" ||
     s.gender !== "" ||
     s.age_from.trim() !== "" ||
@@ -55,7 +58,30 @@ export function filtersFromApiPayload(
   if (!payload || typeof payload !== "object") return base;
   const p = payload as Record<string, unknown>;
   if (typeof p.area === "number" && Number.isFinite(p.area)) {
-    base.area = p.area;
+    base.area = [p.area];
+  } else if (Array.isArray(p.area)) {
+    const areaIds = Array.from(
+      new Set(
+        p.area.filter((x): x is number => typeof x === "number" && Number.isFinite(x)),
+      ),
+    );
+    if (areaIds.length > 0) {
+      base.area = areaIds;
+    }
+  }
+  if (typeof p.professional_role === "number" && Number.isFinite(p.professional_role)) {
+    base.professional_role = [p.professional_role];
+  } else if (Array.isArray(p.professional_role)) {
+    const roleIds = Array.from(
+      new Set(
+        p.professional_role.filter(
+          (x): x is number => typeof x === "number" && Number.isFinite(x),
+        ),
+      ),
+    );
+    if (roleIds.length > 0) {
+      base.professional_role = roleIds;
+    }
   }
   if (typeof p.experience === "string" && EXP_BUCKETS.includes(p.experience as ExperienceBucket)) {
     base.experience = p.experience as ExperienceBucket;
@@ -80,7 +106,8 @@ export function filtersToApiPayload(
   s: SearchFiltersState,
 ): Record<string, unknown> | undefined {
   const out: Record<string, unknown> = {};
-  if (s.area !== "") out.area = s.area;
+  if (s.area.length > 0) out.area = s.area;
+  if (s.professional_role.length > 0) out.professional_role = s.professional_role;
   if (s.experience !== "") out.experience = s.experience;
   if (s.gender !== "") out.gender = s.gender;
   if (s.age_from.trim() !== "") {
@@ -104,6 +131,7 @@ export function filtersToApiPayload(
 }
 
 export type HhAreaOption = { id: number; name: string };
+export type HhProfessionalRoleOption = { id: number; name: string };
 
 /** Если API справочника недоступен */
 export const FALLBACK_AREA_OPTIONS: HhAreaOption[] = [
@@ -193,7 +221,7 @@ export function partialFiltersFromParsedParams(
   const region = p.region;
   if (typeof region === "string" && region.trim()) {
     const id = findAreaIdByRegionName(region, areas);
-    if (id !== undefined) out.area = id;
+    if (id !== undefined) out.area = [id];
   }
   const expMin = p.experience_years_min;
   if (typeof expMin === "number" && Number.isFinite(expMin)) {
@@ -219,7 +247,7 @@ export function mergeNlpIntoFilters(
   partial: Partial<SearchFiltersState>,
 ): SearchFiltersState {
   const next = { ...prev };
-  if (partial.area !== undefined && prev.area === "") {
+  if (partial.area !== undefined && prev.area.length === 0) {
     next.area = partial.area as SearchFiltersState["area"];
   }
   if (partial.experience !== undefined && prev.experience === "") {
@@ -259,17 +287,35 @@ const GENDER_LABELS: Record<"male" | "female", string> = {
 export function filtersToReadableSummary(
   f: SearchFiltersState,
   areaLabels?: Map<number, string>,
+  roleLabels?: Map<number, string>,
 ): string[] {
   const out: string[] = [];
-  if (f.area !== "") {
-    const fromMap = areaLabels?.get(f.area);
-    const fromFallback = FALLBACK_AREA_OPTIONS.find((a) => a.id === f.area)?.name;
-    const areaLabel = fromMap ?? fromFallback;
-    if (areaLabel) out.push(areaLabel);
-    else out.push(`Регион №${f.area}`);
+  if (f.area.length > 0) {
+    const areaLabelsResolved = f.area.map((areaId) => {
+      const fromMap = areaLabels?.get(areaId);
+      const fromFallback = FALLBACK_AREA_OPTIONS.find((a) => a.id === areaId)?.name;
+      return fromMap ?? fromFallback ?? `Регион №${areaId}`;
+    });
+    if (areaLabelsResolved.length <= 3) {
+      out.push(`Регионы: ${areaLabelsResolved.join(", ")}`);
+    } else {
+      const visible = areaLabelsResolved.slice(0, 3).join(", ");
+      out.push(`Регионы: ${visible} +${areaLabelsResolved.length - 3}`);
+    }
   }
   if (f.experience !== "") {
     out.push(EXPERIENCE_LABELS[f.experience]);
+  }
+  if (f.professional_role.length > 0) {
+    const roleLabelsResolved = f.professional_role.map(
+      (roleId) => roleLabels?.get(roleId) ?? `Роль #${roleId}`,
+    );
+    if (roleLabelsResolved.length <= 3) {
+      out.push(`Роли: ${roleLabelsResolved.join(", ")}`);
+    } else {
+      const visible = roleLabelsResolved.slice(0, 3).join(", ");
+      out.push(`Роли: ${visible} +${roleLabelsResolved.length - 3}`);
+    }
   }
   if (f.gender !== "") {
     out.push(GENDER_LABELS[f.gender]);

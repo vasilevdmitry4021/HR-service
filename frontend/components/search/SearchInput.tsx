@@ -63,11 +63,6 @@ export function SearchInput(props: {
           </Button>
         </div>
       </div>
-      <div className="flex items-center gap-2 text-xs text-muted-foreground">
-        <span>Enter — новая строка</span>
-        <span className="text-border">•</span>
-        <span>Ctrl+Enter — запуск поиска</span>
-      </div>
       {(parsing || loading) && (
         <div className="flex items-center gap-2 text-sm text-muted-foreground animate-fade-in" role="status">
           <div className="h-1 w-1 rounded-full bg-primary animate-pulse" />

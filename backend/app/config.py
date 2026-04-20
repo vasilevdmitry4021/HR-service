@@ -113,6 +113,8 @@ class Settings(BaseSettings):
     search_max_resumes_fetch_per_search: int = 1000
     search_hh_page_size: int = 50
     search_recall_target_min: int = 60
+    # Для запросов с зафиксированным регионом допустим меньший recall-порог.
+    search_recall_target_min_with_area: int = 40
     search_recall_target_max: int = 300
     search_max_recall: int = 300
     search_bonus_share_max: float = 0.2
@@ -121,8 +123,11 @@ class Settings(BaseSettings):
     skill_synonyms_per_canonical_max: int = 8
     hh_query_use_search_field: bool = False
     hh_query_relax_max_steps: int = 3
+    hh_query_relax_max_steps_with_area: int = 2
     hh_query_max_text_length: int = 1500
     feature_hh_auto_professional_role: bool = False
+    hh_professional_roles_timeout_seconds: float = 3.0
+    hh_professional_roles_cache_ttl_seconds: int = 900
     # Формат: "10=аналитик|business analyst;96=разработчик|developer"
     hh_auto_professional_role_map: str = ""
     # Максимум резюме с подгрузкой полных данных (опыт, «о себе») на этапе evaluate
@@ -130,9 +135,16 @@ class Settings(BaseSettings):
     evaluate_enrich_concurrency: int = 5
     evaluate_progress_ttl_seconds: int = 1800
     evaluate_interactive_top_n: int = 60
-    llm_prescore_interactive_max_seconds: float = 12.0
-    llm_prescore_background_max_seconds: float = 45.0
+    # Бюджет времени фаз pre-score:
+    # > 0 — ограничение в секундах, <= 0 — без ограничения по времени.
+    llm_prescore_interactive_max_seconds: float = 120.0
+    llm_prescore_background_max_seconds: float = 900.0
     llm_prescore_refill_min_gain: int = 1
+    llm_prescore_recovery_enabled: bool = True
+    llm_prescore_single_retry_max_attempts: int = 3
+    llm_prescore_recovery_max_depth: int = 10
+    llm_prescore_partial_status_on_timeout: bool = True
+    llm_prescore_single_timeout_seconds: float = 240.0
     llm_prescore_enable_fallback: bool = False
     llm_prescore_fallback_min_score: int = 20
     llm_prescore_fallback_max_score: int = 95
