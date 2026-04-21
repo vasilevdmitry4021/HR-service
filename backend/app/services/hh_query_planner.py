@@ -169,6 +169,8 @@ def _apply_length_guard(base: HHQueryPlan, max_length: int) -> list[HHQueryPlan]
 
 def _flatten_skill_terms(skill_obj: dict[str, Any], expanded_synonyms: dict[str, list[str]]) -> list[str]:
     canonical = str(skill_obj.get("canonical") or "").strip()
+    if not settings.feature_skill_synonyms_enabled:
+        return [canonical] if canonical else []
     raw_synonyms = skill_obj.get("synonyms")
     synonyms = [str(s).strip() for s in raw_synonyms] if isinstance(raw_synonyms, list) else []
     merged = [canonical, *synonyms, *(expanded_synonyms.get(canonical, []) or [])]

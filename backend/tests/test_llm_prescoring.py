@@ -136,7 +136,7 @@ def test_prescore_keeps_raw_llm_scores(monkeypatch) -> None:
     assert stats["status"] == "done"
 
 
-def test_format_prescore_header_includes_expanded_synonyms() -> None:
+def test_format_prescore_header_ignores_expanded_synonyms() -> None:
     requirements = {
         "position_keywords": ["Python Developer"],
         "skills": ["Python", "FastAPI"],
@@ -148,13 +148,10 @@ def test_format_prescore_header_includes_expanded_synonyms() -> None:
         },
     }
     header = llm_prescoring._format_prescore_header(requirements)
-    assert "Python" in header["synonyms_summary"]
-    assert "питон" in header["synonyms_summary"]
-    assert "FastAPI" in header["synonyms_summary"]
-    assert header["synonyms_summary"] != "нет"
+    assert "synonyms_summary" not in header
 
 
-def test_format_prescore_header_no_synonyms() -> None:
+def test_format_prescore_header_without_synonyms_field() -> None:
     requirements = {"position_keywords": ["Developer"], "skills": ["Python"]}
     header = llm_prescoring._format_prescore_header(requirements)
-    assert header["synonyms_summary"] == "нет"
+    assert "synonyms_summary" not in header

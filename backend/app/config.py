@@ -119,6 +119,8 @@ class Settings(BaseSettings):
     search_max_recall: int = 300
     search_bonus_share_max: float = 0.2
     search_bonus_guard_top_n: int = 30
+    # Глобальный флаг: при false навыки обрабатываются только по canonical без синонимов/эквивалентов.
+    feature_skill_synonyms_enabled: bool = False
     skill_synonyms_ttl_days: int = 30
     skill_synonyms_per_canonical_max: int = 8
     hh_query_use_search_field: bool = False

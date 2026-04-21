@@ -33,6 +33,12 @@ def _normalize_currency(val: Any) -> str | None:
     return cur
 
 
+def _normalize_skill_value(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return re.sub(r"\s+", " ", value.strip().lower())
+
+
 def _passes_experience(resume: dict[str, Any], exp_min: int | None) -> bool:
     if exp_min is None:
         return True
@@ -86,7 +92,7 @@ def _passes_salary(
 def _passes_skills(resume: dict[str, Any], required_skills: list[str] | None) -> bool:
     """
     Проверяет, что у кандидата есть хотя бы один из требуемых навыков.
-    Использует синонимы для корректного сопоставления.
+    Сопоставляет только точные canonical-названия навыков.
     
     Если у резюме нет навыков (HH не вернул их в списке поиска), 
     кандидат пропускается — фильтрация невозможна.
@@ -96,12 +102,12 @@ def _passes_skills(resume: dict[str, Any], required_skills: list[str] | None) ->
     resume_skills = resume.get("skills") or []
     if not resume_skills:
         return True
-    resume_skills_expanded = skill_synonyms.expand_skills_for_matching(resume_skills)
+    resume_skill_set = {_normalize_skill_value(skill) for skill in resume_skills if _normalize_skill_value(skill)}
     for req_skill in required_skills:
-        if not req_skill:
+        req_norm = _normalize_skill_value(req_skill)
+        if not req_norm:
             continue
-        req_expanded = skill_synonyms.expand_skill(req_skill)
-        if req_expanded & resume_skills_expanded:
+        if req_norm in resume_skill_set:
             return True
     return False
 
@@ -116,12 +122,12 @@ def _skills_mismatch(resume: dict[str, Any], required_skills: list[str] | None) 
     resume_skills = resume.get("skills") or []
     if not resume_skills:
         return False
-    resume_skills_expanded = skill_synonyms.expand_skills_for_matching(resume_skills)
+    resume_skill_set = {_normalize_skill_value(skill) for skill in resume_skills if _normalize_skill_value(skill)}
     for req_skill in required_skills:
-        if not req_skill:
+        req_norm = _normalize_skill_value(req_skill)
+        if not req_norm:
             continue
-        req_expanded = skill_synonyms.expand_skill(req_skill)
-        if req_expanded & resume_skills_expanded:
+        if req_norm in resume_skill_set:
             return False
     return True
 

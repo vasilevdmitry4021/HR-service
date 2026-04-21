@@ -139,14 +139,13 @@ def test_apply_strict_filters_skills_no_match() -> None:
 
 
 def test_apply_strict_filters_skills_synonym() -> None:
-    """Навыки сопоставляются с учётом синонимов (js = javascript)."""
+    """Синонимы навыков не учитываются: js не заменяет JavaScript."""
     items = [
         {"id": "1", "skills": ["js", "React"], "title": "Frontend Developer"},
     ]
     parsed = {"skills": ["JavaScript"]}
     out = post_filter.apply_strict_filters(items, parsed, mode="hide")
-    assert len(out) == 1
-    assert out[0]["id"] == "1"
+    assert len(out) == 0
 
 
 def test_apply_strict_filters_position_match() -> None:

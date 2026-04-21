@@ -7,6 +7,7 @@ from app.services import skill_expansion
 
 
 def test_expand_skills_cache_hit_uses_db_without_llm(db_session, monkeypatch) -> None:
+    monkeypatch.setattr(skill_expansion.settings, "feature_skill_synonyms_enabled", True)
     db_session.add(
         SkillSynonym(
             canonical_norm="python",
@@ -24,6 +25,7 @@ def test_expand_skills_cache_hit_uses_db_without_llm(db_session, monkeypatch) ->
 
 
 def test_expand_skills_ttl_expired_calls_llm_and_updates(db_session, monkeypatch) -> None:
+    monkeypatch.setattr(skill_expansion.settings, "feature_skill_synonyms_enabled", True)
     db_session.add(
         SkillSynonym(
             canonical_norm="kafka",
@@ -49,6 +51,7 @@ def test_expand_skills_ttl_expired_calls_llm_and_updates(db_session, monkeypatch
 
 
 def test_expand_skills_manual_overrides_llm(db_session, monkeypatch) -> None:
+    monkeypatch.setattr(skill_expansion.settings, "feature_skill_synonyms_enabled", True)
     db_session.add(
         SkillSynonym(
             canonical_norm="react",
@@ -70,6 +73,7 @@ def test_expand_skills_manual_overrides_llm(db_session, monkeypatch) -> None:
 
 
 def test_sanity_filter_removes_noise(monkeypatch) -> None:
+    monkeypatch.setattr(skill_expansion.settings, "feature_skill_synonyms_enabled", True)
     monkeypatch.setattr(skill_expansion.settings, "skill_synonyms_per_canonical_max", 4)
     clean = skill_expansion._sanitize_synonyms(
         "Python",
@@ -80,12 +84,14 @@ def test_sanity_filter_removes_noise(monkeypatch) -> None:
 
 
 def test_skill_hard_confidence_manual_source_boosts_score() -> None:
+    # Функция независимо от глобального флага оценивает качество подготовленных эквивалентов.
     base = skill_expansion.skill_hard_confidence("Kafka", ["Apache Kafka"], manual_source=False)
     boosted = skill_expansion.skill_hard_confidence("Kafka", ["Apache Kafka"], manual_source=True)
     assert boosted > base
 
 
-def test_classify_parsed_skills_demotes_risky_must() -> None:
+def test_classify_parsed_skills_demotes_risky_must(monkeypatch) -> None:
+    monkeypatch.setattr(skill_expansion.settings, "feature_skill_synonyms_enabled", True)
     parsed = {
         "must_skills": [
             {"canonical": "Python", "synonyms": [], "intent_strength": "required", "query_confidence": 0.9},

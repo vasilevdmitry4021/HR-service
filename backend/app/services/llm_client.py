@@ -37,9 +37,9 @@ SYSTEM_PROMPT = """Ты — ассистент для парсинга HR-зап
 {
   "skills": [],
   "must_position": [],
-  "must_skills": [{"canonical": "", "synonyms": [], "search_equivalents": [], "intent_strength": "required|preferred|signal", "query_confidence": 0.0}],
-  "should_skills": [{"canonical": "", "synonyms": [], "search_equivalents": [], "intent_strength": "required|preferred|signal", "query_confidence": 0.0}],
-  "semantic_skills": [{"canonical": "", "search_equivalents": [], "intent_strength": "required|preferred|signal", "query_confidence": 0.0}],
+  "must_skills": [{"canonical": "", "intent_strength": "required|preferred|signal", "query_confidence": 0.0}],
+  "should_skills": [{"canonical": "", "intent_strength": "required|preferred|signal", "query_confidence": 0.0}],
+  "semantic_skills": [{"canonical": "", "intent_strength": "required|preferred|signal", "query_confidence": 0.0}],
   "soft_signals": [],
   "experience_years_min": null,
   "experience_years_max": null,
@@ -73,7 +73,6 @@ SYSTEM_PROMPT = """Ты — ассистент для парсинга HR-зап
 - must_position: жёсткая роль (основная должность) и 2-4 синонима; дублирует основную роль для boolean-планировщика.
 - semantic_skills: основной семантический массив навыков. Для каждого навыка:
   canonical — каноническая профессиональная формулировка;
-  search_equivalents — 2-8 рыночных формулировок для HH (включая RU/EN варианты);
   intent_strength — required|preferred|signal по намерению пользователя;
   query_confidence — уверенность в интерпретации 0..1.
 - must_skills / should_skills: backward-compatible поля; заполняй на основе semantic_skills.
@@ -627,6 +626,7 @@ def _normalize_skill_groups(raw_groups: Any) -> list[dict[str, Any]]:
         return []
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
+    synonyms_enabled = bool(settings.feature_skill_synonyms_enabled)
     intent_aliases = {
         "must": "required",
         "required": "required",
@@ -646,12 +646,13 @@ def _normalize_skill_groups(raw_groups: Any) -> list[dict[str, Any]]:
         query_confidence: float | None = None
         if isinstance(item, dict):
             canonical = str(item.get("canonical") or "").strip()
-            raw_syn = item.get("synonyms")
-            if isinstance(raw_syn, list):
-                synonyms = [str(s).strip() for s in raw_syn if str(s).strip()]
-            raw_eq = item.get("search_equivalents")
-            if isinstance(raw_eq, list):
-                search_equivalents = [str(s).strip() for s in raw_eq if str(s).strip()]
+            if synonyms_enabled:
+                raw_syn = item.get("synonyms")
+                if isinstance(raw_syn, list):
+                    synonyms = [str(s).strip() for s in raw_syn if str(s).strip()]
+                raw_eq = item.get("search_equivalents")
+                if isinstance(raw_eq, list):
+                    search_equivalents = [str(s).strip() for s in raw_eq if str(s).strip()]
             raw_intent = str(item.get("intent_strength") or "").strip().lower()
             intent_strength = intent_aliases.get(raw_intent)
             raw_conf = item.get("query_confidence")
@@ -726,6 +727,7 @@ def _score_skill_hard_confidence(canonical: str, synonyms: list[str]) -> float:
 def _merge_skill_groups(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
+    synonyms_enabled = bool(settings.feature_skill_synonyms_enabled)
     for bucket in groups:
         for item in bucket:
             canonical = str(item.get("canonical") or "").strip()
@@ -737,11 +739,17 @@ def _merge_skill_groups(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
             seen.add(key)
             skill_obj: dict[str, Any] = {
                 "canonical": canonical,
-                "synonyms": [str(s).strip() for s in (item.get("synonyms") or []) if str(s).strip()],
+                "synonyms": (
+                    [str(s).strip() for s in (item.get("synonyms") or []) if str(s).strip()]
+                    if synonyms_enabled
+                    else []
+                ),
             }
-            search_equivalents = [
-                str(s).strip() for s in (item.get("search_equivalents") or []) if str(s).strip()
-            ]
+            search_equivalents = (
+                [str(s).strip() for s in (item.get("search_equivalents") or []) if str(s).strip()]
+                if synonyms_enabled
+                else []
+            )
             if search_equivalents:
                 skill_obj["search_equivalents"] = search_equivalents
             intent_strength = str(item.get("intent_strength") or "").strip()
@@ -762,12 +770,19 @@ def _split_hard_and_risky(
     hard: list[dict[str, Any]] = []
     risky: list[dict[str, Any]] = []
     profile: list[dict[str, Any]] = []
+    synonyms_enabled = bool(settings.feature_skill_synonyms_enabled)
     for item in groups:
         canonical = str(item.get("canonical") or "").strip()
-        synonyms = [str(s).strip() for s in (item.get("synonyms") or []) if str(s).strip()]
-        search_equivalents = [
-            str(s).strip() for s in (item.get("search_equivalents") or []) if str(s).strip()
-        ]
+        synonyms = (
+            [str(s).strip() for s in (item.get("synonyms") or []) if str(s).strip()]
+            if synonyms_enabled
+            else []
+        )
+        search_equivalents = (
+            [str(s).strip() for s in (item.get("search_equivalents") or []) if str(s).strip()]
+            if synonyms_enabled
+            else []
+        )
         if not canonical:
             continue
         llm_conf = item.get("query_confidence")
@@ -815,15 +830,20 @@ def _normalize_llm_output(raw: dict[str, Any]) -> dict[str, Any]:
         sem_should: list[dict[str, Any]] = []
         sem_soft: list[str] = []
         semantic_profile: list[dict[str, Any]] = []
+        synonyms_enabled = bool(settings.feature_skill_synonyms_enabled)
         for skill in semantic_skills:
             canonical = str(skill.get("canonical") or "").strip()
             if not canonical:
                 continue
-            equivalents = [
-                str(x).strip()
-                for x in (skill.get("search_equivalents") or skill.get("synonyms") or [])
-                if str(x).strip()
-            ]
+            equivalents = (
+                [
+                    str(x).strip()
+                    for x in (skill.get("search_equivalents") or skill.get("synonyms") or [])
+                    if str(x).strip()
+                ]
+                if synonyms_enabled
+                else []
+            )
             intent = str(skill.get("intent_strength") or "preferred").strip().lower()
             confidence_raw = skill.get("query_confidence")
             confidence = (
@@ -834,7 +854,7 @@ def _normalize_llm_output(raw: dict[str, Any]) -> dict[str, Any]:
             is_risky = any(rx.search(canonical.lower()) for rx in _RISKY_SKILL_PATTERNS)
             normalized_skill = {
                 "canonical": canonical,
-                "synonyms": list(skill.get("synonyms") or []),
+                "synonyms": list(skill.get("synonyms") or []) if synonyms_enabled else [],
                 "search_equivalents": equivalents,
                 "intent_strength": intent,
                 "query_confidence": round(confidence, 3),

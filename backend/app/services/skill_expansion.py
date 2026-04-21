@@ -153,6 +153,7 @@ def classify_parsed_skills(
     *,
     expansion_stats: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    synonyms_enabled = bool(settings.feature_skill_synonyms_enabled)
     must_skills = parsed.get("must_skills")
     if not isinstance(must_skills, list):
         must_skills = []
@@ -186,11 +187,15 @@ def classify_parsed_skills(
         fallback_intent: str,
     ) -> tuple[str, dict[str, Any], dict[str, Any]]:
         canonical = str(item.get("canonical") or "").strip()
-        own_synonyms = _as_string_list(item.get("synonyms"))
-        own_equivalents = _as_string_list(item.get("search_equivalents"))
-        merged_equivalents = _sanitize_equivalents(
-            canonical,
-            [*own_synonyms, *own_equivalents, *(expanded_synonyms.get(canonical, []) or [])],
+        own_synonyms = _as_string_list(item.get("synonyms")) if synonyms_enabled else []
+        own_equivalents = _as_string_list(item.get("search_equivalents")) if synonyms_enabled else []
+        merged_equivalents = (
+            _sanitize_equivalents(
+                canonical,
+                [*own_synonyms, *own_equivalents, *(expanded_synonyms.get(canonical, []) or [])],
+            )
+            if synonyms_enabled
+            else []
         )
         stat_row = hardness_stats.get(_norm(canonical)) or hardness_stats.get(canonical) or {}
         manual_boost = bool(stat_row.get("manual_source"))
@@ -203,7 +208,7 @@ def classify_parsed_skills(
         if query_confidence is None:
             query_confidence = hard_confidence
         intent = _normalize_intent(item.get("intent_strength"), fallback=fallback_intent)
-        eq_quality = min(1.0, len(merged_equivalents) / 3.0)
+        eq_quality = 1.0 if not synonyms_enabled else min(1.0, len(merged_equivalents) / 3.0)
         semantic_confidence = max(
             0.0,
             min(1.0, 0.55 * query_confidence + 0.3 * hard_confidence + 0.15 * eq_quality),
@@ -211,7 +216,7 @@ def classify_parsed_skills(
         is_risky = any(rx.search(_norm(canonical)) for rx in _RISKY_SKILL_PATTERNS)
         if intent == "signal" or semantic_confidence < 0.28:
             bucket = "soft"
-        elif intent == "required" and semantic_confidence >= 0.64 and eq_quality >= 0.2 and not (
+        elif intent == "required" and semantic_confidence >= 0.64 and (not synonyms_enabled or eq_quality >= 0.2) and not (
             is_risky and semantic_confidence < 0.82
         ):
             bucket = "must"
@@ -375,6 +380,8 @@ def expand_skills_with_stats(
         "llm_call_count": 0,
         "skill_hardness": {},
     }
+    if not settings.feature_skill_synonyms_enabled:
+        return {}, stats
 
     by_norm: dict[str, str] = {}
     for skill in canonicals:

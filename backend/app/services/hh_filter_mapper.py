@@ -259,6 +259,9 @@ def _skill_terms_from_parsed(parsed: dict[str, Any]) -> list[str]:
             semantic_skill_groups.extend([x for x in raw_groups if isinstance(x, dict)])
     for item in semantic_skill_groups:
         canonical = str(item.get("canonical") or "").strip()
+        if canonical and not settings.feature_skill_synonyms_enabled:
+            add_term(canonical)
+            continue
         equivalents = item.get("search_equivalents")
         eq_terms = (
             [str(x).strip() for x in equivalents if str(x).strip()]

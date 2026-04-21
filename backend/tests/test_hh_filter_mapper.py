@@ -102,7 +102,7 @@ def test_resume_search_text_prefers_hard_skills_over_legacy_skills() -> None:
     assert "вайбкодинг" not in text
 
 
-def test_resume_search_text_uses_semantic_canonical_equivalents() -> None:
+def test_resume_search_text_uses_semantic_canonical_only() -> None:
     parsed = {
         "position_keywords": ["Python developer"],
         "must_skills": [
@@ -115,8 +115,8 @@ def test_resume_search_text_uses_semantic_canonical_equivalents() -> None:
     }
     text = resume_search_text_for_hh(parsed)
     assert text is not None
-    assert "курсорить" not in text
-    assert "AI-assisted coding" in text
+    assert "курсорить" in text
+    assert "AI-assisted coding" not in text
 
 
 def test_merge_prefers_query_plan_text() -> None:
