@@ -99,10 +99,16 @@ def _analyze_progress_out_from_state(state: dict[str, Any], job_id: str) -> Anal
         job_id=str(state.get("job_id") or job_id),
         status=str(state.get("status") or "queued"),
         stage=str(state.get("stage") or "queued"),
+        phase=str(state.get("phase") or "queued"),
         total_count=int(state.get("total_count") or 0),
         processed_count=int(state.get("processed_count") or 0),
         analyzed_count=int(state.get("analyzed_count") or 0),
+        phase_total_count=int(state.get("phase_total_count") or 0),
+        phase_done_count=int(state.get("phase_done_count") or 0),
+        enriched_count=int(state.get("enriched_count") or 0),
+        progress_percent=float(state.get("progress_percent") or 0.0),
         analyses=dict(state.get("analyses") or {}),
+        metrics=dict(state.get("metrics") or {}),
         processing_time_seconds=state.get("processing_time_seconds"),
         error=state.get("error"),
     )
@@ -511,21 +517,49 @@ async def _run_analyze_job(
 
         def _progress(evt: dict[str, Any]) -> None:
             stage = str(evt.get("stage") or "running")
-            if stage == "start":
+            if stage in {"start", "enriching"}:
                 stage = "preparing"
+            elif stage in {"running", "finalizing", "done"}:
+                stage = stage
             processed = int(evt.get("processed_count") or 0)
             analyzed = int(evt.get("analyzed_count") or 0)
+            phase = str(evt.get("phase") or "").strip() or None
+            phase_total_count = (
+                int(evt.get("phase_total_count"))
+                if evt.get("phase_total_count") is not None
+                else None
+            )
+            phase_done_count = (
+                int(evt.get("phase_done_count"))
+                if evt.get("phase_done_count") is not None
+                else None
+            )
+            progress_percent = (
+                float(evt.get("progress_percent"))
+                if evt.get("progress_percent") is not None
+                else None
+            )
+            enriched_count = (
+                int(evt.get("enriched_count"))
+                if evt.get("enriched_count") is not None
+                else None
+            )
             analyze_progress.update_progress(
                 job_id,
                 stage=stage,
                 processed_count=processed,
                 analyzed_count=analyzed,
+                phase=phase,
+                phase_total_count=phase_total_count,
+                phase_done_count=phase_done_count,
+                enriched_count=enriched_count,
+                progress_percent=progress_percent,
             )
             delta = evt.get("analyses_delta")
             if isinstance(delta, dict) and delta:
                 analyze_progress.add_partial_analyses(job_id, delta)
 
-        updated = await llm_evaluation.analyze_top_resumes(
+        analyze_result = await llm_evaluation.analyze_top_resumes(
             access,
             list(snap.items),
             parsed,
@@ -535,6 +569,10 @@ async def _run_analyze_job(
             db=db,
             progress_callback=_progress,
         )
+        if isinstance(analyze_result, tuple):
+            updated, analyze_metrics = analyze_result
+        else:
+            updated, analyze_metrics = analyze_result, {}
         processed_count = min(len(updated), max(1, int(top_n)))
         analyzed_n = sum(1 for x in updated if x.get("llm_analysis"))
         new_snap = SearchSnapshotData(
@@ -555,6 +593,7 @@ async def _run_analyze_job(
             processed_count=processed_count,
             analyzed_count=analyzed_n,
             processing_time_seconds=time.monotonic() - started,
+            metrics=analyze_metrics,
         )
     except asyncio.CancelledError:
         logger.info("Фоновый анализ снимка отменен пользователем: job_id=%s", job_id)
@@ -911,7 +950,7 @@ async def analyze_resumes(
     top_n = body.top_n
     t0 = time.monotonic()
     try:
-        updated = await llm_evaluation.analyze_top_resumes(
+        analyze_result = await llm_evaluation.analyze_top_resumes(
             access,
             list(snap.items),
             parsed,
@@ -920,6 +959,10 @@ async def analyze_resumes(
             top_n=top_n,
             db=db,
         )
+        if isinstance(analyze_result, tuple):
+            updated, analyze_metrics = analyze_result
+        else:
+            updated, analyze_metrics = analyze_result, {}
     except HHClientError as exc:
         detail = exc.detail
         if is_daily_view_limit_error(exc.detail):
@@ -959,6 +1002,7 @@ async def analyze_resumes(
         items=items_out,
         analyzed_count=analyzed_n,
         processing_time_seconds=round(elapsed, 3),
+        metrics=analyze_metrics,
     )
 
 
@@ -1067,8 +1111,13 @@ async def analyze_resumes_start(
     analyze_progress.update_progress(
         job_id,
         stage="queued",
+        phase="queued",
         processed_count=0,
         analyzed_count=0,
+        phase_total_count=0,
+        phase_done_count=0,
+        enriched_count=0,
+        progress_percent=0.0,
     )
     task = asyncio.create_task(
         _run_analyze_job(

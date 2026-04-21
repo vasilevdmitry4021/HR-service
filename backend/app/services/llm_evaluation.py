@@ -186,6 +186,8 @@ async def _enrich_resumes_for_llm(
     cache_user_id: uuid.UUID,
     max_enrich: int | None = None,
     db: Session | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    progress_phase: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     enriched: list[dict[str, Any] | None] = [None] * len(resumes)
     candidates_to_fetch: list[tuple[int, dict[str, Any], str]] = []
@@ -193,28 +195,51 @@ async def _enrich_resumes_for_llm(
     cache_hit = 0
     cache_miss = 0
     enrich_count = 0
+    enrich_done = 0
+    enrich_total = len(resumes)
+
+    def _publish_enrich_progress() -> None:
+        if progress_callback is None or not progress_phase:
+            return
+        progress_callback(
+            {
+                "stage": "enriching",
+                "phase": progress_phase,
+                "phase_total_count": enrich_total,
+                "phase_done_count": enrich_done,
+            }
+        )
 
     for idx, r in enumerate(resumes):
         rid = _resume_row_id(r)
         if not rid:
             enriched[idx] = r
+            enrich_done += 1
+            _publish_enrich_progress()
             continue
         if r.get("work_experience") and r.get("about"):
             enriched[idx] = r
+            enrich_done += 1
+            _publish_enrich_progress()
             continue
         cached = resume_cache.get_cached_resume(cache_user_id, rid)
         if cached:
             cache_hit += 1
             enriched[idx] = {**r, **cached}
+            enrich_done += 1
+            _publish_enrich_progress()
             continue
         cache_miss += 1
         if enrich_count >= max_fetch:
             enriched[idx] = r
+            enrich_done += 1
+            _publish_enrich_progress()
             continue
         enrich_count += 1
         candidates_to_fetch.append((idx, r, rid))
 
     async def _fetch_one(idx: int, base_row: dict[str, Any], rid: str) -> None:
+        nonlocal enrich_done
         try:
             full = await hh_client.fetch_resume(
                 access_token,
@@ -233,6 +258,9 @@ async def _enrich_resumes_for_llm(
         except Exception as e:
             logger.warning("Не удалось подгрузить полное резюме %s: %s", rid, e)
             enriched[idx] = base_row
+        finally:
+            enrich_done += 1
+            _publish_enrich_progress()
 
     if candidates_to_fetch:
         # Выполняем последовательно: после обнаружения лимита HH прекращаем дальнейшие fetch_resume.
@@ -338,6 +366,11 @@ async def evaluate_all_resumes(
             "avg_prompt_chars": 0,
             "parse_fail_count": 0,
             "refill_gain_ratio": 0.0,
+            "prescore_mode": "chat_legacy",
+            "rerank_calls_total": 0,
+            "rerank_batch_split_count": 0,
+            "rerank_avg_score": 0.0,
+            "rerank_raw_avg_relevance": 0.0,
             "cache_hit": 0,
             "cache_miss": 0,
             "hh_fetch_count": 0,
@@ -377,6 +410,11 @@ async def evaluate_all_resumes(
                 "avg_prompt_chars": 0,
                 "parse_fail_count": 0,
                 "refill_gain_ratio": 0.0,
+                "prescore_mode": "chat_legacy",
+                "rerank_calls_total": 0,
+                "rerank_batch_split_count": 0,
+                "rerank_avg_score": 0.0,
+                "rerank_raw_avg_relevance": 0.0,
                 "cache_hit": 0,
                 "cache_miss": 0,
                 "hh_fetch_count": 0,
@@ -475,6 +513,11 @@ async def evaluate_all_resumes(
             "avg_prompt_chars": int(phase_prescore_stats.get("avg_prompt_chars") or 0),
             "parse_fail_count": int(phase_prescore_stats.get("parse_fail_count") or 0),
             "refill_gain_ratio": float(phase_prescore_stats.get("refill_gain_ratio") or 0.0),
+            "prescore_mode": str(phase_prescore_stats.get("prescore_mode") or "chat_legacy"),
+            "rerank_calls_total": int(phase_prescore_stats.get("rerank_calls_total") or 0),
+            "rerank_batch_split_count": int(phase_prescore_stats.get("rerank_batch_split_count") or 0),
+            "rerank_avg_score": float(phase_prescore_stats.get("rerank_avg_score") or 0.0),
+            "rerank_raw_avg_relevance": float(phase_prescore_stats.get("rerank_raw_avg_relevance") or 0.0),
             "cache_hit": int(enrich_stats.get("cache_hit") or 0),
             "cache_miss": int(enrich_stats.get("cache_miss") or 0),
             "hh_fetch_count": int(enrich_stats.get("hh_fetch_count") or 0),
@@ -562,6 +605,16 @@ async def evaluate_all_resumes(
         status = "error"
     else:
         status = "partial"
+    interactive_mode = str(interactive_stats["prescore_mode"])
+    background_mode = str(background_stats["prescore_mode"])
+    if interactive_mode == background_mode:
+        prescore_mode = interactive_mode
+    elif int(background_stats["llm_calls_total"]) == 0:
+        prescore_mode = interactive_mode
+    elif int(interactive_stats["llm_calls_total"]) == 0:
+        prescore_mode = background_mode
+    else:
+        prescore_mode = "mixed"
     return [t[0] for t in rows], {
         "status": status,
         "enrichment_elapsed_ms": int(interactive_stats["enrichment_elapsed_ms"] + background_stats["enrichment_elapsed_ms"]),
@@ -600,6 +653,26 @@ async def evaluate_all_resumes(
             / 2,
             4,
         ),
+        "prescore_mode": prescore_mode,
+        "rerank_calls_total": int(interactive_stats["rerank_calls_total"] + background_stats["rerank_calls_total"]),
+        "rerank_batch_split_count": int(
+            interactive_stats["rerank_batch_split_count"] + background_stats["rerank_batch_split_count"]
+        ),
+        "rerank_avg_score": round(
+            (
+                float(interactive_stats["rerank_avg_score"]) + float(background_stats["rerank_avg_score"])
+            )
+            / 2,
+            4,
+        ),
+        "rerank_raw_avg_relevance": round(
+            (
+                float(interactive_stats["rerank_raw_avg_relevance"])
+                + float(background_stats["rerank_raw_avg_relevance"])
+            )
+            / 2,
+            6,
+        ),
         "cache_hit": int(interactive_stats["cache_hit"] + background_stats["cache_hit"]),
         "cache_miss": int(interactive_stats["cache_miss"] + background_stats["cache_miss"]),
         "hh_fetch_count": int(interactive_stats["hh_fetch_count"] + background_stats["hh_fetch_count"]),
@@ -627,13 +700,33 @@ async def analyze_top_resumes(
     top_n: int,
     db: Session,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """
     Берёт топ-N по llm_score (нужна предварительная оценка), детальный LLM, кэш, обновление llm_analysis.
     """
     if not items:
-        return []
+        return [], {
+            "detailed_total_ms": 0,
+            "detailed_enrich_ms": 0,
+            "detailed_analyze_ms": 0,
+            "detailed_batch_count": 0,
+            "detailed_batch_parse_fail_count": 0,
+            "detailed_fallback_single_resume_count": 0,
+            "detailed_prompt_chars_avg": 0,
+            "detailed_prompt_chars_max": 0,
+            "detailed_peak_concurrency": 0,
+            "detailed_batch_size": 0,
+            "detailed_analyze_concurrency": 0,
+            "detailed_parse_fail_ratio": 0.0,
+            "detailed_json_stability_ok": True,
+            "hh_enrichment_cache_hit": 0,
+            "hh_enrichment_cache_miss": 0,
+            "hh_enrichment_fetch_count": 0,
+            "hh_enrichment_share_ratio": 0.0,
+            "hh_enrichment_optimization_recommended": False,
+        }
 
+    detailed_started = time.monotonic()
     cfg = llm_client.get_llm_config(db)
     n = max(1, min(50, int(top_n), int(cfg.llm_detailed_top_n or 15)))
     with_score = [(d, d.get("llm_score")) for d in items]
@@ -648,57 +741,145 @@ async def analyze_top_resumes(
         progress_callback(
             {
                 "stage": "start",
+                "phase": "enriching",
                 "processed_count": 0,
                 "analyzed_count": 0,
                 "total_count": len(top),
+                "phase_total_count": len(top),
+                "phase_done_count": 0,
+                "enriched_count": 0,
             }
         )
 
-    enriched, _enrich_stats = await _enrich_resumes_for_llm(
+    enrich_started = time.monotonic()
+    enriched, enrich_stats = await _enrich_resumes_for_llm(
         top,
         access_token,
         cache_user_id=uuid.UUID(user_id),
         max_enrich=len(top),
         db=db,
+        progress_callback=progress_callback,
+        progress_phase="enriching",
     )
-    batch_size = max(1, int(cfg.llm_search_batch_size or 10))
+    detailed_enrich_ms = int((time.monotonic() - enrich_started) * 1000)
+    if progress_callback is not None:
+        progress_callback(
+            {
+                "stage": "running",
+                "phase": "analyzing",
+                "processed_count": 0,
+                "analyzed_count": 0,
+                "total_count": len(top),
+                "phase_total_count": len(top),
+                "phase_done_count": 0,
+                "enriched_count": len(enriched),
+            }
+        )
+    batch_size = max(
+        1, int(cfg.llm_search_batch_size or settings.llm_search_batch_size or 3)
+    )
+    analyze_concurrency = max(
+        1,
+        min(8, int(settings.llm_detailed_analyze_concurrency or 1)),
+    )
 
     llm_by_id: dict[str, dict[str, Any]] = {}
     processed_count = 0
-    for i in range(0, len(enriched), batch_size):
-        chunk = enriched[i : i + batch_size]
-        batch_out = await asyncio.to_thread(
-            llm_resume_analyzer.analyze_resumes_batch,
-            parsed_params,
-            chunk,
-            batch_size=batch_size,
-            db=db,
-        )
-        for r in chunk:
-            rid = _resume_row_id(r)
-            if not rid or rid not in batch_out:
-                continue
-            llm_by_id[rid] = batch_out[rid]
-            keys = llm_analysis_cache.resume_lookup_keys(r)
-            if not keys:
-                keys = [rid]
-            llm_analysis_cache.store_for_resume_ids(user_id, keys, query, batch_out[rid])
-            processed_count += 1
-        if progress_callback is not None:
-            batch_analyses = {
-                _resume_row_id(r): batch_out[_resume_row_id(r)]
-                for r in chunk
-                if _resume_row_id(r) and _resume_row_id(r) in batch_out
-            }
-            progress_callback(
-                {
-                    "stage": "running",
-                    "processed_count": processed_count,
-                    "analyzed_count": len(llm_by_id),
-                    "total_count": len(top),
-                    "analyses_delta": batch_analyses,
+    detailed_batch_count = 0
+    detailed_batch_parse_fail_count = 0
+    detailed_fallback_single_resume_count = 0
+    prompt_chars_sum = 0
+    prompt_chars_samples = 0
+    prompt_chars_max = 0
+    active_workers = 0
+    peak_concurrency = 0
+    chunks = [enriched[i : i + batch_size] for i in range(0, len(enriched), batch_size)]
+    lock = asyncio.Lock()
+    semaphore = asyncio.Semaphore(analyze_concurrency)
+    analyze_started = time.monotonic()
+
+    async def _analyze_chunk(chunk: list[dict[str, Any]]) -> None:
+        nonlocal processed_count
+        nonlocal detailed_batch_count
+        nonlocal detailed_batch_parse_fail_count
+        nonlocal detailed_fallback_single_resume_count
+        nonlocal prompt_chars_sum
+        nonlocal prompt_chars_samples
+        nonlocal prompt_chars_max
+        nonlocal active_workers
+        nonlocal peak_concurrency
+        async with semaphore:
+            async with lock:
+                active_workers += 1
+                peak_concurrency = max(peak_concurrency, active_workers)
+            try:
+                batch_result = await asyncio.to_thread(
+                    llm_resume_analyzer.analyze_resumes_batch,
+                    parsed_params,
+                    chunk,
+                    batch_size=batch_size,
+                    db=None,
+                    runtime_config=cfg,
+                    include_metrics=True,
+                )
+            finally:
+                async with lock:
+                    active_workers = max(0, active_workers - 1)
+            if (
+                isinstance(batch_result, tuple)
+                and len(batch_result) == 2
+                and isinstance(batch_result[0], dict)
+                and isinstance(batch_result[1], dict)
+            ):
+                batch_out, batch_metrics = batch_result
+            elif isinstance(batch_result, dict):
+                batch_out = batch_result
+                batch_metrics = {
+                    "detailed_batch_count": 1 if len(chunk) > 1 else 0,
                 }
-            )
+            else:
+                batch_out = {}
+                batch_metrics = {}
+            async with lock:
+                detailed_batch_count += int(batch_metrics.get("detailed_batch_count") or 0)
+                detailed_batch_parse_fail_count += int(
+                    batch_metrics.get("detailed_batch_parse_fail_count") or 0
+                )
+                detailed_fallback_single_resume_count += int(
+                    batch_metrics.get("detailed_fallback_single_resume_count") or 0
+                )
+                avg_chars = int(batch_metrics.get("detailed_prompt_chars_avg") or 0)
+                max_chars = int(batch_metrics.get("detailed_prompt_chars_max") or 0)
+                if max_chars > 0:
+                    prompt_chars_samples += 1
+                    prompt_chars_sum += avg_chars
+                    prompt_chars_max = max(prompt_chars_max, max_chars)
+                for r in chunk:
+                    rid = _resume_row_id(r)
+                    if not rid or rid not in batch_out:
+                        continue
+                    llm_by_id[rid] = batch_out[rid]
+                    keys = llm_analysis_cache.resume_lookup_keys(r)
+                    if not keys:
+                        keys = [rid]
+                    llm_analysis_cache.store_for_resume_ids(user_id, keys, query, batch_out[rid])
+                    processed_count += 1
+                    if progress_callback is not None:
+                        progress_callback(
+                            {
+                                "stage": "running",
+                                "phase": "analyzing",
+                                "processed_count": processed_count,
+                                "analyzed_count": len(llm_by_id),
+                                "total_count": len(top),
+                                "phase_total_count": len(top),
+                                "phase_done_count": processed_count,
+                                "analyses_delta": {rid: batch_out[rid]},
+                            }
+                        )
+
+    await asyncio.gather(*[_analyze_chunk(chunk) for chunk in chunks])
+    detailed_analyze_ms = int((time.monotonic() - analyze_started) * 1000)
 
     out: list[dict[str, Any]] = []
     for d in items:
@@ -713,10 +894,76 @@ async def analyze_top_resumes(
     if progress_callback is not None:
         progress_callback(
             {
-                "stage": "done",
+                "stage": "finalizing",
+                "phase": "finalizing",
                 "processed_count": processed_count,
                 "analyzed_count": len(llm_by_id),
                 "total_count": len(top),
+                "phase_total_count": 1,
+                "phase_done_count": 0,
             }
         )
-    return out
+        progress_callback(
+            {
+                "stage": "done",
+                "phase": "done",
+                "processed_count": processed_count,
+                "analyzed_count": len(llm_by_id),
+                "total_count": len(top),
+                "phase_total_count": 1,
+                "phase_done_count": 1,
+            }
+        )
+    detailed_total_ms = int((time.monotonic() - detailed_started) * 1000)
+    parse_fail_ratio = (
+        float(detailed_batch_parse_fail_count) / float(detailed_batch_count)
+        if detailed_batch_count > 0
+        else 0.0
+    )
+    parse_fail_warn_ratio = max(
+        0.0,
+        min(1.0, float(settings.llm_detailed_parse_fail_warn_ratio or 0.25)),
+    )
+    detailed_json_stability_ok = parse_fail_ratio <= parse_fail_warn_ratio
+    if not detailed_json_stability_ok:
+        logger.warning(
+            "Detailed analyze JSON stability degraded: parse_fail_ratio=%.3f threshold=%.3f",
+            parse_fail_ratio,
+            parse_fail_warn_ratio,
+        )
+    enrich_share_ratio = (
+        float(detailed_enrich_ms) / float(detailed_total_ms)
+        if detailed_total_ms > 0
+        else 0.0
+    )
+    enrich_optimize_threshold = max(
+        0.0,
+        min(1.0, float(settings.llm_detailed_enrich_optimize_share_threshold or 0.35)),
+    )
+    hh_fetch_count = int(enrich_stats.get("hh_fetch_count") or 0)
+    hh_enrichment_optimization_recommended = (
+        hh_fetch_count > 0 and enrich_share_ratio >= enrich_optimize_threshold
+    )
+    metrics = {
+        "detailed_total_ms": detailed_total_ms,
+        "detailed_enrich_ms": detailed_enrich_ms,
+        "detailed_analyze_ms": detailed_analyze_ms,
+        "detailed_batch_count": detailed_batch_count,
+        "detailed_batch_parse_fail_count": detailed_batch_parse_fail_count,
+        "detailed_fallback_single_resume_count": detailed_fallback_single_resume_count,
+        "detailed_prompt_chars_avg": int(prompt_chars_sum / prompt_chars_samples)
+        if prompt_chars_samples > 0
+        else 0,
+        "detailed_prompt_chars_max": prompt_chars_max,
+        "detailed_peak_concurrency": peak_concurrency,
+        "detailed_batch_size": batch_size,
+        "detailed_analyze_concurrency": analyze_concurrency,
+        "detailed_parse_fail_ratio": round(parse_fail_ratio, 4),
+        "detailed_json_stability_ok": detailed_json_stability_ok,
+        "hh_enrichment_cache_hit": int(enrich_stats.get("cache_hit") or 0),
+        "hh_enrichment_cache_miss": int(enrich_stats.get("cache_miss") or 0),
+        "hh_enrichment_fetch_count": hh_fetch_count,
+        "hh_enrichment_share_ratio": round(enrich_share_ratio, 4),
+        "hh_enrichment_optimization_recommended": hh_enrichment_optimization_recommended,
+    }
+    return out, metrics

@@ -129,6 +129,7 @@ export type AnalyzeSnapshotResponse = {
   items: Candidate[];
   analyzed_count: number;
   processing_time_seconds: number;
+  metrics?: Record<string, unknown>;
 };
 
 export type AnalyzeStartResponse = {
@@ -141,10 +142,16 @@ export type AnalyzeProgressResponse = {
   job_id: string;
   status: string;
   stage: string;
+  phase: string;
   total_count: number;
   processed_count: number;
   analyzed_count: number;
+  phase_total_count: number;
+  phase_done_count: number;
+  enriched_count: number;
+  progress_percent: number;
   analyses: Record<string, LLMAnalysis>;
+  metrics?: Record<string, unknown>;
   processing_time_seconds?: number | null;
   error?: string | null;
 };

@@ -18,6 +18,11 @@ def _setup_llm(monkeypatch, *, batch_size: int = 4) -> None:
             fast_model="fast",
             model="base",
             llm_fast_batch_size=batch_size,
+            prescore_mode="chat_legacy",
+            rerank_endpoint="",
+            rerank_model="rerank-model",
+            rerank_timeout_seconds=30.0,
+            rerank_batch_size=200,
         ),
     )
     monkeypatch.setattr(llm_prescoring.settings, "llm_prescore_enable_fallback", False)
@@ -155,3 +160,74 @@ def test_format_prescore_header_without_synonyms_field() -> None:
     requirements = {"position_keywords": ["Developer"], "skills": ["Python"]}
     header = llm_prescoring._format_prescore_header(requirements)
     assert "synonyms_summary" not in header
+
+
+def test_prescore_rerank_maps_relevance_to_int_scores(monkeypatch) -> None:
+    resumes = [_resume("a"), _resume("b")]
+    monkeypatch.setattr(
+        llm_prescoring.llm_client,
+        "get_llm_config",
+        lambda _db: SimpleNamespace(
+            endpoint="http://llm",
+            fast_model="fast",
+            model="base",
+            llm_fast_batch_size=2,
+            prescore_mode="rerank",
+            rerank_endpoint="http://rerank",
+            rerank_model="rerank-model",
+            rerank_timeout_seconds=30.0,
+            rerank_batch_size=2,
+        ),
+    )
+    monkeypatch.setattr(
+        llm_prescoring.llm_client,
+        "call_rerank",
+        lambda query, documents, **kwargs: [
+            {"index": 0, "relevance_score": 0.91},
+            {"index": 1, "relevance_score": 0.34},
+        ],
+    )
+    scores, stats = llm_prescoring.prescore_resumes_batch(
+        {"skills": ["python"]},
+        resumes,
+    )
+    assert scores == {"a": 91, "b": 34}
+    assert stats["prescore_mode"] == "rerank"
+    assert stats["rerank_calls_total"] == 1
+
+
+def test_prescore_rerank_splits_batch_on_failure(monkeypatch) -> None:
+    resumes = [_resume("a"), _resume("b"), _resume("c"), _resume("d")]
+    monkeypatch.setattr(
+        llm_prescoring.llm_client,
+        "get_llm_config",
+        lambda _db: SimpleNamespace(
+            endpoint="http://llm",
+            fast_model="fast",
+            model="base",
+            llm_fast_batch_size=4,
+            prescore_mode="rerank",
+            rerank_endpoint="http://rerank",
+            rerank_model="rerank-model",
+            rerank_timeout_seconds=30.0,
+            rerank_batch_size=4,
+        ),
+    )
+    calls = {"n": 0}
+
+    def fake_rerank(query, documents, **kwargs):
+        _ = query, kwargs
+        calls["n"] += 1
+        if len(documents) >= 4:
+            return None
+        return [{"index": i, "relevance_score": 0.5 + i * 0.1} for i in range(len(documents))]
+
+    monkeypatch.setattr(llm_prescoring.llm_client, "call_rerank", fake_rerank)
+    scores, stats = llm_prescoring.prescore_resumes_batch(
+        {"skills": ["python"]},
+        resumes,
+    )
+    assert len(scores) == 4
+    assert calls["n"] >= 3
+    assert stats["prescore_mode"] == "rerank"
+    assert stats["rerank_batch_split_count"] >= 1

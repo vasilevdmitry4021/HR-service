@@ -42,6 +42,27 @@ function parseStoredResults(v: unknown): SearchResponse | null {
   return v as SearchResponse;
 }
 
+function migrateAnalyzePhase(rawPhase: unknown, rawStage: unknown): string {
+  if (typeof rawPhase === "string" && rawPhase.trim()) return rawPhase;
+  if (typeof rawStage !== "string") return "queued";
+  switch (rawStage) {
+    case "preparing":
+      return "enriching";
+    case "running":
+      return "analyzing";
+    case "done":
+      return "done";
+    case "error":
+      return "error";
+    case "cancelled":
+      return "cancelled";
+    case "queued":
+      return "queued";
+    default:
+      return "queued";
+  }
+}
+
 export type SearchStatePayload = {
   query: string;
   filters: Record<string, unknown> | null;
@@ -84,9 +105,14 @@ export type SearchStatePayload = {
   snapshotAnalyzeProgress?: {
     status: string;
     stage: string;
+    phase: string;
     total: number;
     processed: number;
     analyzed: number;
+    phaseTotal: number;
+    phaseDone: number;
+    enriched: number;
+    progressPercent: number;
   } | null;
 };
 
@@ -243,29 +269,59 @@ export function readSearchState(): SearchStatePayload | null {
     const analyzeProgressRaw = o.snapshotAnalyzeProgress;
     const snapshotAnalyzeProgress =
       analyzeProgressRaw && typeof analyzeProgressRaw === "object"
-        ? ({
-            status:
+        ? (() => {
+            const status =
               typeof (analyzeProgressRaw as { status?: unknown }).status ===
               "string"
                 ? String((analyzeProgressRaw as { status: string }).status)
-                : "running",
-            stage:
+                : "running";
+            const stage =
               typeof (analyzeProgressRaw as { stage?: unknown }).stage ===
               "string"
                 ? String((analyzeProgressRaw as { stage: string }).stage)
-                : "",
-            total:
+                : "";
+            const total =
               Number((analyzeProgressRaw as { total?: unknown }).total ?? 0) ||
-              0,
-            processed:
+              0;
+            const processed =
               Number(
                 (analyzeProgressRaw as { processed?: unknown }).processed ?? 0,
-              ) || 0,
-            analyzed:
+              ) || 0;
+            const phaseTotalRaw =
               Number(
-                (analyzeProgressRaw as { analyzed?: unknown }).analyzed ?? 0,
-              ) || 0,
-          } satisfies NonNullable<SearchStatePayload["snapshotAnalyzeProgress"]>)
+                (analyzeProgressRaw as { phaseTotal?: unknown }).phaseTotal ??
+                  0,
+              ) || 0;
+            const phaseDoneRaw =
+              Number(
+                (analyzeProgressRaw as { phaseDone?: unknown }).phaseDone ?? 0,
+              ) || 0;
+            return {
+              status,
+              stage,
+              phase: migrateAnalyzePhase(
+                (analyzeProgressRaw as { phase?: unknown }).phase,
+                stage,
+              ),
+              total,
+              processed,
+              analyzed:
+                Number(
+                  (analyzeProgressRaw as { analyzed?: unknown }).analyzed ?? 0,
+                ) || 0,
+              phaseTotal: phaseTotalRaw > 0 ? phaseTotalRaw : total,
+              phaseDone: phaseDoneRaw > 0 ? phaseDoneRaw : processed,
+              enriched:
+                Number(
+                  (analyzeProgressRaw as { enriched?: unknown }).enriched ?? 0,
+                ) || 0,
+              progressPercent:
+                Number(
+                  (analyzeProgressRaw as { progressPercent?: unknown })
+                    .progressPercent ?? 0,
+                ) || 0,
+            } satisfies NonNullable<SearchStatePayload["snapshotAnalyzeProgress"]>;
+          })()
         : null;
     return {
       query,

@@ -181,6 +181,7 @@ class AnalyzeOut(BaseModel):
     items: list[CandidateOut]
     analyzed_count: int
     processing_time_seconds: float
+    metrics: dict[str, Any] = Field(default_factory=dict)
 
 
 class AnalyzeStartOut(BaseModel):
@@ -193,9 +194,15 @@ class AnalyzeProgressOut(BaseModel):
     job_id: str
     status: str
     stage: str
+    phase: str = "queued"
     total_count: int
     processed_count: int
     analyzed_count: int
-    analyses: dict[str, Any] = {}
+    phase_total_count: int = 0
+    phase_done_count: int = 0
+    enriched_count: int = 0
+    progress_percent: float = 0.0
+    analyses: dict[str, Any] = Field(default_factory=dict)
+    metrics: dict[str, Any] = Field(default_factory=dict)
     processing_time_seconds: float | None = None
     error: str | None = None

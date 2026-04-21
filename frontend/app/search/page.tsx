@@ -87,6 +87,26 @@ import type {
 } from "@/lib/types";
 import { useAuthStore } from "@/stores/auth-store";
 
+const ANALYZE_PROGRESS_POLL_INTERVAL_MS = 350;
+const ANALYZE_DISPLAY_SMOOTHING_INTERVAL_MS = 100;
+
+type AnalyzeSnapshotProgress = {
+  status: string;
+  stage: string;
+  phase: string;
+  total: number;
+  processed: number;
+  analyzed: number;
+  phaseTotal: number;
+  phaseDone: number;
+  enriched: number;
+  progressPercent: number;
+};
+
+function isAnalyzeTerminalStatus(status: string): boolean {
+  return status === "done" || status === "error" || status === "cancelled";
+}
+
 function cardModelScore(c: Candidate): number | null {
   const fromAnalysis = c.llm_analysis?.llm_score;
   if (fromAnalysis != null) return fromAnalysis;
@@ -179,14 +199,16 @@ function stageLabelRu(stage: string): string {
   }
 }
 
-function analyzeStageLabelRu(stage: string): string {
-  switch (stage) {
+function analyzePhaseLabelRu(phase: string): string {
+  switch (phase) {
     case "queued":
       return "Задача в очереди";
-    case "preparing":
+    case "enriching":
       return "Подготовка резюме";
-    case "running":
+    case "analyzing":
       return "Детальный анализ";
+    case "finalizing":
+      return "Сохранение результатов";
     case "done":
       return "Детальный анализ завершен";
     case "error":
@@ -230,13 +252,9 @@ function SearchPageContent() {
     snapshotId: string;
     jobId: string;
   } | null>(null);
-  const [snapshotAnalyzeProgress, setSnapshotAnalyzeProgress] = useState<{
-    status: string;
-    stage: string;
-    total: number;
-    processed: number;
-    analyzed: number;
-  } | null>(null);
+  const [snapshotAnalyzeProgress, setSnapshotAnalyzeProgress] = useState<AnalyzeSnapshotProgress | null>(null);
+  const [snapshotAnalyzeDisplayProgress, setSnapshotAnalyzeDisplayProgress] =
+    useState<AnalyzeSnapshotProgress | null>(null);
   const [snapshotEvalJob, setSnapshotEvalJob] = useState<{
     snapshotId: string;
     jobId: string;
@@ -337,6 +355,44 @@ function SearchPageContent() {
     const t = setTimeout(() => setAnalyzeProgressVisible(false), 2000);
     return () => clearTimeout(t);
   }, [snapshotAnalyzeProgress, snapshotAnalyzeProgress?.status]);
+
+  useEffect(() => {
+    if (!snapshotAnalyzeProgress) {
+      setSnapshotAnalyzeDisplayProgress(null);
+      return;
+    }
+    if (isAnalyzeTerminalStatus(snapshotAnalyzeProgress.status)) {
+      setSnapshotAnalyzeDisplayProgress(snapshotAnalyzeProgress);
+      return;
+    }
+    setSnapshotAnalyzeDisplayProgress((prev) => {
+      if (!prev) return snapshotAnalyzeProgress;
+      const targetAnalyzed = Math.max(0, snapshotAnalyzeProgress.analyzed);
+      const prevAnalyzed = Math.max(0, prev.analyzed);
+      return {
+        ...snapshotAnalyzeProgress,
+        analyzed: Math.min(prevAnalyzed, targetAnalyzed),
+      };
+    });
+  }, [snapshotAnalyzeProgress]);
+
+  useEffect(() => {
+    if (!snapshotAnalyzeProgress || !snapshotAnalyzeDisplayProgress) return;
+    if (isAnalyzeTerminalStatus(snapshotAnalyzeProgress.status)) return;
+    if (snapshotAnalyzeDisplayProgress.analyzed >= snapshotAnalyzeProgress.analyzed) return;
+    const timer = window.setTimeout(() => {
+      setSnapshotAnalyzeDisplayProgress((prev) => {
+        if (!prev) return prev;
+        const targetAnalyzed = Math.max(0, snapshotAnalyzeProgress.analyzed);
+        if (prev.analyzed >= targetAnalyzed) return prev;
+        return {
+          ...prev,
+          analyzed: Math.min(prev.analyzed + 1, targetAnalyzed),
+        };
+      });
+    }, ANALYZE_DISPLAY_SMOOTHING_INTERVAL_MS);
+    return () => window.clearTimeout(timer);
+  }, [snapshotAnalyzeProgress, snapshotAnalyzeDisplayProgress]);
 
   const areaLabels = useMemo(() => {
     const m = new Map<number, string>();
@@ -850,7 +906,9 @@ function SearchPageContent() {
           if (progress.status === "cancelled") {
             break;
           }
-          await new Promise((resolve) => window.setTimeout(resolve, 1200));
+          await new Promise((resolve) =>
+            window.setTimeout(resolve, ANALYZE_PROGRESS_POLL_INTERVAL_MS),
+          );
         }
       } catch (e) {
         setError(e instanceof ApiError ? e.message : "Не удалось оценить выдачу");
@@ -899,9 +957,14 @@ function SearchPageContent() {
           setSnapshotAnalyzeProgress({
             status: progress.status,
             stage: progress.stage,
+            phase: progress.phase,
             total: progress.total_count,
             processed: progress.processed_count,
             analyzed: progress.analyzed_count,
+            phaseTotal: progress.phase_total_count,
+            phaseDone: progress.phase_done_count,
+            enriched: progress.enriched_count,
+            progressPercent: progress.progress_percent,
           });
           if (progress.analyses && Object.keys(progress.analyses).length > 0) {
             setResults((prev) => {
@@ -957,7 +1020,8 @@ function SearchPageContent() {
     if (!snapshotAnalyzeJob) return;
     if (
       snapshotAnalyzeProgress?.status === "done" ||
-      snapshotAnalyzeProgress?.status === "error"
+      snapshotAnalyzeProgress?.status === "error" ||
+      snapshotAnalyzeProgress?.status === "cancelled"
     ) {
       return;
     }
@@ -1018,9 +1082,14 @@ function SearchPageContent() {
     setSnapshotAnalyzeProgress({
       status: "queued",
       stage: "queued",
+      phase: "queued",
       total: 0,
       processed: 0,
       analyzed: 0,
+      phaseTotal: 0,
+      phaseDone: 0,
+      enriched: 0,
+      progressPercent: 0,
     });
     setError(null);
     try {
@@ -1067,9 +1136,14 @@ function SearchPageContent() {
       setSnapshotAnalyzeProgress({
         status: cancelled.status,
         stage: cancelled.stage,
+        phase: cancelled.phase,
         total: cancelled.total_count,
         processed: cancelled.processed_count,
         analyzed: cancelled.analyzed_count,
+        phaseTotal: cancelled.phase_total_count,
+        phaseDone: cancelled.phase_done_count,
+        enriched: cancelled.enriched_count,
+        progressPercent: cancelled.progress_percent,
       });
       setSnapshotAnalyzeJob(null);
     } catch (e) {
@@ -1310,6 +1384,20 @@ function SearchPageContent() {
   const progressValue = snapshotEvalProgress
     ? Math.min(snapshotEvalProgress.scored, snapshotEvalProgress.total)
     : 0;
+  const analyzeProgressUi = snapshotAnalyzeDisplayProgress ?? snapshotAnalyzeProgress;
+  const analyzeProgressValue = analyzeProgressUi
+    ? analyzeProgressUi.total > 0
+      ? Math.max(
+          0,
+          Math.min(
+            100,
+            (100 *
+              Math.max(0, Math.min(analyzeProgressUi.analyzed, analyzeProgressUi.total))) /
+              analyzeProgressUi.total,
+          ),
+        )
+      : 0
+    : 0;
   const pageButtons = (() => {
     if (!pagination) return [] as number[];
     const total = pagination.totalPages;
@@ -1525,29 +1613,27 @@ function SearchPageContent() {
                       </p>
                     </div>
                   )}
-                  {snapshotAnalyzeProgress && analyzeProgressVisible && (
+                  {analyzeProgressUi && analyzeProgressVisible && (
                     <div className={cn(
                       "space-y-2 rounded-lg border bg-muted/30 p-3 transition-opacity duration-500",
                       (
-                        snapshotAnalyzeProgress.status === "done" ||
-                        snapshotAnalyzeProgress.status === "error" ||
-                        snapshotAnalyzeProgress.status === "cancelled"
+                        analyzeProgressUi.status === "done" ||
+                        analyzeProgressUi.status === "error" ||
+                        analyzeProgressUi.status === "cancelled"
                       ) && "opacity-50",
                     )}>
                       <Progress
-                        value={Math.min(
-                          snapshotAnalyzeProgress.processed,
-                          snapshotAnalyzeProgress.total,
-                        )}
-                        max={Math.max(snapshotAnalyzeProgress.total, 1)}
-                        label={analyzeStageLabelRu(snapshotAnalyzeProgress.stage)}
+                        value={analyzeProgressValue}
+                        max={100}
+                        label={analyzePhaseLabelRu(analyzeProgressUi.phase)}
                         showPercentage
                       />
                       <p className="text-xs text-muted-foreground">
-                        {statusLabelRu(snapshotAnalyzeProgress.status)}. Обработано:{" "}
-                        {snapshotAnalyzeProgress.processed} из{" "}
-                        {snapshotAnalyzeProgress.total}, с детальным выводом:{" "}
-                        {snapshotAnalyzeProgress.analyzed}.
+                        {statusLabelRu(analyzeProgressUi.status)}.{" "}
+                        {analyzePhaseLabelRu(analyzeProgressUi.phase)}.
+                        {" "}
+                        Проанализировано {analyzeProgressUi.analyzed} из{" "}
+                        {analyzeProgressUi.total}.
                       </p>
                     </div>
                   )}

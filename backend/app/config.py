@@ -84,13 +84,28 @@ class Settings(BaseSettings):
     llm_relevance_threshold: int = 60
 
     # LLM детальный анализ (батч на снимке)
-    llm_search_batch_size: int = 10
+    llm_search_batch_size: int = 5
     llm_detailed_top_n: int = 15
+    llm_detailed_about_max_chars: int = 2_400
+    llm_detailed_work_summary_max_chars: int = 3_000
+    llm_detailed_education_max_chars: int = 1_000
+    llm_detailed_skills_max_items: int = 12
+    llm_detailed_single_timeout_seconds: float = 90.0
+    llm_detailed_batch_timeout_seconds: float = 90.0
+    llm_detailed_analyze_concurrency: int = 1
+    llm_detailed_enrich_optimize_share_threshold: float = 0.35
+    llm_detailed_parse_fail_warn_ratio: float = 0.25
 
     # Быстрый LLM pre-screening (лёгкая модель, числовая оценка)
+    prescore_mode: str = "chat_legacy"
     llm_fast_model: str = "qwen2.5:7b"
     # Меньшие батчи надёжнее для тяжёлых моделей (полный JSON-массив по всем строкам).
     llm_fast_batch_size: int = 5
+    rerank_endpoint: str = ""
+    rerank_model: str = "qwen3-vl-embedding-2b"
+    rerank_api_key: str = ""
+    rerank_timeout_seconds: float = 30.0
+    rerank_batch_size: int = 200
     # Дозапрос, если в батче не пришла оценка
     llm_prescore_refill_enabled: bool = True
     llm_prescore_refill_max_llm_calls: int = 500

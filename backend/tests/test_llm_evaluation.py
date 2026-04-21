@@ -210,7 +210,7 @@ async def test_analyze_top_resumes_keeps_enrichment_for_top_n() -> None:
                             with patch(
                                 "app.services.llm_evaluation.llm_analysis_cache.store_for_resume_ids"
                             ):
-                                out = await llm_evaluation.analyze_top_resumes(
+                                out, metrics = await llm_evaluation.analyze_top_resumes(
                                     "token",
                                     items,
                                     parsed,
@@ -228,6 +228,85 @@ async def test_analyze_top_resumes_keeps_enrichment_for_top_n() -> None:
     assert out[0]["llm_analysis"] is not None
     assert out[1]["llm_analysis"] is not None
     assert out[2].get("llm_analysis") is None
+    assert metrics["detailed_batch_size"] == 10
+
+
+@pytest.mark.asyncio
+async def test_analyze_top_resumes_emits_per_item_progress_with_batch_3() -> None:
+    user_id = str(uuid.uuid4())
+    items = [
+        {
+            "id": f"resume-{i}",
+            "hh_resume_id": f"resume-{i}",
+            "title": "Python Developer",
+            "skills": ["Python"],
+            "llm_score": 100 - i,
+            "about": f"about-{i}",
+            "work_experience": [{"company": "ACME"}],
+        }
+        for i in range(15)
+    ]
+    parsed = {"text": "python"}
+    analyze_calls: list[list[dict[str, Any]]] = []
+    events: list[dict[str, Any]] = []
+
+    async def fake_enrich(*args, **kwargs):
+        _ = args, kwargs
+        return items, {"cache_hit": 0, "cache_miss": 0, "hh_fetch_count": 0}
+
+    def fake_analyze_batch(parsed_params, chunk, **kwargs):
+        _ = parsed_params, kwargs
+        analyze_calls.append(chunk)
+        return {
+            str(row["id"]): {
+                "llm_score": int(row.get("llm_score") or 0),
+                "summary": f"analysis-{row['id']}",
+            }
+            for row in chunk
+        }
+
+    with patch(
+        "app.services.llm_evaluation.llm_client.get_llm_config",
+        return_value=SimpleNamespace(llm_detailed_top_n=15, llm_search_batch_size=3),
+    ):
+        with patch(
+            "app.services.llm_evaluation._enrich_resumes_for_llm",
+            side_effect=fake_enrich,
+        ):
+            with patch(
+                "app.services.llm_evaluation.llm_resume_analyzer.analyze_resumes_batch",
+                side_effect=fake_analyze_batch,
+            ):
+                with patch(
+                    "app.services.llm_evaluation.llm_analysis_cache.resume_lookup_keys",
+                    return_value=[],
+                ):
+                    with patch(
+                        "app.services.llm_evaluation.llm_analysis_cache.store_for_resume_ids"
+                    ):
+                        out, metrics = await llm_evaluation.analyze_top_resumes(
+                            "token",
+                            items,
+                            parsed,
+                            user_id=user_id,
+                            query="python",
+                            top_n=15,
+                            db=object(),
+                            progress_callback=lambda evt: events.append(dict(evt)),
+                        )
+
+    assert len(out) == 15
+    assert len(analyze_calls) == 5
+    assert all(len(chunk) == 3 for chunk in analyze_calls)
+    analyzing_done_steps = [
+        int(evt.get("phase_done_count") or 0)
+        for evt in events
+        if evt.get("phase") == "analyzing" and evt.get("stage") == "running"
+    ]
+    assert analyzing_done_steps == list(range(0, 16))
+    assert events[-1].get("phase") == "done"
+    assert events[-1].get("phase_done_count") == 1
+    assert metrics["detailed_batch_count"] == 5
 
 
 @pytest.mark.asyncio
@@ -497,3 +576,55 @@ async def test_evaluate_all_resumes_sets_error_when_no_scores(monkeypatch) -> No
 
     assert metrics["status"] == "error"
     assert metrics["unresolved_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_evaluate_exposes_rerank_metrics(monkeypatch) -> None:
+    resumes = [
+        {"id": "r1", "hh_resume_id": "r1", "title": "A", "skills": ["Python"], "experience_years": 3},
+        {"id": "r2", "hh_resume_id": "r2", "title": "B", "skills": ["Python"], "experience_years": 4},
+    ]
+    parsed = {"text": "python", "skills": ["Python"]}
+    monkeypatch.setattr(llm_evaluation.settings, "evaluate_interactive_top_n", 2)
+
+    def fake_prescore(requirements, rows, db=None, **kwargs):
+        _ = requirements, db, kwargs
+        return {"r1": 91, "r2": 64}, {
+            "prescore_elapsed_ms": 1,
+            "llm_calls_total": 2,
+            "llm_calls_refill": 0,
+            "avg_prompt_chars": 0,
+            "parse_fail_count": 0,
+            "refill_gain_ratio": 0.0,
+            "budget_exhausted": False,
+            "llm_scored_count": 2,
+            "fallback_scored_count": 0,
+            "coverage_ratio": 1.0,
+            "unresolved_count": 0,
+            "recovery_batches_total": 1,
+            "single_resume_attempts_total": 0,
+            "single_resume_fail_count": 0,
+            "llm_only_complete": True,
+            "status": "done",
+            "prescore_mode": "rerank",
+            "rerank_calls_total": 2,
+            "rerank_batch_split_count": 1,
+            "rerank_avg_score": 77.5,
+            "rerank_raw_avg_relevance": 0.775,
+        }
+
+    with patch(
+        "app.services.llm_evaluation.llm_prescoring.prescore_resumes_batch",
+        side_effect=fake_prescore,
+    ):
+        _items, metrics = await llm_evaluation.evaluate_all_resumes(
+            None,
+            resumes,
+            parsed,
+            db=object(),
+            user_id=uuid.uuid4(),
+        )
+
+    assert metrics["prescore_mode"] == "rerank"
+    assert metrics["rerank_calls_total"] == 2
+    assert metrics["rerank_batch_split_count"] == 1

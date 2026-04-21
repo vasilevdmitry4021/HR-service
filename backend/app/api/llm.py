@@ -15,6 +15,7 @@ from app.schemas.llm import (
     LLMSettingsGetOut,
     LLMSettingsIn,
     LLMTestOut,
+    PrescoreMode,
 )
 from app.services import encryption, llm_client
 
@@ -28,7 +29,7 @@ def _merge_llm_payload(existing: dict | None, body: LLMSettingsIn) -> dict:
     incoming = body.model_dump(exclude_none=True, mode="json")
 
     # Пустая строка для секретов — оставляем прежнее значение
-    for secret_key in ("api_key", "client_secret"):
+    for secret_key in ("api_key", "client_secret", "rerank_api_key"):
         v = incoming.get(secret_key)
         if isinstance(v, str) and not v.strip():
             incoming.pop(secret_key, None)
@@ -41,6 +42,9 @@ def _merge_llm_payload(existing: dict | None, body: LLMSettingsIn) -> dict:
         data["fast_model"] = None
     for k in ("llm_search_batch_size", "llm_fast_batch_size", "llm_detailed_top_n"):
         data.pop(k, None)
+    mode = str(data.get("prescore_mode") or PrescoreMode.CHAT_LEGACY.value).strip()
+    if mode not in {PrescoreMode.CHAT_LEGACY.value, PrescoreMode.RERANK.value}:
+        data["prescore_mode"] = PrescoreMode.CHAT_LEGACY.value
     return data
 
 
@@ -66,6 +70,12 @@ def get_llm_settings(
         folder_id=cfg.folder_id,
         client_id=cfg.client_id,
         scope=cfg.scope,
+        prescore_mode=cfg.prescore_mode,
+        rerank_model=cfg.rerank_model or None,
+        rerank_endpoint_masked=llm_client.mask_endpoint(cfg.rerank_endpoint) if cfg.rerank_endpoint else None,
+        rerank_endpoint=cfg.rerank_endpoint or None,
+        rerank_timeout_seconds=float(cfg.rerank_timeout_seconds),
+        rerank_batch_size=int(cfg.rerank_batch_size),
     )
 
 
@@ -96,6 +106,17 @@ def put_llm_settings(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Для GigaChat укажите client_id и client_secret.",
+            )
+    if merged.get("prescore_mode") == PrescoreMode.RERANK.value:
+        if not (str(merged.get("rerank_endpoint") or "").strip()):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Для режима prescore_mode=rerank укажите rerank_endpoint.",
+            )
+        if not (str(merged.get("rerank_model") or "").strip()):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Для режима prescore_mode=rerank укажите rerank_model.",
             )
 
     blob = encryption.encrypt_json(merged)

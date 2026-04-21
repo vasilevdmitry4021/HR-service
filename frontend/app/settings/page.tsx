@@ -26,6 +26,7 @@ import {
   updateLLMSettings,
   type LLMProvider,
   type LLMSettingsIn,
+  type PrescoreMode,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { useAuthStore } from "@/stores/auth-store";
@@ -98,6 +99,12 @@ function SettingsBody() {
   const [llmClientId, setLlmClientId] = useState("");
   const [llmClientSecret, setLlmClientSecret] = useState("");
   const [llmScope, setLlmScope] = useState("");
+  const [prescoreMode, setPrescoreMode] = useState<PrescoreMode>("chat_legacy");
+  const [rerankEndpoint, setRerankEndpoint] = useState("");
+  const [rerankModel, setRerankModel] = useState("qwen3-vl-embedding-2b");
+  const [rerankApiKey, setRerankApiKey] = useState("");
+  const [rerankTimeoutSeconds, setRerankTimeoutSeconds] = useState("30");
+  const [rerankBatchSize, setRerankBatchSize] = useState("200");
   const [savingLlm, setSavingLlm] = useState(false);
   const [testingLlm, setTestingLlm] = useState(false);
   const [llmTestHint, setLlmTestHint] = useState<string | null>(null);
@@ -128,6 +135,15 @@ function SettingsBody() {
         setLlmFolderId(st.folder_id ?? "");
         setLlmClientId(st.client_id ?? "");
         setLlmScope(st.scope ?? "");
+        setPrescoreMode(st.prescore_mode === "rerank" ? "rerank" : "chat_legacy");
+        setRerankEndpoint(st.rerank_endpoint ?? "");
+        setRerankModel(st.rerank_model ?? "qwen3-vl-embedding-2b");
+        setRerankTimeoutSeconds(
+          st.rerank_timeout_seconds != null ? String(st.rerank_timeout_seconds) : "30",
+        );
+        setRerankBatchSize(
+          st.rerank_batch_size != null ? String(st.rerank_batch_size) : "200",
+        );
       })
       .catch(() => {
         /* ignore */
@@ -148,6 +164,9 @@ function SettingsBody() {
         folder_id: llmFolderId.trim() || null,
         client_id: llmClientId.trim() || null,
         scope: llmScope.trim() || null,
+        prescore_mode: prescoreMode,
+        rerank_endpoint: rerankEndpoint.trim() || null,
+        rerank_model: rerankModel.trim() || null,
       };
       if (llmApiKey.trim()) {
         body.api_key = llmApiKey.trim();
@@ -155,9 +174,21 @@ function SettingsBody() {
       if (llmClientSecret.trim()) {
         body.client_secret = llmClientSecret.trim();
       }
+      if (rerankApiKey.trim()) {
+        body.rerank_api_key = rerankApiKey.trim();
+      }
+      const timeoutNum = Number(rerankTimeoutSeconds);
+      if (Number.isFinite(timeoutNum) && timeoutNum > 0) {
+        body.rerank_timeout_seconds = timeoutNum;
+      }
+      const batchNum = Number(rerankBatchSize);
+      if (Number.isFinite(batchNum) && batchNum > 0) {
+        body.rerank_batch_size = batchNum;
+      }
       await updateLLMSettings(body);
       setLlmApiKey("");
       setLlmClientSecret("");
+      setRerankApiKey("");
       setLlmMsg("Настройки языковой модели сохранены");
       const st = await fetchLLMSettingsStatus();
       setLlmConfigured(st.configured);
@@ -545,6 +576,80 @@ function SettingsBody() {
                     placeholder="пусто = та же, что основная"
                     autoComplete="off"
                   />
+                </div>
+              </div>
+              <div className="grid gap-4 md:grid-cols-2">
+                <div className="space-y-2">
+                  <Label htmlFor="prescore-mode">Режим pre-score</Label>
+                  <select
+                    id="prescore-mode"
+                    className={llmSelectClass}
+                    value={prescoreMode}
+                    onChange={(e) => setPrescoreMode(e.target.value as PrescoreMode)}
+                  >
+                    <option value="chat_legacy">chat_legacy (текущая схема)</option>
+                    <option value="rerank">rerank (отдельный endpoint)</option>
+                  </select>
+                </div>
+              </div>
+              <div className="space-y-4 rounded-md border border-border p-4">
+                <p className="text-sm font-medium text-foreground">
+                  Настройки rerank (используются только при prescore_mode=rerank)
+                </p>
+                <div className="grid gap-4 md:grid-cols-2">
+                  <div className="space-y-2">
+                    <Label htmlFor="rerank-endpoint">Rerank endpoint</Label>
+                    <Input
+                      id="rerank-endpoint"
+                      value={rerankEndpoint}
+                      onChange={(e) => setRerankEndpoint(e.target.value)}
+                      placeholder="http://host:8002/v1/rerank"
+                      autoComplete="off"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="rerank-model">Rerank model</Label>
+                    <Input
+                      id="rerank-model"
+                      value={rerankModel}
+                      onChange={(e) => setRerankModel(e.target.value)}
+                      placeholder="qwen3-vl-embedding-2b"
+                      autoComplete="off"
+                    />
+                  </div>
+                </div>
+                <div className="grid gap-4 md:grid-cols-3">
+                  <div className="space-y-2">
+                    <Label htmlFor="rerank-timeout">Timeout, сек</Label>
+                    <Input
+                      id="rerank-timeout"
+                      type="number"
+                      min={1}
+                      value={rerankTimeoutSeconds}
+                      onChange={(e) => setRerankTimeoutSeconds(e.target.value)}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="rerank-batch-size">Batch size</Label>
+                    <Input
+                      id="rerank-batch-size"
+                      type="number"
+                      min={1}
+                      value={rerankBatchSize}
+                      onChange={(e) => setRerankBatchSize(e.target.value)}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="rerank-api-key">Rerank API-ключ</Label>
+                    <Input
+                      id="rerank-api-key"
+                      type="password"
+                      value={rerankApiKey}
+                      onChange={(e) => setRerankApiKey(e.target.value)}
+                      placeholder="Оставьте пустым, чтобы не менять ключ"
+                      autoComplete="off"
+                    />
+                  </div>
                 </div>
               </div>
 

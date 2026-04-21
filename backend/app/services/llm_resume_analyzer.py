@@ -11,97 +11,55 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.services import llm_client
 
-RESUME_ANALYSIS_PROMPT = """Ты — эксперт по оценке резюме. Определи, насколько кандидат перспективен для вакансии, не требуя буквального совпадения формулировок.
+RESUME_ANALYSIS_PROMPT = """Оцени соответствие резюме вакансии по смыслу (синонимы, близкие роли и смежные технологии считаются релевантными).
+Числовые ограничения (опыт, возраст, зарплата, регион) учитывай как корректирующий фактор, не как автоматический отказ.
+В gaps указывай только 1-3 наиболее критичных пробела.
 
-ПРАВИЛА:
-1. Оценивай прежде всего смысловое соответствие:
-   - считай эквивалентными синонимы, англ/рус варианты, аббревиатуры, смежные технологии и близкие должности;
-   - ищи навыки не только в тегах, но и в опыте, разделе "О себе", проектах, образовании.
-2. Числовые требования (опыт, зарплата, возраст, регион) — факторы корректировки, а не автоматический отказ:
-   - небольшое расхождение по опыту или возрасту не должно обнулять релевантность;
-   - если есть сильные ключевые навыки, релевантные проекты или близкая роль, это компенсирует часть расхождений.
-3. Учитывай аналоги должностей и грейдов:
-   - близкие роли (System Analyst ↔ Business Analyst, Team Lead ↔ Tech Lead) допустимы с умеренным снижением оценки;
-   - отклонение на 1 грейд (Senior вместо Lead, Middle вместо Senior) — не критично.
-4. В gaps указывай не более 3 самых важных пробелов. Не дублируй малозначимые отклонения.
+Вакансия:
+- должность: {position}
+- навыки: {skills}
+- опыт: {exp_min}
+- возраст: {age_bounds}
+- зарплата от: {salary_from}
+- регион: {region}
 
-Требования вакансии:
-- Должность: {position}
-- Ключевые навыки: {skills}
-- Минимальный опыт: {exp_min}
-- Возраст: {age_bounds}
-- Минимальная зарплата: {salary_from}
-- Регион: {region}
+Резюме:
+- должность: {r_title}
+- навыки (теги): {r_skills}
+- опыт: {r_exp}
+- возраст: {r_age}
+- зарплата: {r_salary}
+- регион: {r_area}
+- о себе: {r_about}
+- образование: {r_education}
+- опыт работы: {r_work_summary}
 
-Резюме кандидата:
-- Текущая/последняя должность: {r_title}
-- Указанные навыки (теги в резюме): {r_skills}
-- Общий опыт работы: {r_exp} лет
-- Возраст: {r_age}
-- Зарплата: {r_salary}
-- Регион проживания: {r_area}
-
-Текст «О себе» и дополнительные сведения с сайта резюме (если есть — опирайся на них в первую очередь):
-{r_about}
-
-Образование:
-{r_education}
-
-Сводка по местам работ (описания позиций):
-{r_work_summary}
-
-ЛОГИКА ОЦЕНКИ:
-- 55%: ключевые навыки и реальный релевантный опыт
-- 20%: близость роли и уровня (грейда)
-- 15%: общий стаж и качество проектов
-- 10%: вторичные факторы (зарплата, регион, возраст)
-
-ШКАЛА:
-- 85-100: сильное соответствие
-- 70-84: хорошее соответствие
-- 50-69: в целом релевантен, есть отдельные пробелы
-- 35-49: спорный, но может быть перспективен
-- 0-34: слабое соответствие
-
-Верни ТОЛЬКО JSON:
+Верни строго JSON-объект:
 {{
-    "llm_score": <число 0-100>,
-    "is_relevant": <true если кандидат перспективен для рассмотрения>,
-    "strengths": ["сильная сторона 1", "сильная сторона 2"],
-    "gaps": ["пробел 1 (не более 3)"],
-    "summary": "1-2 предложения: почему кандидат релевантен или нет, что компенсирует пробелы."
+  "llm_score": 0-100,
+  "is_relevant": true/false,
+  "strengths": ["..."],
+  "gaps": ["..."],
+  "summary": "1-2 предложения"
 }}"""
 
-RESUME_BATCH_PROMPT = """Ты — эксперт по оценке резюме. Оцени соответствие КАЖДОГО из перечисленных резюме требованиям вакансии.
+RESUME_BATCH_PROMPT = """Оцени соответствие каждого резюме вакансии по смыслу.
+Синонимы/близкие роли учитывай как релевантные, числовые ограничения используй как корректирующий фактор.
+В gaps указывай только 1-3 ключевых пробела.
 
-ПРАВИЛА:
-1. Оценивай смысловое соответствие: синонимы, англ/рус варианты, смежные технологии и близкие должности эквивалентны.
-2. Анализируй ВСЕ данные резюме: навыки часто указаны в описаниях опыта и разделе "о себе", а не только в тегах.
-3. Числовые расхождения (опыт, возраст, зарплата) — фактор корректировки, а не автоматический отказ. Сильные навыки и релевантный опыт компенсируют небольшие расхождения.
-4. Близкие роли и отклонение на 1 грейд допустимы с умеренным снижением оценки.
-5. В gaps указывай не более 3 самых важных пробелов.
+Вакансия:
+- должность: {position}
+- навыки: {skills}
+- опыт: {exp_min}
+- возраст: {age_bounds}
+- зарплата от: {salary_from}
+- регион: {region}
 
-ЛОГИКА ОЦЕНКИ:
-- 55%: ключевые навыки и реальный релевантный опыт
-- 20%: близость роли и уровня
-- 15%: общий стаж и качество проектов
-- 10%: вторичные факторы (зарплата, регион, возраст)
-
-ШКАЛА: 85-100 сильное, 70-84 хорошее, 50-69 релевантен с пробелами, 35-49 спорный, 0-34 слабое.
-
-Требования вакансии:
-- Должность: {position}
-- Ключевые навыки: {skills}
-- Минимальный опыт: {exp_min}
-- Возраст: {age_bounds}
-- Минимальная зарплата: {salary_from}
-- Регион: {region}
-
-Резюме для оценки (каждое помечено resume_id):
+Резюме:
 {resumes_block}
 
-Верни ТОЛЬКО JSON-массив с объектами в том же порядке. Каждый объект:
-{{"resume_id": "<строго из списка>", "llm_score": 0-100, "is_relevant": true/false, "strengths": [], "gaps": [], "summary": "..."}}"""
+Верни строго JSON-массив объектов в исходном порядке:
+{{"resume_id":"...","llm_score":0-100,"is_relevant":true/false,"strengths":[],"gaps":[],"summary":"..."}}"""
 
 
 def _format_numeric_bounds(requirements: dict[str, Any]) -> tuple[str, str, str]:
@@ -140,6 +98,7 @@ def _format_resume_numeric(resume: dict[str, Any]) -> tuple[str, str]:
 
 
 def _truncate_skills(skills: list[str], max_items: int = 12) -> str:
+    max_items = max(1, int(max_items or 1))
     lst = skills or []
     if len(lst) <= max_items:
         return ", ".join(lst)
@@ -260,14 +219,18 @@ def build_prescore_semantic_summary(
     return _shorten_text(" | ".join(parts), max_chars)
 
 
-def _resume_about_for_prompt(resume: dict[str, Any], max_chars: int = 14_000) -> str:
+def _resume_about_for_prompt(resume: dict[str, Any], max_chars: int | None = None) -> str:
+    if max_chars is None:
+        max_chars = int(settings.llm_detailed_about_max_chars or 2400)
     raw = resume.get("about")
     if not isinstance(raw, str) or not raw.strip():
         return "не указано"
     return _shorten_text(raw, max_chars)
 
 
-def _resume_education_for_prompt(resume: dict[str, Any], max_chars: int = 2_000) -> str:
+def _resume_education_for_prompt(resume: dict[str, Any], max_chars: int | None = None) -> str:
+    if max_chars is None:
+        max_chars = int(settings.llm_detailed_education_max_chars or 1000)
     items = resume.get("education") or []
     lines: list[str] = []
     for e in items:
@@ -280,7 +243,9 @@ def _resume_education_for_prompt(resume: dict[str, Any], max_chars: int = 2_000)
     return _shorten_text("\n".join(lines), max_chars)
 
 
-def _resume_work_summary_for_prompt(resume: dict[str, Any], max_chars: int = 8_000) -> str:
+def _resume_work_summary_for_prompt(resume: dict[str, Any], max_chars: int | None = None) -> str:
+    if max_chars is None:
+        max_chars = int(settings.llm_detailed_work_summary_max_chars or 3000)
     items = resume.get("work_experience") or []
     parts: list[str] = []
     for it in items:
@@ -317,7 +282,10 @@ def _format_resume_for_batch(
         salary_str = "не указана"
     area = resume.get("area", "")
     if include_skill_tags:
-        skills = _truncate_skills(resume.get("skills") or [])
+        skills = _truncate_skills(
+            resume.get("skills") or [],
+            max_items=int(settings.llm_detailed_skills_max_items or 12),
+        )
         base = (
             f"[resume_id={rid}] {title} | навыки (теги): {skills} | опыт: {exp} лет | "
             f"возраст: {age} | зарплата: {salary_str} | регион: {area}"
@@ -329,9 +297,12 @@ def _format_resume_for_batch(
         )
     about = resume.get("about")
     if isinstance(about, str) and about.strip():
-        frag = _shorten_text(about, 1000).replace("\n", " ")
+        frag = _shorten_text(
+            about,
+            int(settings.llm_detailed_about_max_chars or 2400),
+        ).replace("\n", " ")
         base += f" | о себе: {frag}"
-    work_summary = _resume_work_summary_for_prompt(resume, max_chars=2500)
+    work_summary = _resume_work_summary_for_prompt(resume, max_chars=None)
     if work_summary and work_summary != "не указано":
         work_frag = work_summary.replace("\n", " | ")
         base += f" | описание опыта работы: {work_frag}"
@@ -352,6 +323,36 @@ def _format_resume_for_prescore_batch(resume: dict[str, Any]) -> str:
             recent_jobs_limit=3,
         )
     return f"[resume_id={rid}] {summary}"
+
+
+def _format_resume_for_rerank_document(resume: dict[str, Any]) -> str:
+    """Стабильный короткий документ для rerank (без prompt-инструкций)."""
+    title = _shorten_text(_clean_inline_text(resume.get("title")), 100) or "не указана"
+    skills = _truncate_skills([str(x) for x in (resume.get("skills") or [])], max_items=12) or "не указаны"
+    exp = resume.get("experience_years")
+    exp_str = f"{exp}" if isinstance(exp, (int, float)) else "не указан"
+    area = _shorten_text(_clean_inline_text(resume.get("area")), 100) or "не указан"
+    summary = _clean_inline_text(resume.get("semantic_summary")) or build_prescore_semantic_summary(
+        resume,
+        max_chars=1200,
+        highlights_limit=6,
+        recent_jobs_limit=3,
+    )
+    highlights = _top_resume_fragments(
+        resume,
+        max_items=3,
+        max_item_chars=180,
+    )
+    parts = [
+        f"должность: {title}",
+        f"навыки: {skills}",
+        f"опыт: {exp_str}",
+        f"регион: {area}",
+        f"summary: {_shorten_text(summary, 1200)}",
+    ]
+    if highlights:
+        parts.append("опыт_фрагменты: " + " | ".join(highlights))
+    return _shorten_text(" || ".join(parts), 2000)
 
 
 def _format_resume_for_analyze_batch(resume: dict[str, Any]) -> str:
@@ -385,27 +386,42 @@ def _extract_json_array(text: str) -> list[dict[str, Any]] | None:
 
 
 def _call_llm_for_json(
-    user_prompt: str, db: Session | None = None
+    user_prompt: str,
+    db: Session | None = None,
+    *,
+    runtime_config: llm_client.LLMRuntimeConfig | None = None,
+    timeout: float | None = None,
 ) -> dict[str, Any] | None:
-    if not llm_client.llm_connection_configured(db):
+    cfg = runtime_config or llm_client.get_llm_config(db)
+    if not llm_client.llm_connection_configured_runtime(cfg):
         return None
-    raw = llm_client.call_llm_for_json_object(db, user_prompt, timeout=60.0)
+    raw = llm_client.call_llm_for_json_object(
+        db,
+        user_prompt,
+        timeout=float(timeout or settings.llm_detailed_single_timeout_seconds or 90.0),
+        runtime_config=cfg,
+    )
     return raw
 
 
 def _call_llm_raw(
-    user_prompt: str, timeout: float = 90.0, db: Session | None = None
+    user_prompt: str,
+    timeout: float = 90.0,
+    db: Session | None = None,
+    *,
+    runtime_config: llm_client.LLMRuntimeConfig | None = None,
 ) -> str | None:
     """Вызов LLM, возвращает сырой текст ответа (для batch)."""
-    if not llm_client.llm_connection_configured(db):
+    cfg = runtime_config or llm_client.get_llm_config(db)
+    if not llm_client.llm_connection_configured_runtime(cfg):
         return None
-    cfg = llm_client.get_llm_config(db)
     return llm_client.call_llm_user_prompt(
         db,
         user_prompt,
         model=cfg.model,
         format_json=True,
         timeout=timeout,
+        runtime_config=cfg,
     )
 
 
@@ -414,14 +430,24 @@ def analyze_resumes_batch(
     resumes: list[dict[str, Any]],
     batch_size: int = 1,
     db: Session | None = None,
-) -> dict[str, dict[str, Any]]:
+    *,
+    runtime_config: llm_client.LLMRuntimeConfig | None = None,
+    include_metrics: bool = False,
+) -> dict[str, dict[str, Any]] | tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     """
     Анализирует несколько резюме через LLM. При batch_size>1 — одним запросом на группу.
     При сбое парсинга batch — fallback на одиночные analyze_resume.
     Возвращает dict[resume_id, analysis].
     """
     if not resumes:
-        return {}
+        empty_metrics = {
+            "detailed_batch_count": 0,
+            "detailed_batch_parse_fail_count": 0,
+            "detailed_fallback_single_resume_count": 0,
+            "detailed_prompt_chars_avg": 0,
+            "detailed_prompt_chars_max": 0,
+        }
+        return ({}, empty_metrics) if include_metrics else {}
 
     exp_str, age_str, sal_str = _format_numeric_bounds(requirements)
     header = {
@@ -434,18 +460,33 @@ def analyze_resumes_batch(
     }
 
     result: dict[str, dict[str, Any]] = {}
+    metrics = {
+        "detailed_batch_count": 0,
+        "detailed_batch_parse_fail_count": 0,
+        "detailed_fallback_single_resume_count": 0,
+        "detailed_prompt_chars_avg": 0,
+        "detailed_prompt_chars_max": 0,
+    }
+    prompt_sizes: list[int] = []
     batches: list[list[dict[str, Any]]] = []
     for i in range(0, len(resumes), batch_size):
         batches.append(resumes[i : i + batch_size])
 
     for batch in batches:
         if batch_size > 1 and len(batch) > 1:
+            metrics["detailed_batch_count"] += 1
             resumes_block = "\n".join(_format_resume_for_analyze_batch(r) for r in batch)
             prompt = RESUME_BATCH_PROMPT.format(
                 **header,
                 resumes_block=resumes_block,
             )
-            raw = _call_llm_raw(prompt, db=db)
+            prompt_sizes.append(len(prompt))
+            raw = _call_llm_raw(
+                prompt,
+                timeout=float(settings.llm_detailed_batch_timeout_seconds or 90.0),
+                db=db,
+                runtime_config=runtime_config,
+            )
             arr = _extract_json_array(raw) if raw else None
             if arr and len(arr) >= len(batch):
                 by_id = {str(x.get("resume_id", "")): x for x in arr if x.get("resume_id")}
@@ -457,21 +498,38 @@ def analyze_resumes_batch(
                     else:
                         result[rid] = _empty_analysis()
             else:
+                metrics["detailed_batch_parse_fail_count"] += 1
                 for r in batch:
                     rid = str(r.get("id", r.get("hh_resume_id", "")))
-                    result[rid] = analyze_resume(requirements, r, db=db)
+                    metrics["detailed_fallback_single_resume_count"] += 1
+                    result[rid] = analyze_resume(
+                        requirements,
+                        r,
+                        db=db,
+                        runtime_config=runtime_config,
+                    )
         else:
             for r in batch:
                 rid = str(r.get("id", r.get("hh_resume_id", "")))
-                result[rid] = analyze_resume(requirements, r, db=db)
+                result[rid] = analyze_resume(
+                    requirements,
+                    r,
+                    db=db,
+                    runtime_config=runtime_config,
+                )
 
-    return result
+    if prompt_sizes:
+        metrics["detailed_prompt_chars_avg"] = int(sum(prompt_sizes) / len(prompt_sizes))
+        metrics["detailed_prompt_chars_max"] = max(prompt_sizes)
+    return (result, metrics) if include_metrics else result
 
 
 def analyze_resume(
     requirements: dict[str, Any],
     resume: dict[str, Any],
     db: Session | None = None,
+    *,
+    runtime_config: llm_client.LLMRuntimeConfig | None = None,
 ) -> dict[str, Any]:
     """Возвращает поля для LLMAnalysisOut; при ошибке или без endpoint — пустой анализ."""
     exp_str, age_str, sal_str = _format_numeric_bounds(requirements)
@@ -479,25 +537,38 @@ def analyze_resume(
     skill_tags = resume.get("skills") or []
     if isinstance(skill_tags, str):
         skill_tags = [skill_tags]
+    req_skills = _truncate_skills(
+        [str(x) for x in (requirements.get("skills") or []) if str(x).strip()],
+        max_items=int(settings.llm_detailed_skills_max_items or 12),
+    )
+    resume_skills = _truncate_skills(
+        [str(x) for x in skill_tags if str(x).strip()],
+        max_items=int(settings.llm_detailed_skills_max_items or 12),
+    )
     user_prompt = RESUME_ANALYSIS_PROMPT.format(
-        skills=", ".join(requirements.get("skills") or []) or "не указаны",
+        skills=req_skills or "не указаны",
         exp_min=exp_str,
         age_bounds=age_str,
         salary_from=sal_str,
         region=requirements.get("region") or "любой",
         position=", ".join(requirements.get("position_keywords") or []) or "не указана",
         r_title=resume.get("title", ""),
-        r_skills=", ".join(skill_tags) if skill_tags else "не указаны",
+        r_skills=resume_skills or "не указаны",
         r_exp=resume.get("experience_years", 0),
         r_age=r_age,
         r_salary=r_salary,
         r_area=resume.get("area", ""),
-        r_about=_resume_about_for_prompt(resume),
-        r_education=_resume_education_for_prompt(resume),
-        r_work_summary=_resume_work_summary_for_prompt(resume),
+        r_about=_resume_about_for_prompt(resume, max_chars=None),
+        r_education=_resume_education_for_prompt(resume, max_chars=None),
+        r_work_summary=_resume_work_summary_for_prompt(resume, max_chars=None),
     )
 
-    raw = _call_llm_for_json(user_prompt, db=db)
+    raw = _call_llm_for_json(
+        user_prompt,
+        db=db,
+        runtime_config=runtime_config,
+        timeout=float(settings.llm_detailed_single_timeout_seconds or 90.0),
+    )
     if not raw:
         return _empty_analysis()
     return _normalize_analysis(raw)

@@ -12,6 +12,11 @@ class LLMProvider(str, Enum):
     GIGACHAT = "gigachat"
 
 
+class PrescoreMode(str, Enum):
+    CHAT_LEGACY = "chat_legacy"
+    RERANK = "rerank"
+
+
 class LLMSettingsIn(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -24,6 +29,12 @@ class LLMSettingsIn(BaseModel):
     client_id: str | None = Field(None, max_length=256)
     client_secret: str | None = Field(None, max_length=512)
     scope: str | None = Field(None, max_length=256)
+    prescore_mode: PrescoreMode | None = PrescoreMode.CHAT_LEGACY
+    rerank_endpoint: str | None = None
+    rerank_model: str | None = Field(None, max_length=256)
+    rerank_api_key: str | None = Field(None, max_length=512)
+    rerank_timeout_seconds: float | None = None
+    rerank_batch_size: int | None = None
 
 
 class LLMSettingsStatusOut(BaseModel):
@@ -35,12 +46,18 @@ class LLMSettingsStatusOut(BaseModel):
     folder_id: str | None = None
     client_id: str | None = None
     scope: str | None = None
+    prescore_mode: PrescoreMode = PrescoreMode.CHAT_LEGACY
+    rerank_model: str | None = None
+    rerank_endpoint_masked: str | None = None
 
 
 class LLMSettingsGetOut(LLMSettingsStatusOut):
     """Полные несекретные поля для формы настроек (GET)."""
 
     endpoint: str | None = None
+    rerank_endpoint: str | None = None
+    rerank_timeout_seconds: float | None = None
+    rerank_batch_size: int | None = None
 
 
 class LLMTestOut(BaseModel):

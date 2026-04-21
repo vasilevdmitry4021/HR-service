@@ -123,6 +123,12 @@ class LLMRuntimeConfig:
     llm_search_batch_size: int
     llm_fast_batch_size: int
     llm_detailed_top_n: int
+    prescore_mode: str
+    rerank_endpoint: str
+    rerank_model: str
+    rerank_api_key: str | None
+    rerank_timeout_seconds: float
+    rerank_batch_size: int
 
 
 def _stored_llm_dict(db: Session) -> dict[str, Any] | None:
@@ -174,6 +180,12 @@ def get_llm_config(db: Session | None) -> LLMRuntimeConfig:
     env_key = (settings.internal_llm_api_key or "ollama").strip() or "ollama"
     env_model = (settings.internal_llm_model or "llama3.2").strip() or "llama3.2"
     env_fast = (settings.llm_fast_model or "qwen2.5:7b").strip() or "qwen2.5:7b"
+    env_prescore_mode = (settings.prescore_mode or "chat_legacy").strip() or "chat_legacy"
+    env_rerank_endpoint = (settings.rerank_endpoint or "").strip()
+    env_rerank_model = (settings.rerank_model or "qwen3-vl-embedding-2b").strip() or "qwen3-vl-embedding-2b"
+    env_rerank_api_key = (settings.rerank_api_key or "").strip() or None
+    env_rerank_timeout = max(1.0, float(settings.rerank_timeout_seconds or 30.0))
+    env_rerank_batch_size = max(1, min(500, int(settings.rerank_batch_size or 200)))
 
     env_cfg = LLMRuntimeConfig(
         provider=_default_provider_env(env_endpoint),
@@ -188,6 +200,12 @@ def get_llm_config(db: Session | None) -> LLMRuntimeConfig:
         llm_search_batch_size=max(1, min(50, int(settings.llm_search_batch_size or 10))),
         llm_fast_batch_size=max(1, min(50, int(settings.llm_fast_batch_size or 5))),
         llm_detailed_top_n=max(1, min(50, int(settings.llm_detailed_top_n or 15))),
+        prescore_mode=env_prescore_mode if env_prescore_mode in {"chat_legacy", "rerank"} else "chat_legacy",
+        rerank_endpoint=env_rerank_endpoint,
+        rerank_model=env_rerank_model,
+        rerank_api_key=env_rerank_api_key,
+        rerank_timeout_seconds=env_rerank_timeout,
+        rerank_batch_size=env_rerank_batch_size,
     )
     env_priority = bool(settings.llm_runtime_env_priority)
     env_ready = bool(env_endpoint)
@@ -216,6 +234,32 @@ def get_llm_config(db: Session | None) -> LLMRuntimeConfig:
         csec = str(csec).strip() if isinstance(csec, str) and csec.strip() else None
         scope = stored.get("scope")
         scope = str(scope).strip() if isinstance(scope, str) and scope.strip() else None
+        prescore_mode_raw = str(stored.get("prescore_mode") or env_prescore_mode).strip()
+        prescore_mode = prescore_mode_raw if prescore_mode_raw in {"chat_legacy", "rerank"} else "chat_legacy"
+        rerank_endpoint = (str(stored.get("rerank_endpoint") or env_rerank_endpoint)).strip()
+        rerank_model = (str(stored.get("rerank_model") or env_rerank_model)).strip() or env_rerank_model
+        rerank_api_key_raw = stored.get("rerank_api_key")
+        rerank_api_key = (
+            str(rerank_api_key_raw).strip()
+            if isinstance(rerank_api_key_raw, str) and str(rerank_api_key_raw).strip()
+            else env_rerank_api_key
+        )
+        rerank_timeout_raw = stored.get("rerank_timeout_seconds")
+        try:
+            rerank_timeout_seconds = max(
+                1.0,
+                float(rerank_timeout_raw),
+            ) if rerank_timeout_raw is not None else env_rerank_timeout
+        except (TypeError, ValueError):
+            rerank_timeout_seconds = env_rerank_timeout
+        rerank_batch_raw = stored.get("rerank_batch_size")
+        try:
+            rerank_batch_size = max(
+                1,
+                min(500, int(rerank_batch_raw)),
+            ) if rerank_batch_raw is not None else env_rerank_batch_size
+        except (TypeError, ValueError):
+            rerank_batch_size = env_rerank_batch_size
 
         llm_search_batch_size = max(
             1, min(50, int(settings.llm_search_batch_size or 10))
@@ -245,6 +289,12 @@ def get_llm_config(db: Session | None) -> LLMRuntimeConfig:
             llm_search_batch_size=max(1, min(50, llm_search_batch_size)),
             llm_fast_batch_size=max(1, min(50, llm_fast_batch_size)),
             llm_detailed_top_n=max(1, min(50, llm_detailed_top_n)),
+            prescore_mode=prescore_mode,
+            rerank_endpoint=rerank_endpoint,
+            rerank_model=rerank_model,
+            rerank_api_key=rerank_api_key,
+            rerank_timeout_seconds=rerank_timeout_seconds,
+            rerank_batch_size=rerank_batch_size,
         )
         _log_llm_config_source("db", cfg)
         return cfg
@@ -263,6 +313,10 @@ def mask_endpoint(url: str) -> str:
 
 def llm_connection_configured(db: Session | None) -> bool:
     cfg = get_llm_config(db)
+    return llm_connection_configured_runtime(cfg)
+
+
+def llm_connection_configured_runtime(cfg: LLMRuntimeConfig) -> bool:
     if not (cfg.endpoint or "").strip():
         return False
     if cfg.provider == LLMProvider.YANDEX_GPT.value:
@@ -508,9 +562,10 @@ def call_llm_chat(
     model: str | None = None,
     format_json: bool = False,
     timeout: float = 90.0,
+    runtime_config: LLMRuntimeConfig | None = None,
 ) -> str | None:
     """Унифицированный вызов чата; model по умолчанию — основная модель из конфигурации."""
-    cfg = get_llm_config(db)
+    cfg = runtime_config or get_llm_config(db)
     m = (model or cfg.model or "").strip() or cfg.model
     if not m:
         return None
@@ -531,6 +586,7 @@ def call_llm_user_prompt(
     model: str | None = None,
     format_json: bool = False,
     timeout: float = 90.0,
+    runtime_config: LLMRuntimeConfig | None = None,
 ) -> str | None:
     """Один пользовательский промпт (как в анализе резюме)."""
     return call_llm_chat(
@@ -539,7 +595,64 @@ def call_llm_user_prompt(
         model=model,
         format_json=format_json,
         timeout=timeout,
+        runtime_config=runtime_config,
     )
+
+
+def call_rerank(
+    query: str,
+    documents: list[str],
+    *,
+    model: str | None = None,
+    timeout: float | None = None,
+    db: Session | None = None,
+) -> list[dict[str, Any]] | None:
+    """Вызов rerank endpoint; возвращает список объектов с index/relevance_score."""
+    cfg = get_llm_config(db)
+    endpoint = (cfg.rerank_endpoint or "").strip()
+    if not endpoint:
+        return None
+    docs = [str(x) for x in documents]
+    if not docs:
+        return []
+    m = (model or cfg.rerank_model or "").strip() or cfg.rerank_model
+    payload: dict[str, Any] = {
+        "model": m,
+        "query": str(query or ""),
+        "documents": docs,
+        "top_n": len(docs),
+    }
+    headers = {"Content-Type": "application/json"}
+    token = (cfg.rerank_api_key or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req_timeout = float(timeout or cfg.rerank_timeout_seconds or 30.0)
+    try:
+        with httpx.Client(timeout=max(1.0, req_timeout)) as client:
+            response = client.post(endpoint, json=payload, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+    except Exception as exc:
+        logger.warning("Rerank request failed: %s", exc)
+        return None
+    if not isinstance(data, dict):
+        return None
+    results = data.get("results")
+    if not isinstance(results, list):
+        return None
+    normalized: list[dict[str, Any]] = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        idx = item.get("index")
+        score = item.get("relevance_score")
+        try:
+            idx_i = int(idx)
+            score_f = float(score)
+        except (TypeError, ValueError):
+            continue
+        normalized.append({"index": idx_i, "relevance_score": score_f})
+    return normalized
 
 
 def call_llm_for_json_object(
@@ -548,9 +661,15 @@ def call_llm_for_json_object(
     *,
     model: str | None = None,
     timeout: float = 60.0,
+    runtime_config: LLMRuntimeConfig | None = None,
 ) -> dict[str, Any] | None:
     raw = call_llm_user_prompt(
-        db, user_prompt, model=model, format_json=True, timeout=timeout
+        db,
+        user_prompt,
+        model=model,
+        format_json=True,
+        timeout=timeout,
+        runtime_config=runtime_config,
     )
     if not raw:
         return None

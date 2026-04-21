@@ -436,6 +436,8 @@ export type LLMProvider =
   | "yandex_gpt"
   | "gigachat";
 
+export type PrescoreMode = "chat_legacy" | "rerank";
+
 export type LLMSettingsGetOut = {
   configured: boolean;
   provider?: string | null;
@@ -446,6 +448,12 @@ export type LLMSettingsGetOut = {
   folder_id?: string | null;
   client_id?: string | null;
   scope?: string | null;
+  prescore_mode?: PrescoreMode | null;
+  rerank_model?: string | null;
+  rerank_endpoint_masked?: string | null;
+  rerank_endpoint?: string | null;
+  rerank_timeout_seconds?: number | null;
+  rerank_batch_size?: number | null;
 };
 
 export type LLMSettingsIn = {
@@ -458,6 +466,12 @@ export type LLMSettingsIn = {
   client_id?: string | null;
   client_secret?: string | null;
   scope?: string | null;
+  prescore_mode?: PrescoreMode | null;
+  rerank_endpoint?: string | null;
+  rerank_model?: string | null;
+  rerank_api_key?: string | null;
+  rerank_timeout_seconds?: number | null;
+  rerank_batch_size?: number | null;
 };
 
 export type LLMTestOut = {

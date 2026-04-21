@@ -167,3 +167,62 @@ def test_format_resume_for_prescore_batch_degrades_without_enrichment() -> None:
     assert "навыки: Testing" in formatted
     assert "о себе:" not in formatted
     assert "последние места работы:" not in formatted
+
+
+def test_analyze_resumes_batch_metrics_include_parse_fail_and_fallback() -> None:
+    resumes = [
+        {"id": "r1", "hh_resume_id": "hh-1", "title": "A", "skills": ["Python"]},
+        {"id": "r2", "hh_resume_id": "hh-2", "title": "B", "skills": ["Python"]},
+    ]
+    with patch.object(
+        llm_resume_analyzer,
+        "_call_llm_raw",
+        return_value="not valid json [",
+    ):
+        with patch.object(
+            llm_resume_analyzer,
+            "analyze_resume",
+            side_effect=lambda req, r, db=None, **_: {
+                "llm_score": 40,
+                "is_relevant": False,
+                "strengths": [],
+                "gaps": [],
+                "summary": "fallback",
+            },
+        ):
+            result, metrics = llm_resume_analyzer.analyze_resumes_batch(
+                {"skills": ["Python"]},
+                resumes,
+                batch_size=5,
+                include_metrics=True,
+            )
+    assert len(result) == 2
+    assert metrics["detailed_batch_count"] == 1
+    assert metrics["detailed_batch_parse_fail_count"] == 1
+    assert metrics["detailed_fallback_single_resume_count"] == 2
+
+
+def test_analyze_resume_uses_skill_truncation_from_settings(monkeypatch) -> None:
+    monkeypatch.setattr(llm_resume_analyzer.settings, "llm_detailed_skills_max_items", 2)
+    captured_prompt: dict[str, str] = {}
+
+    def _fake_call(prompt: str, db=None, **kwargs):
+        _ = db, kwargs
+        captured_prompt["value"] = prompt
+        return {
+            "llm_score": 65,
+            "is_relevant": True,
+            "strengths": [],
+            "gaps": [],
+            "summary": "ok",
+        }
+
+    with patch.object(llm_resume_analyzer, "_call_llm_for_json", side_effect=_fake_call):
+        out = llm_resume_analyzer.analyze_resume(
+            {"skills": ["Python", "FastAPI", "PostgreSQL"]},
+            {"id": "r1", "title": "Dev", "skills": ["Kafka", "Redis", "Celery"]},
+        )
+    assert out["llm_score"] == 65
+    prompt = captured_prompt["value"]
+    assert "Python, FastAPI ..." in prompt
+    assert "Kafka, Redis ..." in prompt

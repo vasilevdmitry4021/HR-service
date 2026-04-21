@@ -13,7 +13,10 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.services import llm_client
-from app.services.llm_resume_analyzer import _format_resume_for_prescore_batch
+from app.services.llm_resume_analyzer import (
+    _format_resume_for_prescore_batch,
+    _format_resume_for_rerank_document,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +88,43 @@ def _parse_score(item: dict[str, Any]) -> int | None:
         return max(0, min(100, int(float(str(raw).strip()))))
     except (TypeError, ValueError):
         return None
+
+
+def _score_from_relevance(raw: Any) -> int | None:
+    try:
+        score = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return max(0, min(100, int(round(score * 100.0))))
+
+
+def _rerank_query(requirements: dict[str, Any]) -> str:
+    parts: list[str] = []
+    position = ", ".join(requirements.get("position_keywords") or []).strip()
+    skills = ", ".join(requirements.get("skills") or []).strip()
+    exp = requirements.get("experience_years_min")
+    region = str(requirements.get("region") or "").strip()
+    if position:
+        parts.append(f"Должность: {position}")
+    if skills:
+        parts.append(f"Навыки: {skills}")
+    if exp is not None:
+        parts.append(f"Опыт от {exp} лет")
+    if region:
+        parts.append(f"Регион: {region}")
+    if not parts:
+        return "Подберите максимально релевантное резюме под требования вакансии."
+    return ". ".join(parts)
+
+
+def _stats_with_rerank_defaults(stats: dict[str, Any], *, rerank_calls_total: int = 0) -> dict[str, Any]:
+    out = dict(stats)
+    out.setdefault("prescore_mode", "chat_legacy")
+    out.setdefault("rerank_calls_total", int(rerank_calls_total))
+    out.setdefault("rerank_batch_split_count", 0)
+    out.setdefault("rerank_avg_score", 0.0)
+    out.setdefault("rerank_raw_avg_relevance", 0.0)
+    return out
 
 
 def _slice_balanced_json_array(s: str) -> str | None:
@@ -469,7 +509,7 @@ def _fill_missing_scores(
     return out, reason_counts, len(fallback_scores)
 
 
-def prescore_resumes_batch(
+def _prescore_via_chat_legacy(
     requirements: dict[str, Any],
     resumes: list[dict[str, Any]],
     db: Session | None = None,
@@ -483,7 +523,7 @@ def prescore_resumes_batch(
     Без endpoint, при ошибке или пустом ответе — пустой словарь (или только то, что удалось разобрать).
     """
     if not resumes:
-        return {}, {
+        return {}, _stats_with_rerank_defaults({
             "status": "done",
             "prescore_elapsed_ms": 0,
             "llm_calls_total": 0,
@@ -503,7 +543,8 @@ def prescore_resumes_batch(
             "single_resume_attempts_total": 0,
             "single_resume_fail_count": 0,
             "llm_only_complete": True,
-        }
+            "prescore_mode": "chat_legacy",
+        })
 
     def rid_of(r: dict[str, Any]) -> str:
         return str(r.get("id", r.get("hh_resume_id", "")))
@@ -707,7 +748,7 @@ def prescore_resumes_batch(
     status = "done"
     if not llm_only_complete:
         status = "error" if not llm_enabled else "partial"
-    return out, {
+    return out, _stats_with_rerank_defaults({
         "status": status,
         "prescore_elapsed_ms": elapsed_ms,
         "llm_calls_total": llm_calls_total,
@@ -727,4 +768,237 @@ def prescore_resumes_batch(
         "single_resume_attempts_total": int(single_resume_attempts_total),
         "single_resume_fail_count": int(single_resume_fail_count),
         "llm_only_complete": bool(llm_only_complete),
-    }
+        "prescore_mode": "chat_legacy",
+    })
+
+
+def _prescore_via_rerank(
+    requirements: dict[str, Any],
+    resumes: list[dict[str, Any]],
+    db: Session | None = None,
+    *,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    phase: str = "interactive",
+    max_seconds: float | None = None,
+) -> tuple[dict[str, int], dict[str, Any]]:
+    if not resumes:
+        return {}, _stats_with_rerank_defaults(
+            {
+                "status": "done",
+                "prescore_elapsed_ms": 0,
+                "llm_calls_total": 0,
+                "llm_calls_refill": 0,
+                "avg_prompt_chars": 0,
+                "parse_fail_count": 0,
+                "refill_gain_ratio": 0.0,
+                "budget_exhausted": False,
+                "llm_scored_count": 0,
+                "fallback_scored_count": 0,
+                "coverage_ratio": 1.0,
+                "fallback_parse_fail_count": 0,
+                "fallback_timeout_count": 0,
+                "fallback_limit_exhausted_count": 0,
+                "unresolved_count": 0,
+                "recovery_batches_total": 0,
+                "single_resume_attempts_total": 0,
+                "single_resume_fail_count": 0,
+                "llm_only_complete": True,
+                "prescore_mode": "rerank",
+            }
+        )
+
+    def rid_of(r: dict[str, Any]) -> str:
+        return str(r.get("id", r.get("hh_resume_id", "")))
+
+    cfg = llm_client.get_llm_config(db)
+    query = _rerank_query(requirements)
+    base_batch_size = max(1, min(500, int(cfg.rerank_batch_size or len(resumes))))
+    timeout = float(cfg.rerank_timeout_seconds or 30.0)
+    fallback_enabled = bool(settings.llm_prescore_enable_fallback)
+    t0 = time.monotonic()
+    budget_seconds = float(max_seconds) if max_seconds is not None else None
+    out: dict[str, int] = {}
+    fallback_reason_by_id: dict[str, str] = {}
+    unresolved_ids: set[str] = set()
+    rerank_calls_total = 0
+    rerank_batch_split_count = 0
+    parse_fail_count = 0
+    budget_exhausted = False
+    raw_relevance_values: list[float] = []
+    score_values: list[int] = []
+    pending: list[tuple[list[dict[str, Any]], int]] = [(list(resumes), base_batch_size)]
+
+    while pending:
+        rows, batch_size = pending.pop(0)
+        for start in range(0, len(rows), max(1, batch_size)):
+            chunk = rows[start : start + max(1, batch_size)]
+            if not chunk:
+                continue
+            if budget_seconds is not None and (time.monotonic() - t0) >= budget_seconds:
+                budget_exhausted = True
+                for row in chunk + rows[start + len(chunk):]:
+                    rid = rid_of(row)
+                    if rid and rid not in out:
+                        unresolved_ids.add(rid)
+                        fallback_reason_by_id[rid] = "limit-exhausted"
+                pending.clear()
+                break
+            docs = [_format_resume_for_rerank_document(row) for row in chunk]
+            rerank_calls_total += 1
+            result_items = llm_client.call_rerank(
+                query,
+                docs,
+                model=cfg.rerank_model,
+                timeout=timeout,
+                db=db,
+            )
+            if result_items is None:
+                parse_fail_count += 1
+                if len(chunk) > 1:
+                    next_batch = max(1, len(chunk) // 2)
+                    if next_batch < len(chunk):
+                        pending.append((chunk, next_batch))
+                        rerank_batch_split_count += 1
+                        continue
+                for row in chunk:
+                    rid = rid_of(row)
+                    if rid and rid not in out:
+                        unresolved_ids.add(rid)
+                        fallback_reason_by_id[rid] = "parse-fail"
+                continue
+
+            chunk_scores: dict[str, int] = {}
+            for item in result_items:
+                idx = item.get("index")
+                if not isinstance(idx, int) or idx < 0 or idx >= len(chunk):
+                    continue
+                rid = rid_of(chunk[idx])
+                if not rid:
+                    continue
+                score = _score_from_relevance(item.get("relevance_score"))
+                if score is None:
+                    continue
+                chunk_scores[rid] = score
+                score_values.append(score)
+                try:
+                    raw_relevance_values.append(float(item.get("relevance_score")))
+                except (TypeError, ValueError):
+                    pass
+
+            out.update(chunk_scores)
+            missing_rows = [row for row in chunk if (rid := rid_of(row)) and rid not in chunk_scores]
+            if missing_rows:
+                if len(chunk) > 1:
+                    next_batch = max(1, len(chunk) // 2)
+                    if next_batch < len(chunk):
+                        pending.append((missing_rows, next_batch))
+                        rerank_batch_split_count += 1
+                        continue
+                for row in missing_rows:
+                    rid = rid_of(row)
+                    if rid and rid not in out:
+                        unresolved_ids.add(rid)
+                        fallback_reason_by_id[rid] = "parse-fail"
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "stage": "prescore",
+                        "event": "batch_done",
+                        "phase": phase,
+                        "batch_size": len(chunk),
+                        "missing_scores": len(missing_rows),
+                        "scored_count": len(out),
+                        "llm_scored_count": len(out),
+                        "fallback_scored_count": 0,
+                        "total_count": len(resumes),
+                        "retry_count": 0,
+                        "llm_calls_refill": 0,
+                        "scores_delta": dict(chunk_scores),
+                    }
+                )
+        if budget_exhausted:
+            break
+
+    llm_scored_count = len(out)
+    fallback_scored_count = 0
+    fallback_reasons = {"parse-fail": 0, "timeout": 0, "limit-exhausted": 0}
+    if fallback_enabled:
+        out, fallback_reasons, fallback_scored_count = _fill_missing_scores(
+            requirements,
+            resumes,
+            out,
+            rid_of=rid_of,
+            phase=phase,
+            fallback_reason_by_id=fallback_reason_by_id,
+            progress_callback=progress_callback,
+        )
+    unresolved_count = max(0, sum(1 for r in resumes if (rid := rid_of(r)) and rid not in out))
+    if fallback_enabled:
+        unresolved_count = 0
+    llm_only_complete = unresolved_count == 0
+    status = "done" if llm_only_complete else ("error" if llm_scored_count == 0 else "partial")
+    coverage_ratio = float(len(out) / len(resumes)) if resumes else 1.0
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    rerank_avg_score = round(sum(score_values) / len(score_values), 4) if score_values else 0.0
+    rerank_raw_avg_relevance = (
+        round(sum(raw_relevance_values) / len(raw_relevance_values), 6) if raw_relevance_values else 0.0
+    )
+    return out, _stats_with_rerank_defaults(
+        {
+            "status": status,
+            "prescore_elapsed_ms": elapsed_ms,
+            "llm_calls_total": rerank_calls_total,
+            "llm_calls_refill": 0,
+            "avg_prompt_chars": 0,
+            "parse_fail_count": parse_fail_count,
+            "refill_gain_ratio": 0.0,
+            "budget_exhausted": budget_exhausted,
+            "llm_scored_count": llm_scored_count,
+            "fallback_scored_count": fallback_scored_count,
+            "coverage_ratio": round(coverage_ratio, 4),
+            "fallback_parse_fail_count": int(fallback_reasons["parse-fail"]),
+            "fallback_timeout_count": int(fallback_reasons["timeout"]),
+            "fallback_limit_exhausted_count": int(fallback_reasons["limit-exhausted"]),
+            "unresolved_count": int(unresolved_count),
+            "recovery_batches_total": int(rerank_batch_split_count),
+            "single_resume_attempts_total": 0,
+            "single_resume_fail_count": 0,
+            "llm_only_complete": bool(llm_only_complete),
+            "prescore_mode": "rerank",
+            "rerank_calls_total": int(rerank_calls_total),
+            "rerank_batch_split_count": int(rerank_batch_split_count),
+            "rerank_avg_score": float(rerank_avg_score),
+            "rerank_raw_avg_relevance": float(rerank_raw_avg_relevance),
+        },
+        rerank_calls_total=rerank_calls_total,
+    )
+
+
+def prescore_resumes_batch(
+    requirements: dict[str, Any],
+    resumes: list[dict[str, Any]],
+    db: Session | None = None,
+    *,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    phase: str = "interactive",
+    max_seconds: float | None = None,
+) -> tuple[dict[str, int], dict[str, Any]]:
+    cfg = llm_client.get_llm_config(db)
+    mode = (cfg.prescore_mode or "chat_legacy").strip()
+    if mode == "rerank":
+        return _prescore_via_rerank(
+            requirements,
+            resumes,
+            db=db,
+            progress_callback=progress_callback,
+            phase=phase,
+            max_seconds=max_seconds,
+        )
+    return _prescore_via_chat_legacy(
+        requirements,
+        resumes,
+        db=db,
+        progress_callback=progress_callback,
+        phase=phase,
+        max_seconds=max_seconds,
+    )
