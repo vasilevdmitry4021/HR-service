@@ -329,6 +329,16 @@ export async function fetchEvaluateSearchProgress(
   );
 }
 
+export async function cancelEvaluateSearchSnapshot(
+  snapshotId: string,
+  jobId: string,
+) {
+  return apiFetch<EvaluateProgressResponse>(
+    `/search/${encodeURIComponent(snapshotId)}/evaluate/cancel?job_id=${encodeURIComponent(jobId)}`,
+    { method: "POST" },
+  );
+}
+
 export async function analyzeSearchSnapshot(
   snapshotId: string,
   topN: number = 15,
@@ -361,6 +371,16 @@ export async function fetchAnalyzeSearchProgress(
 ) {
   return apiFetch<AnalyzeProgressResponse>(
     `/search/${encodeURIComponent(snapshotId)}/analyze/progress?job_id=${encodeURIComponent(jobId)}`,
+  );
+}
+
+export async function cancelAnalyzeSearchSnapshot(
+  snapshotId: string,
+  jobId: string,
+) {
+  return apiFetch<AnalyzeProgressResponse>(
+    `/search/${encodeURIComponent(snapshotId)}/analyze/cancel?job_id=${encodeURIComponent(jobId)}`,
+    { method: "POST" },
   );
 }
 

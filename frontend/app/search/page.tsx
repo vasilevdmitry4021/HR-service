@@ -40,6 +40,8 @@ import {
   analyzeCandidate,
   ApiError,
   apiFetch,
+  cancelAnalyzeSearchSnapshot,
+  cancelEvaluateSearchSnapshot,
   createTemplate,
   fetchAnalyzeSearchProgress,
   deleteTemplate,
@@ -145,6 +147,8 @@ function statusLabelRu(status: string): string {
       return "Завершено частично";
     case "error":
       return "Ошибка";
+    case "cancelled":
+      return "Остановлено";
     case "running":
       return "Выполняется";
     case "queued":
@@ -168,6 +172,8 @@ function stageLabelRu(stage: string): string {
       return "Оценка завершена частично";
     case "error":
       return "Ошибка оценки";
+    case "cancelled":
+      return "Оценка остановлена";
     default:
       return "Выполняем оценку";
   }
@@ -185,6 +191,8 @@ function analyzeStageLabelRu(stage: string): string {
       return "Детальный анализ завершен";
     case "error":
       return "Ошибка анализа";
+    case "cancelled":
+      return "Анализ остановлен";
     default:
       return "Детальный анализ";
   }
@@ -280,14 +288,16 @@ function SearchPageContent() {
     (snapshotEvalBusy || Boolean(snapshotEvalJob)) &&
     evalStatus !== "done" &&
     evalStatus !== "partial" &&
-    evalStatus !== "error";
+    evalStatus !== "error" &&
+    evalStatus !== "cancelled";
   const evalCompleted = snapshotEvalProgress?.status === "done";
   const analyzeStatus =
     snapshotAnalyzeProgress?.status ?? (snapshotAnalyzeBusy ? "running" : "");
   const analyzeIsActive =
     (snapshotAnalyzeBusy || Boolean(snapshotAnalyzeJob)) &&
     analyzeStatus !== "done" &&
-    analyzeStatus !== "error";
+    analyzeStatus !== "error" &&
+    analyzeStatus !== "cancelled";
   const batchOperationActive = evalIsActive || analyzeIsActive;
   const canShowAnalyzeTop = evalCompleted;
   const canRunEvaluate = !analyzeIsActive && !evalIsActive;
@@ -301,7 +311,8 @@ function SearchPageContent() {
     if (
       snapshotEvalProgress.status !== "done" &&
       snapshotEvalProgress.status !== "partial" &&
-      snapshotEvalProgress.status !== "error"
+      snapshotEvalProgress.status !== "error" &&
+      snapshotEvalProgress.status !== "cancelled"
     ) {
       setEvalProgressVisible(true);
       return;
@@ -315,7 +326,11 @@ function SearchPageContent() {
       setAnalyzeProgressVisible(false);
       return;
     }
-    if (snapshotAnalyzeProgress.status !== "done" && snapshotAnalyzeProgress.status !== "error") {
+    if (
+      snapshotAnalyzeProgress.status !== "done" &&
+      snapshotAnalyzeProgress.status !== "error" &&
+      snapshotAnalyzeProgress.status !== "cancelled"
+    ) {
       setAnalyzeProgressVisible(true);
       return;
     }
@@ -832,6 +847,9 @@ function SearchPageContent() {
               progress,
             );
           }
+          if (progress.status === "cancelled") {
+            break;
+          }
           await new Promise((resolve) => window.setTimeout(resolve, 1200));
         }
       } catch (e) {
@@ -912,6 +930,9 @@ function SearchPageContent() {
               503,
               progress,
             );
+          }
+          if (progress.status === "cancelled") {
+            break;
           }
           await new Promise((resolve) => window.setTimeout(resolve, 1200));
         }
@@ -1017,6 +1038,46 @@ function SearchPageContent() {
       setSnapshotAnalyzeBusy(false);
     }
   }, [results?.snapshot_id, evalCompleted, evalIsActive]);
+
+  const handleCancelEvaluateSnapshot = useCallback(async () => {
+    const job = snapshotEvalJob;
+    if (!job) return;
+    setError(null);
+    try {
+      const cancelled = await cancelEvaluateSearchSnapshot(job.snapshotId, job.jobId);
+      snapshotEvalRunIdRef.current += 1;
+      snapshotEvalPollKeyRef.current = null;
+      setSnapshotEvalBusy(false);
+      setSnapshotEvalProgress(mapProgressToUi(cancelled));
+      setSnapshotEvalJob(null);
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "Не удалось остановить оценку выдачи");
+    }
+  }, [snapshotEvalJob]);
+
+  const handleCancelAnalyzeSnapshot = useCallback(async () => {
+    const job = snapshotAnalyzeJob;
+    if (!job) return;
+    setError(null);
+    try {
+      const cancelled = await cancelAnalyzeSearchSnapshot(job.snapshotId, job.jobId);
+      snapshotAnalyzeRunIdRef.current += 1;
+      snapshotAnalyzePollKeyRef.current = null;
+      setSnapshotAnalyzeBusy(false);
+      setSnapshotAnalyzeProgress({
+        status: cancelled.status,
+        stage: cancelled.stage,
+        total: cancelled.total_count,
+        processed: cancelled.processed_count,
+        analyzed: cancelled.analyzed_count,
+      });
+      setSnapshotAnalyzeJob(null);
+    } catch (e) {
+      setError(
+        e instanceof ApiError ? e.message : "Не удалось остановить детальный анализ",
+      );
+    }
+  }, [snapshotAnalyzeJob]);
 
   const handleAnalyze = useCallback(
     async (c: Candidate) => {
@@ -1389,28 +1450,50 @@ function SearchPageContent() {
                 <div className="space-y-2">
                   <div className="flex flex-wrap gap-2">
                     {!evalCompleted && (
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="secondary"
-                        disabled={!canRunEvaluate || loading}
-                        onClick={() => void handleEvaluateSnapshot()}
-                      >
-                        {snapshotEvalBusy ? "Оценка выдачи…" : "Оценить выдачу"}
-                      </Button>
+                      snapshotEvalBusy ? (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="destructive"
+                          disabled={loading}
+                          onClick={() => void handleCancelEvaluateSnapshot()}
+                        >
+                          Отменить
+                        </Button>
+                      ) : (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="secondary"
+                          disabled={!canRunEvaluate || loading}
+                          onClick={() => void handleEvaluateSnapshot()}
+                        >
+                          Оценить выдачу
+                        </Button>
+                      )
                     )}
                     {canShowAnalyzeTop && (
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="outline"
-                        disabled={!canRunAnalyzeTop || loading}
-                        onClick={() => void handleAnalyzeSnapshot()}
-                      >
-                        {snapshotAnalyzeBusy
-                          ? "Детальный анализ…"
-                          : "Детальный анализ (топ-15)"}
-                      </Button>
+                      snapshotAnalyzeBusy ? (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="destructive"
+                          disabled={loading}
+                          onClick={() => void handleCancelAnalyzeSnapshot()}
+                        >
+                          Отменить
+                        </Button>
+                      ) : (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={!canRunAnalyzeTop || loading}
+                          onClick={() => void handleAnalyzeSnapshot()}
+                        >
+                          Детальный анализ (топ-15)
+                        </Button>
+                      )
                     )}
                   </div>
                   {snapshotEvalProgress && evalProgressVisible && (
@@ -1419,7 +1502,8 @@ function SearchPageContent() {
                       (
                         snapshotEvalProgress.status === "done" ||
                         snapshotEvalProgress.status === "partial" ||
-                        snapshotEvalProgress.status === "error"
+                        snapshotEvalProgress.status === "error" ||
+                        snapshotEvalProgress.status === "cancelled"
                       ) && "opacity-50",
                     )}>
                       <Progress
@@ -1434,46 +1518,21 @@ function SearchPageContent() {
                           ? "Можно продолжать работать со списком и страницами — оценки подгружаются автоматически."
                           : ""}
                       </p>
-                      <p>
-                        <span className="text-xs text-muted-foreground">
+                      <p className="text-xs text-muted-foreground">
                         Проверено резюме: {snapshotEvalProgress.scored} из{" "}
                         {snapshotEvalProgress.total} (готово{" "}
                         {(snapshotEvalProgress.coverageRatio * 100).toFixed(0)}%)
-                        </span>
                       </p>
-                      <p className="text-xs text-muted-foreground">
-                        Оценено основным способом: {snapshotEvalProgress.llmScored}
-                        {" · дополнительно обработано: "}
-                        {snapshotEvalProgress.fallbackScored}
-                      </p>
-                      {snapshotEvalProgress.unresolvedCount > 0 && (
-                        <p className="text-xs text-amber-700">
-                          Не удалось получить LLM-score для {snapshotEvalProgress.unresolvedCount} резюме.
-                        </p>
-                      )}
-                      <p className="text-xs text-muted-foreground">
-                        Первичная оценка: {snapshotEvalProgress.interactiveDone} из{" "}
-                        {snapshotEvalProgress.interactiveTotal}
-                        {" · дополнительно обработано: "}
-                        {snapshotEvalProgress.interactiveFallback}
-                        {snapshotEvalProgress.interactiveReady
-                          ? " — первые оценки готовы"
-                          : ""}
-                      </p>
-                      {snapshotEvalProgress.backgroundTotal > 0 && (
-                        <p className="text-xs text-muted-foreground">
-                          Дополнительная оценка: {snapshotEvalProgress.backgroundDone} из{" "}
-                          {snapshotEvalProgress.backgroundTotal}
-                          {" · дополнительно обработано: "}
-                          {snapshotEvalProgress.backgroundFallback}
-                        </p>
-                      )}
                     </div>
                   )}
                   {snapshotAnalyzeProgress && analyzeProgressVisible && (
                     <div className={cn(
                       "space-y-2 rounded-lg border bg-muted/30 p-3 transition-opacity duration-500",
-                      (snapshotAnalyzeProgress.status === "done" || snapshotAnalyzeProgress.status === "error") && "opacity-50",
+                      (
+                        snapshotAnalyzeProgress.status === "done" ||
+                        snapshotAnalyzeProgress.status === "error" ||
+                        snapshotAnalyzeProgress.status === "cancelled"
+                      ) && "opacity-50",
                     )}>
                       <Progress
                         value={Math.min(

@@ -30,6 +30,9 @@ def create_job(*, user_id: str, snapshot_id: str, total_count: int) -> str:
         "analyses": {},
         "processing_time_seconds": None,
         "error": None,
+        "cancel_requested": False,
+        "has_active_task": False,
+        "_task": None,
         "created_monotonic": now,
         "updated_monotonic": now,
     }
@@ -56,6 +59,35 @@ def _update(job_id: str, **changes: Any) -> None:
 
 def mark_running(job_id: str) -> None:
     _update(job_id, status="running", stage="preparing")
+
+
+def attach_task(job_id: str, task: Any) -> None:
+    _update(job_id, _task=task, has_active_task=True)
+
+
+def detach_task(job_id: str) -> Any | None:
+    with _lock:
+        state = _jobs.get(job_id)
+        if not state:
+            return None
+        task = state.get("_task")
+        state["_task"] = None
+        state["has_active_task"] = False
+        state["updated_monotonic"] = time.monotonic()
+        _jobs.set(job_id, state)
+        return task
+
+
+def get_task(job_id: str) -> Any | None:
+    with _lock:
+        state = _jobs.get(job_id)
+        if not state:
+            return None
+        return state.get("_task")
+
+
+def request_cancel(job_id: str) -> None:
+    _update(job_id, cancel_requested=True)
 
 
 def update_progress(
@@ -110,6 +142,9 @@ def mark_done(
         analyzed_count=max(0, int(analyzed_count)),
         processing_time_seconds=round(float(processing_time_seconds), 3),
         error=None,
+        cancel_requested=False,
+        has_active_task=False,
+        _task=None,
     )
 
 
@@ -119,4 +154,24 @@ def mark_failed(job_id: str, error: str) -> None:
         status="error",
         stage="error",
         error=error.strip() or "Ошибка анализа",
+        has_active_task=False,
+        _task=None,
     )
+
+
+def mark_cancelled(
+    job_id: str,
+    *,
+    processing_time_seconds: float | None = None,
+    error: str | None = None,
+) -> None:
+    patch: dict[str, Any] = {
+        "status": "cancelled",
+        "stage": "cancelled",
+        "error": (error or "").strip() or "Операция отменена пользователем",
+        "has_active_task": False,
+        "_task": None,
+    }
+    if processing_time_seconds is not None:
+        patch["processing_time_seconds"] = round(float(processing_time_seconds), 3)
+    _update(job_id, **patch)

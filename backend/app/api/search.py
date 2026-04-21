@@ -56,6 +56,56 @@ router = APIRouter(prefix="/search", tags=["search"])
 
 logger = logging.getLogger(__name__)
 metrics_logger = logging.getLogger("search.metrics")
+_TERMINAL_JOB_STATUSES = {"done", "partial", "error", "cancelled"}
+
+
+def _evaluate_progress_out_from_state(state: dict[str, Any], job_id: str) -> EvaluateProgressOut:
+    scores = state.get("scores") or {}
+    items = [
+        EvaluateCandidateOut(id=str(rid), llm_score=score if isinstance(score, int) else None)
+        for rid, score in sorted(scores.items(), key=lambda item: str(item[0]))
+    ]
+    return EvaluateProgressOut(
+        job_id=str(state.get("job_id") or job_id),
+        status=str(state.get("status") or "queued"),
+        stage=str(state.get("stage") or "queued"),
+        phase=str(state.get("phase") or "interactive"),
+        total_count=int(state.get("total_count") or 0),
+        scored_count=int(state.get("scored_count") or 0),
+        llm_scored_count=int(state.get("llm_scored_count") or 0),
+        fallback_scored_count=int(state.get("fallback_scored_count") or 0),
+        coverage_ratio=float(state.get("coverage_ratio") or 0.0),
+        llm_coverage_ratio=float(state.get("llm_coverage_ratio") or state.get("coverage_ratio") or 0.0),
+        unresolved_count=int(state.get("unresolved_count") or 0),
+        llm_only_complete=bool(state.get("llm_only_complete")),
+        completed_count=int(state.get("completed_count") or 0),
+        interactive_total_count=int(state.get("interactive_total_count") or 0),
+        background_total_count=int(state.get("background_total_count") or 0),
+        interactive_done_count=int(state.get("interactive_done_count") or 0),
+        background_done_count=int(state.get("background_done_count") or 0),
+        interactive_llm_scored_count=int(state.get("interactive_llm_scored_count") or 0),
+        background_llm_scored_count=int(state.get("background_llm_scored_count") or 0),
+        interactive_fallback_count=int(state.get("interactive_fallback_count") or 0),
+        background_fallback_count=int(state.get("background_fallback_count") or 0),
+        items=items,
+        processing_time_seconds=state.get("processing_time_seconds"),
+        error=state.get("error"),
+        metrics=dict(state.get("metrics") or {}),
+    )
+
+
+def _analyze_progress_out_from_state(state: dict[str, Any], job_id: str) -> AnalyzeProgressOut:
+    return AnalyzeProgressOut(
+        job_id=str(state.get("job_id") or job_id),
+        status=str(state.get("status") or "queued"),
+        stage=str(state.get("stage") or "queued"),
+        total_count=int(state.get("total_count") or 0),
+        processed_count=int(state.get("processed_count") or 0),
+        analyzed_count=int(state.get("analyzed_count") or 0),
+        analyses=dict(state.get("analyses") or {}),
+        processing_time_seconds=state.get("processing_time_seconds"),
+        error=state.get("error"),
+    )
 
 
 def _evaluate_response_item_dict(row: dict[str, Any]) -> dict[str, Any]:
@@ -418,6 +468,12 @@ async def _run_evaluate_job(
                     else "Оценка завершена частично: не все резюме получили LLM-score."
                 ),
             )
+    except asyncio.CancelledError:
+        logger.info("Фоновая оценка снимка отменена пользователем: job_id=%s", job_id)
+        evaluate_progress.mark_cancelled(
+            job_id,
+            processing_time_seconds=time.monotonic() - started,
+        )
     except HHClientError as exc:
         logger.warning("Оценка снимка остановлена ошибкой HH: %s", exc.detail)
         evaluate_progress.mark_failed(job_id, exc.detail)
@@ -425,6 +481,7 @@ async def _run_evaluate_job(
         logger.exception("Ошибка оценки снимка в фоне: %s", exc)
         evaluate_progress.mark_failed(job_id, "Не удалось выполнить оценку резюме")
     finally:
+        evaluate_progress.detach_task(job_id)
         db.close()
 
 
@@ -499,6 +556,12 @@ async def _run_analyze_job(
             analyzed_count=analyzed_n,
             processing_time_seconds=time.monotonic() - started,
         )
+    except asyncio.CancelledError:
+        logger.info("Фоновый анализ снимка отменен пользователем: job_id=%s", job_id)
+        analyze_progress.mark_cancelled(
+            job_id,
+            processing_time_seconds=time.monotonic() - started,
+        )
     except HHClientError as exc:
         detail = exc.detail
         if is_daily_view_limit_error(exc.detail):
@@ -511,6 +574,7 @@ async def _run_analyze_job(
         logger.exception("Ошибка детального анализа в фоне: %s", exc)
         analyze_progress.mark_failed(job_id, "Не удалось выполнить детальный анализ")
     finally:
+        analyze_progress.detach_task(job_id)
         db.close()
 
 
@@ -945,7 +1009,7 @@ async def evaluate_resumes_start(
         interactive_total_count=interactive_total,
         background_total_count=max(0, len(snap.items) - interactive_total),
     )
-    asyncio.create_task(
+    task = asyncio.create_task(
         _run_evaluate_job(
             job_id=job_id,
             user_id=uid,
@@ -954,6 +1018,7 @@ async def evaluate_resumes_start(
             access=access,
         )
     )
+    evaluate_progress.attach_task(job_id, task)
     return EvaluateStartOut(job_id=job_id, status="queued", total_count=len(snap.items))
 
 
@@ -1005,7 +1070,7 @@ async def analyze_resumes_start(
         processed_count=0,
         analyzed_count=0,
     )
-    asyncio.create_task(
+    task = asyncio.create_task(
         _run_analyze_job(
             job_id=job_id,
             user_id=uid,
@@ -1014,7 +1079,90 @@ async def analyze_resumes_start(
             top_n=top_n,
         )
     )
+    analyze_progress.attach_task(job_id, task)
     return AnalyzeStartOut(job_id=job_id, status="queued", total_count=total_count)
+
+
+@router.post("/{snapshot_id}/evaluate/cancel", response_model=EvaluateProgressOut)
+async def evaluate_resumes_cancel(
+    snapshot_id: str,
+    job_id: str,
+    user: User = Depends(get_current_user),
+) -> EvaluateProgressOut:
+    state = evaluate_progress.get_job(job_id)
+    if state is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Задача оценки не найдена или истекла.",
+        )
+    if str(state.get("user_id")) != str(user.id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Нет доступа к задаче оценки.",
+        )
+    if str(state.get("snapshot_id")) != snapshot_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="job_id не относится к указанному snapshot_id.",
+        )
+
+    current_status = str(state.get("status") or "queued")
+    if current_status not in _TERMINAL_JOB_STATUSES:
+        evaluate_progress.request_cancel(job_id)
+        task = evaluate_progress.get_task(job_id)
+        if task is not None and not task.done():
+            task.cancel()
+        elif current_status in {"queued", "running"}:
+            evaluate_progress.mark_cancelled(job_id)
+
+    updated_state = evaluate_progress.get_job(job_id)
+    if updated_state is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Задача оценки не найдена или истекла.",
+        )
+    return _evaluate_progress_out_from_state(updated_state, job_id)
+
+
+@router.post("/{snapshot_id}/analyze/cancel", response_model=AnalyzeProgressOut)
+async def analyze_resumes_cancel(
+    snapshot_id: str,
+    job_id: str,
+    user: User = Depends(get_current_user),
+) -> AnalyzeProgressOut:
+    state = analyze_progress.get_job(job_id)
+    if state is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Задача анализа не найдена или истекла.",
+        )
+    if str(state.get("user_id")) != str(user.id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Нет доступа к задаче анализа.",
+        )
+    if str(state.get("snapshot_id")) != snapshot_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="job_id не относится к указанному snapshot_id.",
+        )
+
+    current_status = str(state.get("status") or "queued")
+    if current_status not in _TERMINAL_JOB_STATUSES:
+        analyze_progress.request_cancel(job_id)
+        task = analyze_progress.get_task(job_id)
+        if task is not None and not task.done():
+            task.cancel()
+        elif current_status in {"queued", "running"}:
+            analyze_progress.mark_cancelled(job_id)
+
+    updated_state = analyze_progress.get_job(job_id)
+    if updated_state is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Задача анализа не найдена или истекла.",
+        )
+    return _analyze_progress_out_from_state(updated_state, job_id)
 
 
 @router.get("/{snapshot_id}/analyze/progress", response_model=AnalyzeProgressOut)
@@ -1039,17 +1187,7 @@ async def analyze_resumes_progress(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="job_id не относится к указанному snapshot_id.",
         )
-    return AnalyzeProgressOut(
-        job_id=str(state.get("job_id") or job_id),
-        status=str(state.get("status") or "queued"),
-        stage=str(state.get("stage") or "queued"),
-        total_count=int(state.get("total_count") or 0),
-        processed_count=int(state.get("processed_count") or 0),
-        analyzed_count=int(state.get("analyzed_count") or 0),
-        analyses=dict(state.get("analyses") or {}),
-        processing_time_seconds=state.get("processing_time_seconds"),
-        error=state.get("error"),
-    )
+    return _analyze_progress_out_from_state(state, job_id)
 
 
 @router.get("/{snapshot_id}/evaluate/progress", response_model=EvaluateProgressOut)
@@ -1076,38 +1214,7 @@ async def evaluate_resumes_progress(
             detail="job_id не относится к указанному snapshot_id.",
         )
 
-    scores = state.get("scores") or {}
-    items = [
-        EvaluateCandidateOut(id=str(rid), llm_score=score if isinstance(score, int) else None)
-        for rid, score in sorted(scores.items(), key=lambda item: str(item[0]))
-    ]
-    return EvaluateProgressOut(
-        job_id=str(state.get("job_id") or job_id),
-        status=str(state.get("status") or "queued"),
-        stage=str(state.get("stage") or "queued"),
-        phase=str(state.get("phase") or "interactive"),
-        total_count=int(state.get("total_count") or 0),
-        scored_count=int(state.get("scored_count") or 0),
-        llm_scored_count=int(state.get("llm_scored_count") or 0),
-        fallback_scored_count=int(state.get("fallback_scored_count") or 0),
-        coverage_ratio=float(state.get("coverage_ratio") or 0.0),
-        llm_coverage_ratio=float(state.get("llm_coverage_ratio") or state.get("coverage_ratio") or 0.0),
-        unresolved_count=int(state.get("unresolved_count") or 0),
-        llm_only_complete=bool(state.get("llm_only_complete")),
-        completed_count=int(state.get("completed_count") or 0),
-        interactive_total_count=int(state.get("interactive_total_count") or 0),
-        background_total_count=int(state.get("background_total_count") or 0),
-        interactive_done_count=int(state.get("interactive_done_count") or 0),
-        background_done_count=int(state.get("background_done_count") or 0),
-        interactive_llm_scored_count=int(state.get("interactive_llm_scored_count") or 0),
-        background_llm_scored_count=int(state.get("background_llm_scored_count") or 0),
-        interactive_fallback_count=int(state.get("interactive_fallback_count") or 0),
-        background_fallback_count=int(state.get("background_fallback_count") or 0),
-        items=items,
-        processing_time_seconds=state.get("processing_time_seconds"),
-        error=state.get("error"),
-        metrics=dict(state.get("metrics") or {}),
-    )
+    return _evaluate_progress_out_from_state(state, job_id)
 
 
 @router.post("", response_model=SearchOut)
