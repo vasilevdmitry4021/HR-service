@@ -563,6 +563,7 @@ def call_llm_chat(
     format_json: bool = False,
     timeout: float = 90.0,
     runtime_config: LLMRuntimeConfig | None = None,
+    request: Any | None = None,
 ) -> str | None:
     """Унифицированный вызов чата; model по умолчанию — основная модель из конфигурации."""
     cfg = runtime_config or get_llm_config(db)
@@ -570,13 +571,22 @@ def call_llm_chat(
     if not m:
         return None
 
-    if cfg.provider == LLMProvider.YANDEX_GPT.value:
-        return _call_yandex(cfg, messages, m, format_json=format_json, timeout=timeout)
-    if cfg.provider == LLMProvider.GIGACHAT.value:
-        return _call_gigachat(cfg, messages, m, format_json=format_json, timeout=timeout)
-    return _call_openai_compatible(
-        cfg, messages, m, format_json=format_json, timeout=timeout
-    )
+    from app.services.integration_call_tracker import track_integration_call
+
+    with track_integration_call(request, "llm", "call_llm_chat") as _call:
+        try:
+            if cfg.provider == LLMProvider.YANDEX_GPT.value:
+                result = _call_yandex(cfg, messages, m, format_json=format_json, timeout=timeout)
+            elif cfg.provider == LLMProvider.GIGACHAT.value:
+                result = _call_gigachat(cfg, messages, m, format_json=format_json, timeout=timeout)
+            else:
+                result = _call_openai_compatible(
+                    cfg, messages, m, format_json=format_json, timeout=timeout
+                )
+            _call["status_code"] = 200 if result is not None else 500
+            return result
+        except Exception:
+            raise
 
 
 def call_llm_user_prompt(
@@ -587,6 +597,7 @@ def call_llm_user_prompt(
     format_json: bool = False,
     timeout: float = 90.0,
     runtime_config: LLMRuntimeConfig | None = None,
+    request: Any | None = None,
 ) -> str | None:
     """Один пользовательский промпт (как в анализе резюме)."""
     return call_llm_chat(
@@ -596,6 +607,7 @@ def call_llm_user_prompt(
         format_json=format_json,
         timeout=timeout,
         runtime_config=runtime_config,
+        request=request,
     )
 
 

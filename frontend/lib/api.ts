@@ -10,6 +10,10 @@ import type {
   FavoriteRefreshResponse,
   FavoriteRow,
   LLMAnalysis,
+  RequestLogEntry,
+  RequestLogErrorsList,
+  RequestLogList,
+  RequestLogStats,
   SearchHistoryListResponse,
   SearchTemplateRow,
 } from "@/lib/types";
@@ -831,6 +835,64 @@ export function removeIntegrationEditorFlag(userId: string) {
   return apiFetch<unknown>(`/admin/integration-settings-editors/${userId}`, {
     method: "DELETE",
   });
+}
+
+export type RequestLogFilters = {
+  skip?: number;
+  limit?: number;
+  date_from?: string;
+  date_to?: string;
+  user_id?: string;
+  route_tag?: string;
+  status_min?: number;
+  status_max?: number;
+  error_type?: string;
+  search?: string;
+};
+
+export async function fetchRequestLog(params: RequestLogFilters = {}) {
+  const q = new URLSearchParams();
+  if (params.skip !== undefined) q.set("skip", String(params.skip));
+  if (params.limit !== undefined) q.set("limit", String(params.limit));
+  if (params.date_from) q.set("date_from", params.date_from);
+  if (params.date_to) q.set("date_to", params.date_to);
+  if (params.user_id) q.set("user_id", params.user_id);
+  if (params.route_tag) q.set("route_tag", params.route_tag);
+  if (params.status_min !== undefined) q.set("status_min", String(params.status_min));
+  if (params.status_max !== undefined) q.set("status_max", String(params.status_max));
+  if (params.error_type) q.set("error_type", params.error_type);
+  if (params.search) q.set("search", params.search);
+  const qs = q.toString();
+  return apiFetch<RequestLogList>(`/request-log${qs ? `?${qs}` : ""}`);
+}
+
+export async function fetchRequestLogEntry(requestId: string) {
+  return apiFetch<RequestLogEntry>(`/request-log/${encodeURIComponent(requestId)}`);
+}
+
+export async function fetchRequestLogStats(dateFrom?: string, dateTo?: string) {
+  const q = new URLSearchParams();
+  if (dateFrom) q.set("date_from", dateFrom);
+  if (dateTo) q.set("date_to", dateTo);
+  const qs = q.toString();
+  return apiFetch<RequestLogStats>(`/request-log/stats${qs ? `?${qs}` : ""}`);
+}
+
+export type RequestLogErrorsFilters = {
+  date_from?: string;
+  date_to?: string;
+  route_tag?: string;
+  error_type?: string;
+};
+
+export async function fetchRequestLogErrors(params: RequestLogErrorsFilters = {}) {
+  const q = new URLSearchParams();
+  if (params.date_from) q.set("date_from", params.date_from);
+  if (params.date_to) q.set("date_to", params.date_to);
+  if (params.route_tag) q.set("route_tag", params.route_tag);
+  if (params.error_type) q.set("error_type", params.error_type);
+  const qs = q.toString();
+  return apiFetch<RequestLogErrorsList>(`/request-log/errors${qs ? `?${qs}` : ""}`);
 }
 
 export async function loginRequest(email: string, password: string) {

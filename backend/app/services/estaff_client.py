@@ -7,6 +7,8 @@ import time
 from typing import Any, TypedDict
 from urllib.parse import urlparse
 
+from app.services.integration_call_tracker import track_integration_call_async
+
 import certifi
 import httpx
 
@@ -286,6 +288,7 @@ async def fetch_get_voc(
     server_name: str,
     api_token: str,
     voc_id: str,
+    request: Any | None = None,
 ) -> list[dict[str, Any]]:
     """POST /api/base/get_voc — элементы справочника [{id, name}, ...]."""
     vid = (voc_id or "").strip()
@@ -315,75 +318,80 @@ async def fetch_get_voc(
     body = {"voc": {"id": vid}}
 
     last_exc: EStaffClientError | None = None
-    for attempt in range(3):
-        try:
-            async with _estaff_http_client() as client:
-                r = await client.post(url, headers=headers, json=body)
-            if r.status_code in (500, 502, 503) and attempt < 2:
-                await asyncio.sleep(0.5 * (attempt + 1))
-                continue
-            if r.is_success:
-                try:
-                    parsed = r.json()
-                except Exception:
-                    raise EStaffClientError(
-                        502,
-                        "Некорректный ответ справочника e-staff.",
-                        "invalid json get_voc",
-                    ) from None
-                items = parse_get_voc_response(parsed)
-                if not items and isinstance(parsed, dict) and parsed.get("success") is not False:
-                    logger.warning(
-                        "estaff_get_voc_empty voc_id=%s keys=%s",
-                        vid,
-                        list(parsed.keys()) if isinstance(parsed, dict) else None,
-                    )
-                return items
-            text = r.text or ""
+    async with track_integration_call_async(request, "estaff", "fetch_get_voc") as _call:
+        for attempt in range(3):
             try:
-                parsed_err = r.json()
-                err_body = json.dumps(parsed_err, ensure_ascii=False)
-            except Exception:
-                parsed_err = None
-                err_body = _truncate_detail(text)
-            user_msg = _user_message_from_estaff_http_error(
-                r.status_code,
-                parsed_err if parsed_err is not None else text,
-            )
-            raise EStaffClientError(
-                r.status_code,
-                user_msg,
-                _truncate_detail(f"HTTP {r.status_code} get_voc: {err_body}"),
-            )
-        except httpx.TimeoutException:
-            last_exc = EStaffClientError(
-                504,
-                "Сервис e-staff не ответил вовремя. Повторите попытку позже.",
-                "timeout get_voc",
-            )
-            if attempt < 2:
-                await asyncio.sleep(0.5 * (attempt + 1))
-                continue
-            raise last_exc from None
-        except httpx.RequestError as exc:
-            logger.warning(
-                "estaff_get_voc_request_error url=%s err=%s",
-                url,
-                exc,
-                exc_info=True,
-            )
-            last_exc = EStaffClientError(
-                502,
-                _user_message_for_request_error(exc, server_name),
-                _truncate_detail(str(exc)),
-            )
-            if attempt < 2:
-                await asyncio.sleep(0.5 * (attempt + 1))
-                continue
-            raise last_exc from None
-    if last_exc:
-        raise last_exc
-    raise EStaffClientError(500, "Не удалось получить справочник e-staff.", "unknown get_voc")
+                async with _estaff_http_client() as client:
+                    r = await client.post(url, headers=headers, json=body)
+                if r.status_code in (500, 502, 503) and attempt < 2:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                if r.is_success:
+                    _call["status_code"] = r.status_code
+                    try:
+                        parsed = r.json()
+                    except Exception:
+                        raise EStaffClientError(
+                            502,
+                            "Некорректный ответ справочника e-staff.",
+                            "invalid json get_voc",
+                        ) from None
+                    items = parse_get_voc_response(parsed)
+                    if not items and isinstance(parsed, dict) and parsed.get("success") is not False:
+                        logger.warning(
+                            "estaff_get_voc_empty voc_id=%s keys=%s",
+                            vid,
+                            list(parsed.keys()) if isinstance(parsed, dict) else None,
+                        )
+                    return items
+                text = r.text or ""
+                try:
+                    parsed_err = r.json()
+                    err_body = json.dumps(parsed_err, ensure_ascii=False)
+                except Exception:
+                    parsed_err = None
+                    err_body = _truncate_detail(text)
+                user_msg = _user_message_from_estaff_http_error(
+                    r.status_code,
+                    parsed_err if parsed_err is not None else text,
+                )
+                _call["status_code"] = r.status_code
+                raise EStaffClientError(
+                    r.status_code,
+                    user_msg,
+                    _truncate_detail(f"HTTP {r.status_code} get_voc: {err_body}"),
+                )
+            except httpx.TimeoutException:
+                last_exc = EStaffClientError(
+                    504,
+                    "Сервис e-staff не ответил вовремя. Повторите попытку позже.",
+                    "timeout get_voc",
+                )
+                if attempt < 2:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                _call["error"] = "TimeoutException"
+                raise last_exc from None
+            except httpx.RequestError as exc:
+                logger.warning(
+                    "estaff_get_voc_request_error url=%s err=%s",
+                    url,
+                    exc,
+                    exc_info=True,
+                )
+                last_exc = EStaffClientError(
+                    502,
+                    _user_message_for_request_error(exc, server_name),
+                    _truncate_detail(str(exc)),
+                )
+                if attempt < 2:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                _call["error"] = "RequestError"
+                raise last_exc from None
+        if last_exc:
+            raise last_exc
+        raise EStaffClientError(500, "Не удалось получить справочник e-staff.", "unknown get_voc")
 
 
 async def fetch_open_vacancies(
@@ -392,6 +400,7 @@ async def fetch_open_vacancies(
     *,
     min_start_date_iso: str,
     max_start_date_iso: str,
+    request: Any | None = None,
 ) -> tuple[list[EstaffVacancyRow], float]:
     """POST /api/vacancy/find — список вакансий. Возвращает (список, длительность с)."""
     if settings.feature_use_mock_estaff:
@@ -424,76 +433,81 @@ async def fetch_open_vacancies(
     }
     t0 = time.perf_counter()
     last_exc: EStaffClientError | None = None
-    for attempt in range(3):
-        try:
-            async with _estaff_http_client() as client:
-                r = await client.post(
-                    url,
-                    headers=headers,
-                    json=request_body,
-                )
-            if r.status_code in (500, 502, 503) and attempt < 2:
-                await asyncio.sleep(0.5 * (attempt + 1))
-                continue
-            if r.is_success:
-                try:
-                    parsed = r.json()
-                except Exception:
-                    raise EStaffClientError(
-                        502,
-                        "Некорректный ответ списка вакансий e-staff.",
-                        "invalid json",
-                    ) from None
-                rows = normalize_vacancies_payload(parsed)
-                return rows, time.perf_counter() - t0
-            text = r.text or ""
+    async with track_integration_call_async(request, "estaff", "fetch_open_vacancies") as _call:
+        for attempt in range(3):
             try:
-                parsed_err = r.json()
-                err_body = json.dumps(parsed_err, ensure_ascii=False)
-            except Exception:
-                parsed_err = None
-                err_body = _truncate_detail(text)
-            if r.status_code == 404:
-                user_msg = "Список вакансий в e-staff не найден. Проверьте путь API (ESTAFF_VACANCIES_PATH)."
-            else:
-                user_msg = _user_message_from_estaff_http_error(
+                async with _estaff_http_client() as client:
+                    r = await client.post(
+                        url,
+                        headers=headers,
+                        json=request_body,
+                    )
+                if r.status_code in (500, 502, 503) and attempt < 2:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                if r.is_success:
+                    _call["status_code"] = r.status_code
+                    try:
+                        parsed = r.json()
+                    except Exception:
+                        raise EStaffClientError(
+                            502,
+                            "Некорректный ответ списка вакансий e-staff.",
+                            "invalid json",
+                        ) from None
+                    rows = normalize_vacancies_payload(parsed)
+                    return rows, time.perf_counter() - t0
+                text = r.text or ""
+                try:
+                    parsed_err = r.json()
+                    err_body = json.dumps(parsed_err, ensure_ascii=False)
+                except Exception:
+                    parsed_err = None
+                    err_body = _truncate_detail(text)
+                if r.status_code == 404:
+                    user_msg = "Список вакансий в e-staff не найден. Проверьте путь API (ESTAFF_VACANCIES_PATH)."
+                else:
+                    user_msg = _user_message_from_estaff_http_error(
+                        r.status_code,
+                        parsed_err if parsed_err is not None else text,
+                    )
+                _call["status_code"] = r.status_code
+                raise EStaffClientError(
                     r.status_code,
-                    parsed_err if parsed_err is not None else text,
+                    user_msg,
+                    _truncate_detail(f"HTTP {r.status_code}: {err_body}"),
                 )
-            raise EStaffClientError(
-                r.status_code,
-                user_msg,
-                _truncate_detail(f"HTTP {r.status_code}: {err_body}"),
-            )
-        except httpx.TimeoutException:
-            last_exc = EStaffClientError(
-                504,
-                "Сервис e-staff не ответил вовремя. Повторите попытку позже.",
-                "timeout",
-            )
-            if attempt < 2:
-                await asyncio.sleep(0.5 * (attempt + 1))
-                continue
-            raise last_exc from None
-        except httpx.RequestError as exc:
-            logger.warning(
-                "estaff_vacancies_request_error url=%s err=%s",
-                url,
-                exc,
-                exc_info=True,
-            )
-            last_exc = EStaffClientError(
-                502,
-                _user_message_for_request_error(exc, server_name),
-                _truncate_detail(str(exc)),
-            )
-            if attempt < 2:
-                await asyncio.sleep(0.5 * (attempt + 1))
-                continue
-            raise last_exc from None
-    if last_exc:
-        raise last_exc
-    raise EStaffClientError(500, "Не удалось получить список вакансий e-staff.", "unknown")
+            except httpx.TimeoutException:
+                last_exc = EStaffClientError(
+                    504,
+                    "Сервис e-staff не ответил вовремя. Повторите попытку позже.",
+                    "timeout",
+                )
+                if attempt < 2:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                _call["error"] = "TimeoutException"
+                raise last_exc from None
+            except httpx.RequestError as exc:
+                logger.warning(
+                    "estaff_vacancies_request_error url=%s err=%s",
+                    url,
+                    exc,
+                    exc_info=True,
+                )
+                last_exc = EStaffClientError(
+                    502,
+                    _user_message_for_request_error(exc, server_name),
+                    _truncate_detail(str(exc)),
+                )
+                if attempt < 2:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                _call["error"] = "RequestError"
+                raise last_exc from None
+        if last_exc:
+            raise last_exc
+        raise EStaffClientError(500, "Не удалось получить список вакансий e-staff.", "unknown")
 
 
 def _extract_candidate_id_from_response(data: Any) -> str | None:
@@ -636,6 +650,7 @@ async def create_candidate_in_estaff(
     *,
     user_login: str,
     vacancy_id: str | None = None,
+    request: Any | None = None,
 ) -> tuple[str | None, float]:
     """Создаёт кандидата в e-staff. Возвращает (id кандидата или None, длительность с)."""
     if settings.feature_use_mock_estaff:
@@ -684,66 +699,71 @@ async def create_candidate_in_estaff(
 
     last_exc: EStaffClientError | None = None
     t0 = time.perf_counter()
-    for attempt in range(3):
-        try:
-            async with _estaff_http_client() as client:
-                r = await client.post(
-                    url,
-                    json=send_body,
-                    headers=headers,
-                )
-            if r.status_code in (500, 502, 503) and attempt < 2:
-                await asyncio.sleep(0.5 * (attempt + 1))
-                continue
-            if r.is_success:
-                try:
-                    parsed = r.json()
-                except Exception:
-                    parsed = None
-                cid = _extract_candidate_id_from_response(parsed)
-                return cid, time.perf_counter() - t0
-            text = r.text or ""
+    async with track_integration_call_async(request, "estaff", "create_candidate") as _call:
+        for attempt in range(3):
             try:
-                parsed_err = r.json()
-                err_body = json.dumps(parsed_err, ensure_ascii=False)
-            except Exception:
-                parsed_err = None
-                err_body = _truncate_detail(text)
-            user_msg = _user_message_from_estaff_http_error(
-                r.status_code,
-                parsed_err if parsed_err is not None else text,
-            )
-            raise EStaffClientError(
-                r.status_code,
-                user_msg,
-                _truncate_detail(f"HTTP {r.status_code}: {err_body}"),
-            )
-        except httpx.TimeoutException:
-            last_exc = EStaffClientError(
-                504,
-                "Сервис e-staff не ответил вовремя. Повторите попытку позже.",
-                "timeout",
-            )
-            if attempt < 2:
-                await asyncio.sleep(0.5 * (attempt + 1))
-                continue
-            raise last_exc from None
-        except httpx.RequestError as exc:
-            logger.warning(
-                "estaff_candidate_request_error url=%s err=%s",
-                url,
-                exc,
-                exc_info=True,
-            )
-            last_exc = EStaffClientError(
-                502,
-                _user_message_for_request_error(exc, server_name),
-                _truncate_detail(str(exc)),
-            )
-            if attempt < 2:
-                await asyncio.sleep(0.5 * (attempt + 1))
-                continue
-            raise last_exc from None
-    if last_exc:
-        raise last_exc
-    raise EStaffClientError(500, "Не удалось выполнить выгрузку в e-staff.", "unknown")
+                async with _estaff_http_client() as client:
+                    r = await client.post(
+                        url,
+                        json=send_body,
+                        headers=headers,
+                    )
+                if r.status_code in (500, 502, 503) and attempt < 2:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                if r.is_success:
+                    _call["status_code"] = r.status_code
+                    try:
+                        parsed = r.json()
+                    except Exception:
+                        parsed = None
+                    cid = _extract_candidate_id_from_response(parsed)
+                    return cid, time.perf_counter() - t0
+                text = r.text or ""
+                try:
+                    parsed_err = r.json()
+                    err_body = json.dumps(parsed_err, ensure_ascii=False)
+                except Exception:
+                    parsed_err = None
+                    err_body = _truncate_detail(text)
+                user_msg = _user_message_from_estaff_http_error(
+                    r.status_code,
+                    parsed_err if parsed_err is not None else text,
+                )
+                _call["status_code"] = r.status_code
+                raise EStaffClientError(
+                    r.status_code,
+                    user_msg,
+                    _truncate_detail(f"HTTP {r.status_code}: {err_body}"),
+                )
+            except httpx.TimeoutException:
+                last_exc = EStaffClientError(
+                    504,
+                    "Сервис e-staff не ответил вовремя. Повторите попытку позже.",
+                    "timeout",
+                )
+                if attempt < 2:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                _call["error"] = "TimeoutException"
+                raise last_exc from None
+            except httpx.RequestError as exc:
+                logger.warning(
+                    "estaff_candidate_request_error url=%s err=%s",
+                    url,
+                    exc,
+                    exc_info=True,
+                )
+                last_exc = EStaffClientError(
+                    502,
+                    _user_message_for_request_error(exc, server_name),
+                    _truncate_detail(str(exc)),
+                )
+                if attempt < 2:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                _call["error"] = "RequestError"
+                raise last_exc from None
+        if last_exc:
+            raise last_exc
+        raise EStaffClientError(500, "Не удалось выполнить выгрузку в e-staff.", "unknown")

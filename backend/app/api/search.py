@@ -8,7 +8,7 @@ import time
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db, require_search_parse_debug_access
@@ -811,6 +811,7 @@ def search_parse(
 
 @router.post("/{snapshot_id}/evaluate", response_model=EvaluateOut)
 async def evaluate_resumes(
+    request: Request,
     snapshot_id: str,
     body: EvaluateIn,
     db: Session = Depends(get_db),
@@ -899,6 +900,14 @@ async def evaluate_resumes(
             snapshot_id,
             len(updated),
         )
+    try:
+        request.state.response_summary = {
+            "evaluated_count": len(updated),
+            "llm_scored_count": int(metrics.get("llm_scored_count") or scored),
+            "fallback_scored_count": int(metrics.get("fallback_scored_count") or 0),
+        }
+    except Exception:
+        pass
     return EvaluateOut(
         items=items_out,
         evaluated_count=len(updated),
@@ -912,6 +921,7 @@ async def evaluate_resumes(
 
 @router.post("/{snapshot_id}/analyze", response_model=AnalyzeOut)
 async def analyze_resumes(
+    request: Request,
     snapshot_id: str,
     body: AnalyzeIn,
     db: Session = Depends(get_db),
@@ -997,6 +1007,11 @@ async def analyze_resumes(
     )
     replace_snapshot(uid, snapshot_id, new_snap)
 
+    try:
+        request.state.response_summary = {"analyzed_count": analyzed_n}
+    except Exception:
+        pass
+
     items_out = [CandidateOut(**x) for x in updated]
     return AnalyzeOut(
         items=items_out,
@@ -1008,6 +1023,7 @@ async def analyze_resumes(
 
 @router.post("/{snapshot_id}/evaluate/start", response_model=EvaluateStartOut)
 async def evaluate_resumes_start(
+    request: Request,
     snapshot_id: str,
     body: EvaluateIn,
     db: Session = Depends(get_db),
@@ -1063,11 +1079,16 @@ async def evaluate_resumes_start(
         )
     )
     evaluate_progress.attach_task(job_id, task)
+    try:
+        request.state.response_summary = {"job_id": job_id, "total_count": len(snap.items)}
+    except Exception:
+        pass
     return EvaluateStartOut(job_id=job_id, status="queued", total_count=len(snap.items))
 
 
 @router.post("/{snapshot_id}/analyze/start", response_model=AnalyzeStartOut)
 async def analyze_resumes_start(
+    request: Request,
     snapshot_id: str,
     body: AnalyzeIn,
     db: Session = Depends(get_db),
@@ -1129,6 +1150,10 @@ async def analyze_resumes_start(
         )
     )
     analyze_progress.attach_task(job_id, task)
+    try:
+        request.state.response_summary = {"job_id": job_id, "total_count": total_count}
+    except Exception:
+        pass
     return AnalyzeStartOut(job_id=job_id, status="queued", total_count=total_count)
 
 
@@ -1268,6 +1293,7 @@ async def evaluate_resumes_progress(
 
 @router.post("", response_model=SearchOut)
 async def search(
+    request: Request,
     body: SearchIn,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -1618,6 +1644,17 @@ async def search(
             "bonus": sum(1 for x in serialized if x.get("match_source") == "bonus"),
         }
         metrics_logger.info(json.dumps(search_metrics, ensure_ascii=False))
+        request.state.query_id = search_metrics.get("query_id")
+        request.state.search_metrics = search_metrics
+        request.state.request_body_summary = {
+            "query": body.query,
+            "filters": filters_dump,
+            "search_mode": search_mode,
+        }
+        request.state.response_summary = {
+            "found": found,
+            "source_scope": scope,
+        }
     except Exception:
         logger.exception("Не удалось записать метрики поиска")
 

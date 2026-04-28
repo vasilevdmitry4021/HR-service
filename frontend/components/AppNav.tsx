@@ -23,7 +23,7 @@ function initialsFromEmail(email: string | null): string {
   return (local[0] || "?").toUpperCase();
 }
 
-const links = [
+const BASE_LINKS = [
   { href: "/search", label: "Поиск" },
   { href: "/history", label: "История" },
   { href: "/favorites", label: "Избранное" },
@@ -31,16 +31,21 @@ const links = [
   { href: "/settings", label: "Настройки" },
 ];
 
+const ADMIN_LINKS = [{ href: "/request-log", label: "Журнал" }];
+
 export function AppNav() {
   const pathname = usePathname();
   const router = useRouter();
   const accessToken = useAuthStore((s) => s.accessToken);
   const refreshToken = useAuthStore((s) => s.refreshToken);
   const email = useAuthStore((s) => s.email);
+  const isAdmin = useAuthStore((s) => s.isAdmin);
   const setSession = useAuthStore((s) => s.setSession);
   const clearSession = useAuthStore((s) => s.clearSession);
   const [menuOpen, setMenuOpen] = useState(false);
   const [resolvingEmail, setResolvingEmail] = useState(false);
+
+  const links = isAdmin ? [...BASE_LINKS, ...ADMIN_LINKS] : BASE_LINKS;
 
   useEffect(() => {
     setMenuOpen(false);

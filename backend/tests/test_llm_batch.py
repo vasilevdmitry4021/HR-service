@@ -226,3 +226,59 @@ def test_analyze_resume_uses_skill_truncation_from_settings(monkeypatch) -> None
     prompt = captured_prompt["value"]
     assert "Python, FastAPI ..." in prompt
     assert "Kafka, Redis ..." in prompt
+
+
+def test_format_resume_for_batch_includes_education_and_full_context() -> None:
+    resume = {
+        "id": "r-ctx",
+        "title": "Backend Engineer",
+        "skills": ["Python", "FastAPI"],
+        "experience_years": 5,
+        "age": 30,
+        "salary": {"amount": 250000, "currency": "RUR"},
+        "area": "Москва",
+        "about": "Разрабатываю и поддерживаю сервисы.",
+        "education": [{"summary": "МГУ · Прикладная математика · 2018"}],
+        "work_experience": [
+            {
+                "position": "Backend Engineer",
+                "company": "Acme",
+                "description": "Интеграции и микросервисы.",
+            }
+        ],
+        "raw_text": "gender: male\nlanguages[1].name: English\ncitizenship[1].name: Россия",
+    }
+    formatted = llm_resume_analyzer._format_resume_for_batch(resume)
+    assert "образование:" in formatted
+    assert "прочие данные резюме:" in formatted
+    assert "languages[1].name: English" in formatted
+
+
+def test_analyze_resume_includes_full_resume_context_in_prompt() -> None:
+    captured_prompt: dict[str, str] = {}
+
+    def _fake_call(prompt: str, db=None, **kwargs):
+        _ = db, kwargs
+        captured_prompt["value"] = prompt
+        return {
+            "llm_score": 80,
+            "is_relevant": True,
+            "strengths": [],
+            "gaps": [],
+            "summary": "ok",
+        }
+
+    with patch.object(llm_resume_analyzer, "_call_llm_for_json", side_effect=_fake_call):
+        out = llm_resume_analyzer.analyze_resume(
+            {"skills": ["Python"]},
+            {
+                "id": "r1",
+                "title": "Dev",
+                "skills": ["Python"],
+                "raw_text": "gender: female\nlanguages[1].name: Russian",
+            },
+        )
+    assert out["llm_score"] == 80
+    prompt = captured_prompt["value"]
+    assert "прочие данные резюме:" in prompt
+    assert "gender: female" in prompt

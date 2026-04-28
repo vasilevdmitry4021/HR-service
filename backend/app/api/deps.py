@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
@@ -38,12 +38,18 @@ def get_current_user_id(
 
 
 def get_current_user(
+    request: Request,
     db: Session = Depends(get_db),
     user_id: uuid.UUID = Depends(get_current_user_id),
 ) -> User:
     user = db.get(User, user_id)
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    try:
+        request.state.user_id = user.id
+        request.state.user_email = user.email
+    except Exception:
+        pass
     return user
 
 

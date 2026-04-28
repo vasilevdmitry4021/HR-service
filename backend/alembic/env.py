@@ -12,6 +12,7 @@ from app.models import (  # noqa: F401
     CandidateSourceLink,
     EstaffExport,
     Favorite,
+    RequestLog,
     SearchHistory,
     SearchTemplate,
     SystemSettings,

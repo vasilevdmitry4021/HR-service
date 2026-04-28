@@ -249,3 +249,89 @@ export type SearchTemplateRow = {
   created_at: string;
   updated_at: string;
 };
+
+export type IntegrationCallRecord = {
+  system: string;
+  operation: string;
+  duration_ms: number;
+  status_code: number | null;
+  cached: boolean;
+  error?: string | null;
+};
+
+export type RequestLogEntry = {
+  id: string;
+  request_id: string;
+  query_id: string | null;
+  user_id: string | null;
+  user_email: string | null;
+  method: string;
+  route: string;
+  route_tag: string;
+  status_code: number;
+  duration_ms: number;
+  request_body_summary: Record<string, unknown> | null;
+  response_summary: Record<string, unknown> | null;
+  search_metrics: Record<string, unknown> | null;
+  integration_calls: IntegrationCallRecord[] | null;
+  error_type: string | null;
+  error_message: string | null;
+  created_at: string;
+};
+
+export type RequestLogList = {
+  items: RequestLogEntry[];
+  total: number;
+};
+
+export type RequestLogByRouteTag = {
+  route_tag: string;
+  count: number;
+  error_count: number;
+  avg_duration_ms: number;
+};
+
+export type RequestLogByDay = {
+  date: string;
+  count: number;
+  error_count: number;
+  avg_duration_ms: number;
+};
+
+export type RequestLogTopError = {
+  error_type: string;
+  error_message: string | null;
+  count: number;
+};
+
+export type RequestLogIntegrationSummary = {
+  system: string;
+  call_count: number;
+  avg_duration_ms: number;
+  error_rate: number;
+};
+
+export type RequestLogStats = {
+  total_requests: number;
+  success_count: number;
+  error_count: number;
+  avg_duration_ms: number;
+  p95_duration_ms: number;
+  by_route_tag: RequestLogByRouteTag[];
+  by_day: RequestLogByDay[];
+  top_errors: RequestLogTopError[];
+  integration_summary: RequestLogIntegrationSummary[];
+};
+
+export type RequestLogErrorGroup = {
+  error_type: string;
+  error_message: string | null;
+  count: number;
+  last_seen: string;
+  route_tags: string[];
+  affected_users_count: number;
+};
+
+export type RequestLogErrorsList = {
+  items: RequestLogErrorGroup[];
+};

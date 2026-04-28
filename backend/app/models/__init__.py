@@ -1,4 +1,5 @@
 from app.models.api_key import ApiKey
+from app.models.request_log import RequestLog
 from app.models.candidate_profile import (
     CandidateContact,
     CandidateProfile,
@@ -16,6 +17,7 @@ from app.models.user import User
 
 __all__ = [
     "User",
+    "RequestLog",
     "OAuthIdentity",
     "OAuthHandoffCode",
     "ApiKey",

@@ -178,6 +178,13 @@ class Settings(BaseSettings):
 
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
 
+    # Протоколирование запросов
+    request_log_enabled: bool = True
+    request_log_file_path: str = "logs/request_log.jsonl"
+    request_log_file_max_bytes: int = 50_000_000
+    request_log_file_backup_count: int = 5
+    request_log_retention_days: int = 30
+
     # Глобальные секреты (HH-приложение, e-staff, LLM): PUT только при is_admin у пользователя
     # или совпадении email / id со списками ниже. При settings_admin_only=false любой
     # авторизованный пользователь может записывать (только для локальной разработки).

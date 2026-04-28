@@ -286,6 +286,63 @@ def _about_from_resume_raw(it: dict[str, Any]) -> str | None:
     return None
 
 
+def _render_resume_value_for_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "да" if value else "нет"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        plain = _html_to_plain(value)
+        if plain:
+            return " ".join(plain.split())
+        return " ".join(value.split())
+    return ""
+
+
+def _resume_raw_to_text(raw: dict[str, Any], *, max_chars: int = 16_000) -> str:
+    """
+    Плоский человекочитаемый текст из полного ответа HH.
+    Нужен, чтобы детальный LLM-анализ мог учитывать поля, которые не маппятся явно.
+    """
+    lines: list[str] = []
+    total_chars = 0
+
+    def walk(value: Any, path: str) -> None:
+        nonlocal total_chars
+        if total_chars >= max_chars:
+            return
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                key_str = str(key).strip()
+                if not key_str:
+                    continue
+                next_path = f"{path}.{key_str}" if path else key_str
+                walk(nested, next_path)
+            return
+        if isinstance(value, list):
+            for idx, nested in enumerate(value, start=1):
+                next_path = f"{path}[{idx}]"
+                walk(nested, next_path)
+            return
+        text = _render_resume_value_for_text(value)
+        if not text:
+            return
+        label = path or "value"
+        line = f"{label}: {text}"
+        lines.append(line)
+        total_chars += len(line) + 1
+
+    walk(raw, "")
+    if not lines:
+        return ""
+    merged = "\n".join(lines)
+    if len(merged) <= max_chars:
+        return merged
+    return merged[: max_chars - 1] + "…"
+
+
 def _resume_hh_url(it: dict[str, Any], resume_id: str) -> str | None:
     """Ссылка на страницу резюме на сайте HH (из API или по идентификатору)."""
     alt = it.get("alternate_url")
@@ -356,6 +413,9 @@ def _normalize_resume_item(
         edu = _normalize_education(it.get("education"))
         if edu:
             result["education"] = edu
+        raw_text = _resume_raw_to_text(it)
+        if raw_text:
+            result["raw_text"] = raw_text
     return result
 
 
@@ -577,6 +637,7 @@ async def search_resumes(
     professional_role_ids: list[int] | None = None,
     db: Session | None = None,
     hh_token_user_id: uuid.UUID | None = None,
+    request: Any | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     merged = merge_resume_search_params(
         parsed,
@@ -599,30 +660,35 @@ async def search_resumes(
     if not access_token:
         raise PermissionError("HeadHunter is not connected")
 
+    from app.services.integration_call_tracker import track_integration_call_async
+
     flat = flatten_params_for_httpx(merged)
     token = access_token
-    async with httpx.AsyncClient() as client:
-        r = await client.get(
-            f"{HH_API}/resumes",
-            params=flat,
-            headers=_hh_headers(token or ""),
-            timeout=30.0,
-        )
-        try:
-            _raise_if_hh_error(r)
-        except HHClientError as e:
-            retry_tok = await _maybe_retry_hh_after_401(e, token, db, hh_token_user_id)
-            if retry_tok is None:
-                raise
-            token = retry_tok
+    async with track_integration_call_async(request, "hh", "search_resumes") as _call:
+        async with httpx.AsyncClient() as client:
             r = await client.get(
                 f"{HH_API}/resumes",
                 params=flat,
-                headers=_hh_headers(token),
+                headers=_hh_headers(token or ""),
                 timeout=30.0,
             )
-            _raise_if_hh_error(r)
-        data = r.json()
+            try:
+                _raise_if_hh_error(r)
+            except HHClientError as e:
+                retry_tok = await _maybe_retry_hh_after_401(e, token, db, hh_token_user_id)
+                if retry_tok is None:
+                    _call["status_code"] = r.status_code
+                    raise
+                token = retry_tok
+                r = await client.get(
+                    f"{HH_API}/resumes",
+                    params=flat,
+                    headers=_hh_headers(token),
+                    timeout=30.0,
+                )
+                _raise_if_hh_error(r)
+            _call["status_code"] = r.status_code
+            data = r.json()
 
     items_raw = data.get("items", [])
     items: list[dict[str, Any]] = []
@@ -641,6 +707,7 @@ async def fetch_resume(
     keep_raw: bool = False,
     db: Session | None = None,
     hh_token_user_id: uuid.UUID | None = None,
+    request: Any | None = None,
 ) -> dict[str, Any]:
     if settings.feature_use_mock_hh:
         await _sleep_short()
@@ -656,27 +723,32 @@ async def fetch_resume(
     if not access_token:
         raise PermissionError("HeadHunter is not connected")
 
+    from app.services.integration_call_tracker import track_integration_call_async
+
     token = access_token
-    async with httpx.AsyncClient() as client:
-        r = await client.get(
-            f"{HH_API}/resumes/{resume_id}",
-            headers=_hh_headers(token),
-            timeout=30.0,
-        )
-        try:
-            _raise_if_hh_error(r)
-        except HHClientError as e:
-            retry_tok = await _maybe_retry_hh_after_401(e, token, db, hh_token_user_id)
-            if retry_tok is None:
-                raise
-            token = retry_tok
+    async with track_integration_call_async(request, "hh", "fetch_resume") as _call:
+        async with httpx.AsyncClient() as client:
             r = await client.get(
                 f"{HH_API}/resumes/{resume_id}",
                 headers=_hh_headers(token),
                 timeout=30.0,
             )
-            _raise_if_hh_error(r)
-        it = r.json()
+            try:
+                _raise_if_hh_error(r)
+            except HHClientError as e:
+                retry_tok = await _maybe_retry_hh_after_401(e, token, db, hh_token_user_id)
+                if retry_tok is None:
+                    _call["status_code"] = r.status_code
+                    raise
+                token = retry_tok
+                r = await client.get(
+                    f"{HH_API}/resumes/{resume_id}",
+                    headers=_hh_headers(token),
+                    timeout=30.0,
+                )
+                _raise_if_hh_error(r)
+            _call["status_code"] = r.status_code
+            it = r.json()
     if not isinstance(it, dict):
         raise HHClientError(503, "Некорректный ответ HeadHunter")
     norm = _normalize_resume_item(it, include_work_experience=True)

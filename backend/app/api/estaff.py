@@ -8,7 +8,7 @@ import uuid
 from datetime import date, datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -326,6 +326,7 @@ async def list_estaff_vacancies(
 
 @router.post("/export", response_model=EstaffExportBatchOut)
 async def post_estaff_export(
+    request: Request,
     body: EstaffExportRequestIn,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -569,6 +570,15 @@ async def post_estaff_export(
                 )
             )
 
+    try:
+        success_count = sum(1 for r in results if r.status == EstaffExportStatus.success.value)
+        request.state.response_summary = {
+            "exported_count": len(results),
+            "success_count": success_count,
+            "error_count": len(results) - success_count,
+        }
+    except Exception:
+        pass
     return EstaffExportBatchOut(results=results)
 
 

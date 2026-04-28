@@ -33,6 +33,7 @@ RESUME_ANALYSIS_PROMPT = """Оцени соответствие резюме в�
 - о себе: {r_about}
 - образование: {r_education}
 - опыт работы: {r_work_summary}
+- прочие данные резюме: {r_full_context}
 
 Верни строго JSON-объект:
 {{
@@ -266,6 +267,48 @@ def _resume_work_summary_for_prompt(resume: dict[str, Any], max_chars: int | Non
     return _shorten_text("\n".join(parts), max_chars)
 
 
+def _resume_full_context_for_prompt(
+    resume: dict[str, Any], max_chars: int | None = None
+) -> str:
+    if max_chars is None:
+        max_chars = 8000
+    raw_text = resume.get("raw_text")
+    if isinstance(raw_text, str) and raw_text.strip():
+        return _shorten_text(raw_text, max_chars)
+    payload: list[str] = []
+    for key in (
+        "full_name",
+        "title",
+        "age",
+        "experience_years",
+        "area",
+        "salary",
+        "skills",
+        "about",
+        "education",
+        "work_experience",
+    ):
+        val = resume.get(key)
+        if val is None:
+            continue
+        if isinstance(val, str):
+            txt = _clean_inline_text(val)
+            if txt:
+                payload.append(f"{key}: {txt}")
+            continue
+        if isinstance(val, (int, float, bool)):
+            payload.append(f"{key}: {val}")
+            continue
+        if isinstance(val, (list, dict)):
+            try:
+                payload.append(f"{key}: {json.dumps(val, ensure_ascii=False)}")
+            except Exception:
+                continue
+    if not payload:
+        return "не указано"
+    return _shorten_text("\n".join(payload), max_chars)
+
+
 def _format_resume_for_batch(
     resume: dict[str, Any],
     *,
@@ -306,6 +349,14 @@ def _format_resume_for_batch(
     if work_summary and work_summary != "не указано":
         work_frag = work_summary.replace("\n", " | ")
         base += f" | описание опыта работы: {work_frag}"
+    edu_summary = _resume_education_for_prompt(resume, max_chars=None)
+    if edu_summary and edu_summary != "не указано":
+        edu_fragment = edu_summary.replace("\n", " | ")
+        base += f" | образование: {edu_fragment}"
+    full_context = _resume_full_context_for_prompt(resume, max_chars=None)
+    if full_context and full_context != "не указано":
+        context_fragment = full_context.replace("\n", " | ")
+        base += f" | прочие данные резюме: {context_fragment}"
     return base
 
 
@@ -561,6 +612,7 @@ def analyze_resume(
         r_about=_resume_about_for_prompt(resume, max_chars=None),
         r_education=_resume_education_for_prompt(resume, max_chars=None),
         r_work_summary=_resume_work_summary_for_prompt(resume, max_chars=None),
+        r_full_context=_resume_full_context_for_prompt(resume, max_chars=None),
     )
 
     raw = _call_llm_for_json(
